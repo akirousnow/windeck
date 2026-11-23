@@ -125,30 +125,65 @@ impl StableWindowOrder {
     }
 }
 
-/// Selects the initial highlighted card index when opening WinDeck:
-/// picks the most recently active window (by `z_order_windows`) inside the current
-/// virtual desktop group other than `prev_foreground_hwnd`, falling back to the
-/// first card of the current desktop group, or `0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectionCard {
+    pub hwnd: isize,
+    pub flat_index: usize,
+    pub in_current_desktop: bool,
+    pub is_pinned: bool,
+    pub is_cloaked: bool,
+}
+
+/// Selects the initial highlighted card index when opening WinDeck so the active
+/// highlight immediately tracks the window the user is currently on:
+/// 1. Exact match for `foreground_candidates` (foreground window, then its root owner)
+///    inside the current virtual desktop group or pinned ("所有桌面") group.
+/// 2. Exact match for `foreground_candidates` in any other visible non-cloaked card.
+/// 3. Frontmost Z-order window (`z_order_windows`) on the current virtual desktop.
+/// 4. First card on the current virtual desktop, or `0`.
 pub fn pick_initial_selection_index(
     z_order_windows: &[WindowInfo],
-    current_group_cards: &[(isize, usize)],
-    prev_foreground_hwnd: isize,
+    cards: &[SelectionCard],
+    foreground_candidates: &[isize],
 ) -> usize {
-    if current_group_cards.is_empty() {
+    if cards.is_empty() {
         return 0;
     }
-    for win in z_order_windows {
-        if win.hwnd == prev_foreground_hwnd {
+
+    for &fg in foreground_candidates {
+        if fg == 0 {
             continue;
         }
-        if let Some(&(_, flat_idx)) = current_group_cards
+        if let Some(card) = cards
             .iter()
-            .find(|&&(hwnd, _)| hwnd == win.hwnd)
+            .find(|c| c.hwnd == fg && (c.in_current_desktop || c.is_pinned))
         {
-            return flat_idx;
+            return card.flat_index;
         }
     }
-    current_group_cards[0].1
+
+    for &fg in foreground_candidates {
+        if fg == 0 {
+            continue;
+        }
+        if let Some(card) = cards.iter().find(|c| c.hwnd == fg && !c.is_cloaked) {
+            return card.flat_index;
+        }
+    }
+
+    for win in z_order_windows {
+        if let Some(card) = cards
+            .iter()
+            .find(|c| c.hwnd == win.hwnd && c.in_current_desktop)
+        {
+            return card.flat_index;
+        }
+    }
+
+    cards
+        .iter()
+        .find(|c| c.in_current_desktop)
+        .map_or(0, |c| c.flat_index)
 }
 
 #[cfg(test)]
@@ -398,21 +433,81 @@ mod tests {
     }
 
     #[test]
-    fn initial_selection_picks_mru_non_foreground_card_in_stable_grid() {
+    fn initial_selection_highlights_current_foreground_window_after_switching() {
         let d1 = desktop_id(1);
-        // Stable card layout in current desktop: [(10, flat=0), (20, flat=1), (30, flat=2), (40, flat=3)]
-        let current_cards = [(10, 0), (20, 1), (30, 2), (40, 3)];
-        // Win32 Z-order: 40 (active right before open), 30 (previous active), 10, 20
+        let d2 = desktop_id(2);
+        // Stable card layout:
+        // Pinned: (1, flat=0)
+        // Desktop 1 (current): (10, flat=1), (20, flat=2), (30, flat=3), (40, flat=4)
+        // Desktop 2 (other, cloaked): (50, flat=5)
+        let cards = [
+            SelectionCard {
+                hwnd: 1,
+                flat_index: 0,
+                in_current_desktop: false,
+                is_pinned: true,
+                is_cloaked: false,
+            },
+            SelectionCard {
+                hwnd: 10,
+                flat_index: 1,
+                in_current_desktop: true,
+                is_pinned: false,
+                is_cloaked: false,
+            },
+            SelectionCard {
+                hwnd: 20,
+                flat_index: 2,
+                in_current_desktop: true,
+                is_pinned: false,
+                is_cloaked: false,
+            },
+            SelectionCard {
+                hwnd: 30,
+                flat_index: 3,
+                in_current_desktop: true,
+                is_pinned: false,
+                is_cloaked: false,
+            },
+            SelectionCard {
+                hwnd: 40,
+                flat_index: 4,
+                in_current_desktop: true,
+                is_pinned: false,
+                is_cloaked: false,
+            },
+            SelectionCard {
+                hwnd: 50,
+                flat_index: 5,
+                in_current_desktop: false,
+                is_pinned: false,
+                is_cloaked: true,
+            },
+        ];
+        // User switched from 30 -> 40, so Win32 Z-order is [40, 30, 10, 20, 1, 50] and foreground is 40
         let z_order = vec![
             make_win(40, 400, Some((0, d1)), false),
             make_win(30, 300, Some((0, d1)), false),
             make_win(10, 100, Some((0, d1)), false),
             make_win(20, 200, Some((0, d1)), false),
+            make_win(1, 10, Some((0, d1)), true),
+            make_win(50, 500, Some((1, d2)), false),
         ];
 
-        assert_eq!(pick_initial_selection_index(&z_order, &current_cards, 40), 2);
-        // Single window fallback selects that window
-        assert_eq!(pick_initial_selection_index(&z_order, &[(40, 2)], 40), 2);
+        // 1. Opening immediately after switching to 40 highlights 40 (flat=4), NOT 30 (flat=3)
+        assert_eq!(pick_initial_selection_index(&z_order, &cards, &[40, 0]), 4);
+
+        // 2. Switching to pinned window 1 highlights 1 (flat=0)
+        assert_eq!(pick_initial_selection_index(&z_order, &cards, &[1, 0]), 0);
+
+        // 3. Modal dialog (999) owned by window 20 resolves via root owner candidate to 20 (flat=2)
+        assert_eq!(pick_initial_selection_index(&z_order, &cards, &[999, 20]), 2);
+
+        // 4. Stale cloaked foreground on another desktop (50) falls back to current desktop frontmost (40, flat=4)
+        assert_eq!(pick_initial_selection_index(&z_order, &cards, &[50, 0]), 4);
+
+        // 5. Desktop/taskbar foreground (not in cards) falls back to current desktop frontmost (40, flat=4)
+        assert_eq!(pick_initial_selection_index(&z_order, &cards, &[888, 0]), 4);
     }
 
     #[test]

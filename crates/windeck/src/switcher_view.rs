@@ -19,14 +19,15 @@ use win_platform::{
 };
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetShellWindow, GetWindowThreadProcessId, IsWindow, SetForegroundWindow,
+    GA_ROOTOWNER, GetAncestor, GetForegroundWindow, GetShellWindow, GetWindowThreadProcessId,
+    IsWindow, SetForegroundWindow,
 };
 
 use crate::config::{AppConfig, LabelPosition, PreviewFit, append_log};
 use crate::nav::{NavDirection, navigate};
 use crate::thumb_manager::ThumbnailManager;
 use crate::update_dialog::UpdateStatus;
-use crate::window_order::{StableWindowOrder, pick_initial_selection_index};
+use crate::window_order::{SelectionCard, StableWindowOrder, pick_initial_selection_index};
 
 // Balanced, breathable macOS Mission Control spatial constants (logical px)
 const TOP_SPACES_BAR_H: f32 = 58.0;
@@ -173,6 +174,7 @@ pub struct SwitcherView {
     pub(crate) hold_active: bool,
     pub(crate) hold_navigated: bool,
     prev_foreground_hwnd: isize,
+    prev_foreground_root_hwnd: isize,
     desktops: Vec<VirtualDesktopInfo>,
     all_windows: Vec<WindowInfo>,
     window_order: StableWindowOrder,
@@ -250,6 +252,7 @@ impl SwitcherView {
             hold_active: false,
             hold_navigated: false,
             prev_foreground_hwnd: 0,
+            prev_foreground_root_hwnd: 0,
             desktops: Vec::new(),
             all_windows: Vec::new(),
             window_order: StableWindowOrder::new(),
@@ -422,6 +425,31 @@ impl SwitcherView {
         self.show_and_refresh_inner(window, false, cx);
     }
 
+    fn capture_foreground_candidates(&mut self) {
+        let fg_hwnd = unsafe { GetForegroundWindow() };
+        let fg_raw = fg_hwnd.0 as isize;
+        let self_gpui = self.gpui_hwnd.0 as isize;
+        let self_host = self.thumb_host.hwnd().0 as isize;
+        if fg_raw == self_gpui || fg_raw == self_host {
+            return;
+        }
+        self.prev_foreground_hwnd = fg_raw;
+        if fg_raw == 0 {
+            self.prev_foreground_root_hwnd = 0;
+            return;
+        }
+        let root_raw = unsafe { GetAncestor(fg_hwnd, GA_ROOTOWNER) }.0 as isize;
+        self.prev_foreground_root_hwnd = if root_raw != 0
+            && root_raw != fg_raw
+            && root_raw != self_gpui
+            && root_raw != self_host
+        {
+            root_raw
+        } else {
+            0
+        };
+    }
+
     fn show_and_refresh_inner(
         &mut self,
         window: &mut Window,
@@ -429,7 +457,7 @@ impl SwitcherView {
         cx: &mut Context<Self>,
     ) {
         let t_start = Instant::now();
-        self.prev_foreground_hwnd = unsafe { GetForegroundWindow() }.0 as isize;
+        self.capture_foreground_candidates();
         self.hovered_flat = None;
         self.armed_delete_desktop = None;
         self.settings_open = false;
@@ -467,6 +495,7 @@ impl SwitcherView {
             self.config.blur_opacity,
         );
 
+        window.refresh();
         if let Ok((phys_rc, scale)) = show_and_focus_layered_overlay(
             self.gpui_hwnd,
             self.thumb_host.hwnd(),
@@ -485,12 +514,14 @@ impl SwitcherView {
 
         self.last_open_ms = t_start.elapsed().as_secs_f64() * 1000.0;
         append_log(&format!(
-            "OPEN total={:.2}ms enum={:.2}ms desktops={} windows={} thumbs={} preview={}x{} fit={} label={}",
+            "OPEN total={:.2}ms enum={:.2}ms desktops={} windows={} thumbs={} fg=0x{:X} sel={} preview={}x{} fit={} label={}",
             self.last_open_ms,
             self.last_enum_ms,
             self.desktops.len(),
             self.total_window_count,
             self.thumbs.borrow().active_count(),
+            self.prev_foreground_hwnd,
+            self.selected_flat,
             self.config.preview_width as i32,
             self.config.preview_height as i32,
             self.config.preview_fit.as_config_str(),
@@ -833,23 +864,25 @@ impl SwitcherView {
         if self.flat_hwnds.is_empty() {
             return 0;
         }
-        if let Some(cur_group) = self
+        let cards: Vec<SelectionCard> = self
             .groups
             .iter()
-            .find(|g| g.is_current && !g.cards.is_empty())
-        {
-            let cards: Vec<(isize, usize)> = cur_group
-                .cards
-                .iter()
-                .map(|c| (c.info.hwnd, c.flat_index))
-                .collect();
-            return pick_initial_selection_index(
-                &self.all_windows,
-                &cards,
-                self.prev_foreground_hwnd,
-            );
-        }
-        0
+            .flat_map(|g| {
+                let in_current_desktop = g.is_current;
+                g.cards.iter().map(move |c| SelectionCard {
+                    hwnd: c.info.hwnd,
+                    flat_index: c.flat_index,
+                    in_current_desktop,
+                    is_pinned: c.info.is_pinned,
+                    is_cloaked: c.info.cloaked_flags != 0,
+                })
+            })
+            .collect();
+        pick_initial_selection_index(
+            &self.all_windows,
+            &cards,
+            &[self.prev_foreground_hwnd, self.prev_foreground_root_hwnd],
+        )
     }
 
     fn cached_icon(&mut self, info: &WindowInfo) -> Option<Arc<RenderImage>> {
