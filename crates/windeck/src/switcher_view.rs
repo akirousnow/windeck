@@ -509,8 +509,8 @@ impl SwitcherView {
         let desktops = self.vdm.get_desktops().unwrap_or_default();
         let monitors = enumerate_monitors();
         let exclude = [self.gpui_hwnd.0 as isize, self.thumb_host.hwnd().0 as isize];
-        let (windows, _) =
-            enumerate_windows(&self.vdm, &desktops, &monitors, &exclude, false).unwrap_or_default();
+        let windows =
+            enumerate_windows(&self.vdm, &desktops, &monitors, &exclude).unwrap_or_default();
         self.last_enum_ms = t_enum.elapsed().as_secs_f64() * 1000.0;
 
         // If filtered/armed desktop was removed externally, reset cleanly

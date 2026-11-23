@@ -13,10 +13,8 @@ pub use dwm_thumb::DwmThumbnail;
 pub use os_version::OsVersion;
 pub use overlay_win::{
     BackdropStyle, OverlayMonitorPolicy, ThumbnailHostWindow, apply_backdrop_style,
-    apply_win11_rounded_corners, configure_borderless_immersive, hide_layered_overlay,
-    hide_overlay, is_overlay_visible, query_window_and_client_sizes,
-    show_and_focus_layered_overlay, show_and_focus_overlay, target_monitor_rects,
-    target_monitor_work_area,
+    configure_borderless_immersive, hide_layered_overlay, query_window_and_client_sizes,
+    show_and_focus_layered_overlay, target_monitor_rects,
 };
 pub use process_metrics::{
     ProcessResourceSnapshot, capture_process_resources, current_session_desktop_names,
@@ -33,9 +31,7 @@ pub use updater::{
 pub use virtual_desktop::{
     ComProbeStatus, DesktopId, VirtualDesktopClient, VirtualDesktopInfo, WindowDesktopLookup,
 };
-pub use window_enum::{
-    MonitorInfo, RawWindowDiagnostic, WindowInfo, enumerate_monitors, enumerate_windows,
-};
+pub use window_enum::{MonitorInfo, WindowInfo, enumerate_monitors, enumerate_windows};
 pub use window_icon::{IconBgra, extract_window_icon};
 pub use window_switch::{
     ForceQuitOutcome, ForceQuitReport, SwitchReport, force_quit_window, switch_to_window,

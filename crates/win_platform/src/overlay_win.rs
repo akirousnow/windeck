@@ -20,7 +20,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_EXSTYLE, GWL_STYLE, GetClientRect,
-    GetCursorPos, GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST, IsWindowVisible, RegisterClassW,
+    GetCursorPos, GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST, RegisterClassW,
     SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
     SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
     WNDCLASSW, WS_BORDER, WS_CAPTION, WS_DLGFRAME, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME,
@@ -280,10 +280,6 @@ pub fn configure_borderless_immersive(hwnd: HWND, fullscreen: bool) {
     }
 }
 
-pub fn apply_win11_rounded_corners(hwnd: HWND) {
-    configure_borderless_immersive(hwnd, false);
-}
-
 /// Returns `(full_monitor_rect, work_area_rect, scale_factor)` for the chosen monitor.
 pub fn target_monitor_rects(policy: OverlayMonitorPolicy) -> Result<(RECT, RECT, f32)> {
     let hmon = match policy {
@@ -311,11 +307,6 @@ pub fn target_monitor_rects(policy: OverlayMonitorPolicy) -> Result<(RECT, RECT,
     let scale = (dpi_x as f32 / 96.0).max(1.0);
 
     Ok((info.rcMonitor, info.rcWork, scale))
-}
-
-pub fn target_monitor_work_area(policy: OverlayMonitorPolicy) -> Result<(RECT, f32)> {
-    let (_, work, scale) = target_monitor_rects(policy)?;
-    Ok((work, scale))
 }
 
 fn compute_overlay_rect(
@@ -449,37 +440,6 @@ pub fn hide_layered_overlay(gpui_hwnd: HWND, thumb_host_hwnd: HWND) {
     }
 }
 
-pub fn show_and_focus_overlay(
-    hwnd: HWND,
-    policy: OverlayMonitorPolicy,
-    immersive_fullscreen: bool,
-) -> Result<(RECT, f32)> {
-    let (x, y, win_w, win_h, scale) = compute_overlay_rect(policy, immersive_fullscreen)?;
-    unsafe {
-        let _ = SetWindowPos(
-            hwnd,
-            Some(HWND_TOPMOST),
-            x,
-            y,
-            win_w,
-            win_h,
-            SWP_SHOWWINDOW | SWP_FRAMECHANGED,
-        );
-        let _ = ShowWindow(hwnd, SW_SHOW);
-    }
-    focus_hwnd(hwnd);
-
-    Ok((
-        RECT {
-            left: x,
-            top: y,
-            right: x + win_w,
-            bottom: y + win_h,
-        },
-        scale,
-    ))
-}
-
 pub fn query_window_and_client_sizes(hwnd: HWND) -> ((i32, i32), (i32, i32)) {
     let mut wr = RECT::default();
     let mut cr = RECT::default();
@@ -489,14 +449,4 @@ pub fn query_window_and_client_sizes(hwnd: HWND) -> ((i32, i32), (i32, i32)) {
         (wr.right - wr.left, wr.bottom - wr.top),
         (cr.right - cr.left, cr.bottom - cr.top),
     )
-}
-
-pub fn hide_overlay(hwnd: HWND) {
-    unsafe {
-        let _ = ShowWindow(hwnd, SW_HIDE);
-    }
-}
-
-pub fn is_overlay_visible(hwnd: HWND) -> bool {
-    unsafe { IsWindowVisible(hwnd) }.as_bool()
 }

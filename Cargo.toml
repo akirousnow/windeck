@@ -2,8 +2,6 @@
 resolver = "2"
 members = [
     "crates/win_platform",
-    "crates/probe_a",
-    "crates/probe_b",
     "crates/windeck",
 ]
 

@@ -894,7 +894,6 @@ impl ComSession {
 }
 
 enum Command {
-    ProbeStatus(mpsc::Sender<ComProbeStatus>),
     GetDesktops(mpsc::Sender<Result<Vec<VirtualDesktopInfo>>>),
     QueryWindows(Vec<isize>, mpsc::Sender<HashMap<isize, WindowDesktopLookup>>),
     SwitchToDesktop(DesktopId, mpsc::Sender<Result<()>>),
@@ -928,9 +927,6 @@ impl VirtualDesktopClient {
 
                 while let Ok(cmd) = rx.recv() {
                     match cmd {
-                        Command::ProbeStatus(reply) => {
-                            let _ = reply.send(session.probe_status());
-                        }
                         Command::GetDesktops(reply) => {
                             let _ = reply.send(session.get_desktops_merged());
                         }
@@ -967,14 +963,6 @@ impl VirtualDesktopClient {
             tx,
             handle: Some(handle),
         })
-    }
-
-    pub fn probe_status(&self) -> Result<ComProbeStatus> {
-        let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(Command::ProbeStatus(tx))
-            .map_err(|_| anyhow!("vdm worker stopped"))?;
-        rx.recv().context("recv probe_status")
     }
 
     pub fn get_desktops(&self) -> Result<Vec<VirtualDesktopInfo>> {

@@ -19,17 +19,14 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GA_ROOTOWNER, GWL_EXSTYLE, GWL_STYLE, GetAncestor, GetClassNameW,
-    GetLastActivePopup, GetWindowLongW, GetWindowPlacement, GetWindowRect, GetWindowTextLengthW,
-    GetWindowTextW, GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed,
-    SW_SHOWMAXIMIZED, WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW,
+    EnumWindows, GA_ROOTOWNER, GWL_EXSTYLE, GetAncestor, GetClassNameW, GetLastActivePopup,
+    GetWindowLongW, GetWindowPlacement, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed, SW_SHOWMAXIMIZED,
+    WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 use windows_core::{BOOL, PWSTR};
 
-use crate::virtual_desktop::{
-    DesktopId, VirtualDesktopClient, VirtualDesktopInfo, WindowDesktopLookup,
-};
+use crate::virtual_desktop::{DesktopId, VirtualDesktopClient, VirtualDesktopInfo};
 
 #[derive(Debug, Clone)]
 pub struct MonitorInfo {
@@ -62,21 +59,6 @@ pub struct WindowInfo {
     pub cloaked_flags: u32,
     pub monitor_index: Option<usize>,
     pub rect: RECT,
-}
-
-#[derive(Debug, Clone)]
-pub struct RawWindowDiagnostic {
-    pub hwnd: isize,
-    pub title: String,
-    pub class_name: String,
-    pub process_name: String,
-    pub style: u32,
-    pub ex_style: u32,
-    pub cloaked: u32,
-    pub is_iconic: bool,
-    pub lookup: WindowDesktopLookup,
-    pub kept: bool,
-    pub reason: String,
 }
 
 struct OwnedHandle(HANDLE);
@@ -278,8 +260,7 @@ pub fn enumerate_windows(
     desktops: &[VirtualDesktopInfo],
     monitors: &[MonitorInfo],
     exclude_hwnds: &[isize],
-    collect_diagnostics: bool,
-) -> Result<(Vec<WindowInfo>, Vec<RawWindowDiagnostic>)> {
+) -> Result<Vec<WindowInfo>> {
     let mut raw_hwnds: Vec<HWND> = Vec::new();
     unsafe extern "system" fn enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let list = unsafe { &mut *(lparam.0 as *mut Vec<HWND>) };
@@ -304,102 +285,67 @@ pub fn enumerate_windows(
         desktops.iter().find(|d| d.is_current).map(|d| d.id);
 
     let mut windows_out = Vec::new();
-    let mut diagnostics = Vec::new();
 
     for hwnd in visible_hwnds {
         let raw_id = hwnd.0 as isize;
-        let title = get_window_text(hwnd);
-        let class_name = get_class_name(hwnd);
-        let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32;
-        let ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
-        let cloaked = get_cloaked_flags(hwnd);
-        let is_iconic = unsafe { IsIconic(hwnd) }.as_bool();
-        let lookup = desktop_lookups.get(&raw_id).cloned().unwrap_or_default();
-
-        let mut pid = 0u32;
-        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
-
-        let reject_reason: Option<String> = if exclude_hwnds.contains(&raw_id) {
-            Some("self_window".into())
-        } else if (ex_style & WS_EX_TOOLWINDOW.0) != 0 {
-            Some("WS_EX_TOOLWINDOW".into())
-        } else if (ex_style & WS_EX_NOACTIVATE.0) != 0 && (ex_style & WS_EX_APPWINDOW.0) == 0 {
-            Some("WS_EX_NOACTIVATE".into())
-        } else if is_excluded_shell_class(&class_name) {
-            Some(format!("shell_class({class_name})"))
-        } else if title.trim().is_empty() {
-            Some("empty_title".into())
-        } else if (ex_style & WS_EX_APPWINDOW.0) == 0 && !passes_alt_tab_owner_walk(hwnd) {
-            Some("owner_walk_not_root_popup".into())
-        } else if (cloaked & (DWM_CLOAKED_APP | DWM_CLOAKED_INHERITED)) != 0 {
-            Some(format!("cloaked_app_or_inherited(0x{cloaked:x})"))
-        } else if (cloaked & DWM_CLOAKED_SHELL) != 0 {
-            // Shell-cloaked windows are EITHER legitimate windows on another virtual desktop
-            // OR suspended UWP / hidden shell frames (which have no valid desktop or sit on current desktop while cloaked).
-            let eff_desktop = lookup.effective_desktop_id();
-            match eff_desktop {
-                Some(did) if valid_desktop_ids.contains(&did) => {
-                    if current_desktop_id == Some(did) && !lookup.is_pinned {
-                        Some("shell_cloaked_on_current_desktop(suspended_uwp_or_hidden)".into())
-                    } else {
-                        None // Legitimate window on another virtual desktop!
-                    }
-                }
-                _ => Some("shell_cloaked_without_valid_desktop".into()),
-            }
-        } else {
-            None
-        };
-
-        let (process_name, exe_path, is_elevated) =
-            if reject_reason.is_none() || collect_diagnostics {
-                query_process_info(pid)
-            } else {
-                (String::new(), String::new(), None)
-            };
-
-        if let Some(reason) = reject_reason {
-            if collect_diagnostics {
-                diagnostics.push(RawWindowDiagnostic {
-                    hwnd: raw_id,
-                    title,
-                    class_name,
-                    process_name,
-                    style,
-                    ex_style,
-                    cloaked,
-                    is_iconic,
-                    lookup,
-                    kept: false,
-                    reason,
-                });
-            }
+        if exclude_hwnds.contains(&raw_id) {
             continue;
         }
 
+        let ex_style = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32;
+        if (ex_style & WS_EX_TOOLWINDOW.0) != 0 {
+            continue;
+        }
+        if (ex_style & WS_EX_NOACTIVATE.0) != 0 && (ex_style & WS_EX_APPWINDOW.0) == 0 {
+            continue;
+        }
+
+        let class_name = get_class_name(hwnd);
+        if is_excluded_shell_class(&class_name) {
+            continue;
+        }
+
+        let title = get_window_text(hwnd);
+        if title.trim().is_empty() {
+            continue;
+        }
+
+        if (ex_style & WS_EX_APPWINDOW.0) == 0 && !passes_alt_tab_owner_walk(hwnd) {
+            continue;
+        }
+
+        let cloaked = get_cloaked_flags(hwnd);
+        if (cloaked & (DWM_CLOAKED_APP | DWM_CLOAKED_INHERITED)) != 0 {
+            continue;
+        }
+
+        let lookup = desktop_lookups.get(&raw_id).cloned().unwrap_or_default();
+        if (cloaked & DWM_CLOAKED_SHELL) != 0 {
+            // Shell-cloaked windows are EITHER legitimate windows on another virtual desktop
+            // OR suspended UWP / hidden shell frames (which have no valid desktop or sit on current desktop while cloaked).
+            match lookup.effective_desktop_id() {
+                Some(did) if valid_desktop_ids.contains(&did) => {
+                    if current_desktop_id == Some(did) && !lookup.is_pinned {
+                        continue;
+                    }
+                }
+                _ => continue,
+            }
+        }
+
         // Check zero-sized non-minimized ghost windows
+        let is_iconic = unsafe { IsIconic(hwnd) }.as_bool();
         let mut rect = RECT::default();
         let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
         let w = rect.right - rect.left;
         let h = rect.bottom - rect.top;
         if !is_iconic && (w <= 0 || h <= 0) {
-            if collect_diagnostics {
-                diagnostics.push(RawWindowDiagnostic {
-                    hwnd: raw_id,
-                    title,
-                    class_name,
-                    process_name,
-                    style,
-                    ex_style,
-                    cloaked,
-                    is_iconic,
-                    lookup,
-                    kept: false,
-                    reason: format!("zero_rect({w}x{h})"),
-                });
-            }
             continue;
         }
+
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+        let (process_name, exe_path, is_elevated) = query_process_info(pid);
 
         let mut placement = WINDOWPLACEMENT {
             length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
@@ -428,22 +374,6 @@ pub fn enumerate_windows(
         let desktop_index = desktop_id
             .and_then(|did| desktops.iter().position(|d| d.id == did));
 
-        if collect_diagnostics {
-            diagnostics.push(RawWindowDiagnostic {
-                hwnd: raw_id,
-                title: title.clone(),
-                class_name: class_name.clone(),
-                process_name: process_name.clone(),
-                style,
-                ex_style,
-                cloaked,
-                is_iconic,
-                lookup: lookup.clone(),
-                kept: true,
-                reason: "ok".into(),
-            });
-        }
-
         windows_out.push(WindowInfo {
             hwnd: raw_id,
             pid,
@@ -464,5 +394,5 @@ pub fn enumerate_windows(
         });
     }
 
-    Ok((windows_out, diagnostics))
+    Ok(windows_out)
 }
