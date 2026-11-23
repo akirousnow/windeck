@@ -733,7 +733,7 @@ fn main() -> Result<()> {
 
                 // Pick up to 3 real windows (preferring windows from different virtual desktops!).
                 let (real_windows, _) =
-                    enumerate_windows(&vdm, &desktops, &monitors, Some(gpui_hwnd.0 as isize), false)
+                    enumerate_windows(&vdm, &desktops, &monitors, &[gpui_hwnd.0 as isize], false)
                         .unwrap_or_default();
                 let mut targets: Vec<TargetEntry> = Vec::new();
                 // Try picking 1 per desktop first so cross-desktop thumbnails are visibly tested!

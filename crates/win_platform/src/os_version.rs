@@ -29,6 +29,7 @@ impl OsVersion {
         let ubr = key.get_u32("UBR").unwrap_or(0);
         let display_version = key
             .get_string("DisplayVersion")
+            .or_else(|_| key.get_string("ReleaseId"))
             .unwrap_or_else(|_| "unknown".to_string());
 
         Ok(Self {

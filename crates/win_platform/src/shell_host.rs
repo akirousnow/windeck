@@ -3,12 +3,15 @@ use std::sync::mpsc;
 use std::thread;
 
 use anyhow::{Context, Result, anyhow};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, LRESULT, POINT, WPARAM,
+};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS,
     DeleteObject,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey,
     UnregisterHotKey, VK_OEM_3, VK_SPACE, VK_TAB,
@@ -19,23 +22,109 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     ASFW_ANY, AllowSetForegroundWindow, AppendMenuW, CreateIconIndirect, CreatePopupMenu,
     CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW,
-    GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW, HICON, HWND_MESSAGE, ICONINFO,
-    MF_SEPARATOR, MF_STRING, MSG, PostMessageW, RegisterClassW, RegisterWindowMessageW,
+    FindWindowExW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW, HICON,
+    HWND_MESSAGE, ICONINFO, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW, MF_CHECKED, MF_SEPARATOR,
+    MF_STRING, MF_UNCHECKED, MSG, PostMessageW, RegisterClassW, RegisterWindowMessageW,
     SetForegroundWindow, SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_NONOTIFY,
     TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
     WM_CLOSE, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONUP,
     WNDCLASSW,
 };
 use windows_core::{HSTRING, PCWSTR, w};
+use windows_registry::CURRENT_USER;
 
 const HOTKEY_ID: i32 = 1;
 const WM_TRAY_ICON: u32 = WM_APP + 1;
 const WM_REBIND_HOTKEY: u32 = WM_APP + 2;
+const WM_ACTIVATE_EXISTING: u32 = WM_APP + 3;
 
 const MENU_CMD_TOGGLE: u32 = 1001;
 const MENU_CMD_RELOAD: u32 = 1002;
 const MENU_CMD_OPEN_CONFIG: u32 = 1003;
-const MENU_CMD_QUIT: u32 = 1004;
+const MENU_CMD_AUTOSTART: u32 = 1004;
+const MENU_CMD_QUIT: u32 = 1005;
+
+const RUN_REG_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+const RUN_VALUE_NAME: &str = "WinDeck";
+const SINGLE_INSTANCE_MUTEX_NAME: PCWSTR = w!("Local\\WinDeck_SingleInstance_v1");
+
+/// RAII process-wide single-instance guard backed by a Win32 named mutex.
+pub struct SingleInstanceGuard {
+    handle: HANDLE,
+}
+
+unsafe impl Send for SingleInstanceGuard {}
+
+impl SingleInstanceGuard {
+    /// Returns `Ok(Some(guard))` if this process is the sole running WinDeck instance,
+    /// or `Ok(None)` if another instance already holds the mutex.
+    pub fn try_acquire() -> Result<Option<Self>> {
+        let handle = unsafe { CreateMutexW(None, false, SINGLE_INSTANCE_MUTEX_NAME) }
+            .context("CreateMutexW for WinDeck single-instance guard")?;
+        if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+            unsafe {
+                let _ = CloseHandle(handle);
+            }
+            return Ok(None);
+        }
+        Ok(Some(Self { handle }))
+    }
+}
+
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        if !self.handle.is_invalid() {
+            unsafe {
+                let _ = CloseHandle(self.handle);
+            }
+            self.handle = HANDLE::default();
+        }
+    }
+}
+
+/// Signals an already-running WinDeck instance (via its hidden `HWND_MESSAGE` host) to pop open.
+pub fn notify_existing_instance() -> bool {
+    unsafe {
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+        if let Ok(existing) = FindWindowExW(
+            Some(HWND_MESSAGE),
+            None,
+            w!("WinDeckShellHostClass"),
+            w!("WinDeckShellHost"),
+        ) {
+            if !existing.is_invalid() {
+                return PostMessageW(Some(existing), WM_ACTIVATE_EXISTING, WPARAM(0), LPARAM(0))
+                    .is_ok();
+            }
+        }
+        false
+    }
+}
+
+/// Checks whether WinDeck is registered under `HKCU\...\Run` for Windows login autostart.
+pub fn is_autostart_enabled() -> bool {
+    CURRENT_USER
+        .open(RUN_REG_PATH)
+        .ok()
+        .and_then(|k| k.get_string(RUN_VALUE_NAME).ok())
+        .is_some_and(|v| !v.trim().is_empty())
+}
+
+/// Enables or disables Windows login autostart (`"<current_exe>" --hidden`).
+pub fn set_autostart_enabled(enabled: bool) -> Result<()> {
+    let key = CURRENT_USER
+        .create(RUN_REG_PATH)
+        .context("open/create HKCU Run key")?;
+    if enabled {
+        let exe = std::env::current_exe().context("resolve current exe path for autostart")?;
+        let cmd = format!("\"{}\" --hidden", exe.display());
+        key.set_string(RUN_VALUE_NAME, &cmd)
+            .context("write WinDeck autostart value")?;
+    } else {
+        let _ = key.remove_value(RUN_VALUE_NAME);
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HotkeySpec {
@@ -97,8 +186,10 @@ impl HotkeySpec {
 #[derive(Debug, Clone)]
 pub enum ShellEvent {
     ToggleOverlay { hotkey_triggered: bool },
+    ShowOverlay,
     ReloadConfig,
     OpenConfigDir,
+    AutostartToggled(bool),
     ExplorerRestarted,
     Quit,
 }
@@ -175,6 +266,27 @@ fn create_programmatic_tray_icon() -> Result<HICON> {
     Ok(icon)
 }
 
+fn load_embedded_or_fallback_tray_icon() -> Result<HICON> {
+    if let Ok(hinstance) = unsafe { GetModuleHandleW(None) } {
+        // Resource ID 1 = IDI_APPICON embedded via windeck.rc
+        if let Ok(handle) = unsafe {
+            LoadImageW(
+                Some(hinstance.into()),
+                PCWSTR(1usize as *const u16),
+                IMAGE_ICON,
+                32,
+                32,
+                LR_DEFAULTCOLOR,
+            )
+        } {
+            if !handle.is_invalid() {
+                return Ok(HICON(handle.0));
+            }
+        }
+    }
+    create_programmatic_tray_icon()
+}
+
 fn add_tray_icon(hwnd: HWND, icon: HICON, tip: &str) {
     let mut nid = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
@@ -228,6 +340,18 @@ fn show_tray_menu(hwnd: HWND, state: &ShellHostState) {
             MENU_CMD_OPEN_CONFIG as usize,
             w!("打开配置文件目录"),
         );
+        let autostart_on = is_autostart_enabled();
+        let autostart_flags = if autostart_on {
+            MF_STRING | MF_CHECKED
+        } else {
+            MF_STRING | MF_UNCHECKED
+        };
+        let _ = AppendMenuW(
+            menu,
+            autostart_flags,
+            MENU_CMD_AUTOSTART as usize,
+            w!("开机自启动"),
+        );
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(
             menu,
@@ -256,6 +380,12 @@ fn show_tray_menu(hwnd: HWND, state: &ShellHostState) {
             }),
             MENU_CMD_RELOAD => (state.on_event)(ShellEvent::ReloadConfig),
             MENU_CMD_OPEN_CONFIG => (state.on_event)(ShellEvent::OpenConfigDir),
+            MENU_CMD_AUTOSTART => {
+                let target = !autostart_on;
+                if set_autostart_enabled(target).is_ok() {
+                    (state.on_event)(ShellEvent::AutostartToggled(target));
+                }
+            }
             MENU_CMD_QUIT => (state.on_event)(ShellEvent::Quit),
             _ => {}
         }
@@ -322,6 +452,11 @@ unsafe extern "system" fn shell_wnd_proc(
                 }
                 return LRESULT(0);
             }
+            WM_ACTIVATE_EXISTING => {
+                let _ = unsafe { AllowSetForegroundWindow(ASFW_ANY) };
+                (state.on_event)(ShellEvent::ShowOverlay);
+                return LRESULT(0);
+            }
             WM_CLOSE => {
                 if state.hotkey_registered {
                     let _ = unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_ID) };
@@ -380,7 +515,7 @@ impl ShellHost {
                     };
                     unsafe { RegisterClassW(&wc) };
 
-                    let tray_icon = create_programmatic_tray_icon()?;
+                    let tray_icon = load_embedded_or_fallback_tray_icon()?;
                     let taskbar_created_msg =
                         unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
                     let tooltip = format!("WinDeck — 全局窗口切换器 ({hotkey_label})");

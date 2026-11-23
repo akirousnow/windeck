@@ -5,37 +5,48 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, Bounds, BoxShadow, Context, FocusHandle, Focusable, KeyDownEvent, Pixels, RenderImage,
-    ScrollDelta, ScrollWheelEvent, SharedString, Window, canvas, div, hsla, img, point, prelude::*,
-    px, rgb, rgba,
+    App, Bounds, ClickEvent, Context, FocusHandle, Focusable, KeyDownEvent, MouseButton, Pixels,
+    RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Window, WindowBackgroundAppearance,
+    canvas, div, img, prelude::*, px, rgb, rgba,
 };
 use smallvec::smallvec;
 use win_platform::{
-    DesktopId, IconBgra, VirtualDesktopClient, VirtualDesktopInfo, WindowInfo, enumerate_monitors,
-    enumerate_windows, extract_window_icon, hide_overlay, show_and_focus_overlay, switch_to_window,
+    DesktopId, IconBgra, ThumbnailHostWindow, VirtualDesktopClient, VirtualDesktopInfo, WindowInfo,
+    configure_borderless_immersive, enumerate_monitors, enumerate_windows, extract_window_icon,
+    hide_layered_overlay, query_window_and_client_sizes, show_and_focus_layered_overlay,
+    switch_to_window,
 };
 use windows::Win32::Foundation::HWND;
-use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, IsWindow};
+use windows::Win32::UI::WindowsAndMessaging::{
+    GetForegroundWindow, GetShellWindow, IsWindow, SetForegroundWindow,
+};
 
-use crate::config::{AppConfig, append_log};
+use crate::config::{AppConfig, LabelPosition, PreviewFit, append_log};
 use crate::nav::{NavDirection, navigate};
 use crate::thumb_manager::ThumbnailManager;
 
-const GROUP_HEADER_H: f32 = 34.0;
-const GROUP_TOP_GAP: f32 = 20.0;
-const CARD_HEADER_H: f32 = 36.0;
-const CARD_THUMB_H: f32 = 178.0;
-const CARD_TOTAL_H: f32 = CARD_HEADER_H + CARD_THUMB_H + 10.0; // header + well + vertical borders/padding
-const ROW_GAP: f32 = 14.0;
-const EMPTY_GROUP_H: f32 = 42.0;
+// Balanced, breathable macOS Mission Control spatial constants (logical px)
+const TOP_SPACES_BAR_H: f32 = 58.0;
+const CANVAS_PAD_X: f32 = 52.0;
+const CANVAS_MAX_W: f32 = 2280.0;
 const CONTENT_PAD_TOP: f32 = 14.0;
-const CONTENT_PAD_BOTTOM: f32 = 24.0;
+const CONTENT_PAD_BOTTOM: f32 = 36.0;
+const GROUP_HEADER_H: f32 = 28.0;
+const GROUP_TOP_GAP: f32 = 28.0;
+const OUTER_GLOW_PAD: f32 = 4.0;
+const MID_GLOW_PAD: f32 = 3.0;
+const INNER_RING_PAD: f32 = 2.5;
+const TOTAL_RING_PAD: f32 = OUTER_GLOW_PAD + MID_GLOW_PAD + INNER_RING_PAD;
+const BELOW_LABEL_GAP: f32 = 8.0;
+const BELOW_LABEL_H: f32 = 26.0;
+const ROW_GAP: f32 = 22.0;
+const COL_GAP: f32 = 24.0;
+const EMPTY_GROUP_H: f32 = 38.0;
 
 #[derive(Clone)]
 struct WindowCard {
     flat_index: usize,
     info: WindowInfo,
-    desktop_label: SharedString,
     icon: Option<Arc<RenderImage>>,
     monogram: SharedString,
     accent_color: u32,
@@ -46,7 +57,6 @@ struct DesktopGroup {
     title: SharedString,
     desktop_id: Option<DesktopId>,
     is_current: bool,
-    is_pinned_group: bool,
     cards: Vec<WindowCard>,
 }
 
@@ -69,7 +79,7 @@ fn monogram_and_color(process_name: &str, title: &str) -> (SharedString, u32) {
         .to_uppercase()
         .to_string();
     let palette = [
-        0x3B82F6, 0x10B981, 0xF59E0B, 0xEC4899, 0x8B5CF6, 0x06B6D4, 0xEF4444, 0x14B8A6,
+        0x0A84FF, 0x30D158, 0xFF9F0A, 0xFF375F, 0xBF5AF2, 0x64D2FF, 0xFF453A, 0x5E5CE6,
     ];
     let hash: usize = source
         .bytes()
@@ -77,18 +87,69 @@ fn monogram_and_color(process_name: &str, title: &str) -> (SharedString, u32) {
     (SharedString::from(ch), palette[hash % palette.len()])
 }
 
+/// Crisp geometric trash-can icon built from GPUI primitives (DPI-sharp, zero font/emoji fallback issues).
+fn trash_icon() -> gpui::Div {
+    div()
+        .w(px(12.0))
+        .h(px(13.0))
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        // Lid handle
+        .child(
+            div()
+                .w(px(4.5))
+                .h(px(1.5))
+                .rounded_t(px(1.0))
+                .bg(rgb(0xFFFFFF)),
+        )
+        // Lid bar
+        .child(
+            div()
+                .w(px(11.0))
+                .h(px(1.5))
+                .rounded(px(1.0))
+                .bg(rgb(0xFFFFFF)),
+        )
+        // Bin body with two inner ribs
+        .child(
+            div()
+                .mt(px(1.0))
+                .w(px(9.0))
+                .h(px(8.5))
+                .rounded_b(px(2.0))
+                .border_l(px(1.3))
+                .border_r(px(1.3))
+                .border_b(px(1.3))
+                .border_color(rgb(0xFFFFFF))
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .gap(px(2.0))
+                .child(div().w(px(1.0)).h(px(4.5)).rounded(px(0.5)).bg(rgba(0xFFFFFFDC)))
+                .child(div().w(px(1.0)).h(px(4.5)).rounded(px(0.5)).bg(rgba(0xFFFFFFDC))),
+        )
+}
+
 pub struct SwitcherView {
     focus_handle: FocusHandle,
     gpui_hwnd: HWND,
+    thumb_host: ThumbnailHostWindow,
     vdm: Arc<VirtualDesktopClient>,
     config: AppConfig,
     visible: bool,
     shown_at: Option<Instant>,
     prev_foreground_hwnd: isize,
     desktops: Vec<VirtualDesktopInfo>,
+    all_windows: Vec<WindowInfo>,
+    desktop_filter: Option<DesktopId>,
     groups: Vec<DesktopGroup>,
     flat_hwnds: Vec<isize>,
     selected_flat: usize,
+    hovered_flat: Option<usize>,
+    armed_delete_desktop: Option<DesktopId>,
     scroll_y: f32,
     viewport_clip: Rc<RefCell<Option<Bounds<Pixels>>>>,
     viewport_width_px: Rc<Cell<f32>>,
@@ -98,8 +159,8 @@ pub struct SwitcherView {
     last_open_ms: f64,
     last_enum_ms: f64,
     total_window_count: usize,
-    status_notice: Option<SharedString>,
     hotkey_warning: Option<SharedString>,
+    transient_toast: Option<(SharedString, Instant)>,
 }
 
 impl Focusable for SwitcherView {
@@ -111,6 +172,7 @@ impl Focusable for SwitcherView {
 impl SwitcherView {
     pub fn new(
         gpui_hwnd: HWND,
+        thumb_host: ThumbnailHostWindow,
         vdm: Arc<VirtualDesktopClient>,
         config: AppConfig,
         hotkey_warning: Option<String>,
@@ -119,40 +181,53 @@ impl SwitcherView {
     ) -> Self {
         let focus_handle = cx.focus_handle();
         window.focus(&focus_handle);
+        let thumbs = ThumbnailManager::new(thumb_host.hwnd());
 
         Self {
             focus_handle,
             gpui_hwnd,
+            thumb_host,
             vdm,
             config,
             visible: false,
             shown_at: None,
             prev_foreground_hwnd: 0,
             desktops: Vec::new(),
+            all_windows: Vec::new(),
+            desktop_filter: None,
             groups: Vec::new(),
             flat_hwnds: Vec::new(),
             selected_flat: 0,
+            hovered_flat: None,
+            armed_delete_desktop: None,
             scroll_y: 0.0,
             viewport_clip: Rc::new(RefCell::new(None)),
-            viewport_width_px: Rc::new(Cell::new(1400.0)),
-            viewport_height_px: Rc::new(Cell::new(720.0)),
+            viewport_width_px: Rc::new(Cell::new(2560.0)),
+            viewport_height_px: Rc::new(Cell::new(1380.0)),
             icon_cache: HashMap::new(),
-            thumbs: Rc::new(RefCell::new(ThumbnailManager::new(gpui_hwnd))),
+            thumbs: Rc::new(RefCell::new(thumbs)),
             last_open_ms: 0.0,
             last_enum_ms: 0.0,
             total_window_count: 0,
-            status_notice: None,
             hotkey_warning: hotkey_warning.map(SharedString::from),
+            transient_toast: None,
         }
     }
 
-    pub fn update_config(&mut self, new_config: AppConfig, window: &mut Window, cx: &mut Context<Self>) {
-        window.set_background_appearance(new_config.background);
+    pub fn update_config(
+        &mut self,
+        new_config: AppConfig,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        configure_borderless_immersive(self.gpui_hwnd, new_config.immersive);
+        self.thumb_host.configure(
+            new_config.immersive,
+            new_config.background,
+            new_config.blur_opacity,
+        );
+        window.set_background_appearance(WindowBackgroundAppearance::Transparent);
         self.config = new_config;
-        self.status_notice = Some(SharedString::from(format!(
-            "配置已重载（快捷键：{}）",
-            self.config.hotkey
-        )));
         cx.notify();
     }
 
@@ -161,12 +236,15 @@ impl SwitcherView {
         append_log(&format!("Explorer restarted -> VDM reconnect: {:?}", res));
     }
 
-    pub fn handle_window_activation_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn handle_window_activation_changed(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.visible || !self.config.hide_on_blur {
             return;
         }
         if !window.is_window_active() {
-            // Grace period right after showing so initial focus transition does not immediately hide.
             if let Some(shown_at) = self.shown_at {
                 if shown_at.elapsed() < Duration::from_millis(180) {
                     return;
@@ -186,35 +264,47 @@ impl SwitcherView {
 
     pub fn hide(&mut self, cx: &mut Context<Self>) {
         self.thumbs.borrow_mut().unregister_all();
-        hide_overlay(self.gpui_hwnd);
+        hide_layered_overlay(self.gpui_hwnd, self.thumb_host.hwnd());
         self.visible = false;
         self.shown_at = None;
+        self.hovered_flat = None;
+        self.armed_delete_desktop = None;
+        self.transient_toast = None;
         cx.notify();
     }
 
     pub fn show_and_refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let t_start = Instant::now();
         self.prev_foreground_hwnd = unsafe { GetForegroundWindow() }.0 as isize;
-        self.status_notice = None;
+        self.hovered_flat = None;
+        self.armed_delete_desktop = None;
         self.scroll_y = 0.0;
+        // Always open in full panorama ("全部") so all desktops' windows are visible at once
+        self.desktop_filter = None;
 
-        // 1. Refresh desktops + windows + cached icons
         self.refresh_snapshot();
 
-        // 2. Register DWM live thumbnails and mark visible BEFORE ShowWindow so the very first WM_SHOWWINDOW frame is fresh (zero stale flash)
         self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
         self.visible = true;
         self.shown_at = Some(Instant::now());
-        window.set_background_appearance(self.config.background);
+        window.set_background_appearance(WindowBackgroundAppearance::Transparent);
+        self.thumb_host.configure(
+            self.config.immersive,
+            self.config.background,
+            self.config.blur_opacity,
+        );
 
-        // 3. Position & reveal overlay window on chosen monitor
-        if let Ok((phys_rc, scale)) =
-            show_and_focus_overlay(self.gpui_hwnd, self.config.monitor, 0.86, 0.84)
-        {
+        if let Ok((phys_rc, scale)) = show_and_focus_layered_overlay(
+            self.gpui_hwnd,
+            self.thumb_host.hwnd(),
+            self.config.monitor,
+            self.config.immersive,
+        ) {
             let logical_w = ((phys_rc.right - phys_rc.left) as f32 / scale).max(640.0);
             let logical_h = ((phys_rc.bottom - phys_rc.top) as f32 / scale).max(420.0);
-            self.viewport_width_px.set((logical_w - 48.0).max(400.0));
-            self.viewport_height_px.set((logical_h - 92.0).max(260.0));
+            self.viewport_width_px.set(logical_w);
+            self.viewport_height_px
+                .set((logical_h - TOP_SPACES_BAR_H).max(260.0));
         }
         window.focus(&self.focus_handle);
         self.ensure_selected_visible();
@@ -222,12 +312,16 @@ impl SwitcherView {
 
         self.last_open_ms = t_start.elapsed().as_secs_f64() * 1000.0;
         append_log(&format!(
-            "OPEN total={:.2}ms enum={:.2}ms desktops={} windows={} thumbs={}",
+            "OPEN total={:.2}ms enum={:.2}ms desktops={} windows={} thumbs={} preview={}x{} fit={} label={}",
             self.last_open_ms,
             self.last_enum_ms,
             self.desktops.len(),
             self.total_window_count,
             self.thumbs.borrow().active_count(),
+            self.config.preview_width as i32,
+            self.config.preview_height as i32,
+            self.config.preview_fit.as_config_str(),
+            self.config.label_position.as_config_str(),
         ));
         cx.notify();
     }
@@ -236,15 +330,33 @@ impl SwitcherView {
         let t_enum = Instant::now();
         let desktops = self.vdm.get_desktops().unwrap_or_default();
         let monitors = enumerate_monitors();
-        let (windows, _) = enumerate_windows(
-            &self.vdm,
-            &desktops,
-            &monitors,
-            Some(self.gpui_hwnd.0 as isize),
-            false,
-        )
-        .unwrap_or_default();
+        let exclude = [self.gpui_hwnd.0 as isize, self.thumb_host.hwnd().0 as isize];
+        let (windows, _) =
+            enumerate_windows(&self.vdm, &desktops, &monitors, &exclude, false).unwrap_or_default();
         self.last_enum_ms = t_enum.elapsed().as_secs_f64() * 1000.0;
+
+        // If filtered/armed desktop was removed externally, reset cleanly
+        if let Some(fid) = self.desktop_filter {
+            if !desktops.iter().any(|d| d.id == fid) {
+                self.desktop_filter = None;
+            }
+        }
+        if let Some(aid) = self.armed_delete_desktop {
+            if !desktops.iter().any(|d| d.id == aid) {
+                self.armed_delete_desktop = None;
+            }
+        }
+
+        self.desktops = desktops;
+        self.all_windows = windows;
+        self.rebuild_visible_groups(true);
+    }
+
+    /// Rebuilds visible desktop groups & flat HWND index list according to `self.desktop_filter`.
+    fn rebuild_visible_groups(&mut self, pick_smart_initial: bool) {
+        let desktops = self.desktops.clone();
+        let windows = self.all_windows.clone();
+        let filter = self.desktop_filter;
 
         let mut pinned_windows = Vec::new();
         let mut by_desktop: Vec<Vec<WindowInfo>> = vec![Vec::new(); desktops.len()];
@@ -268,16 +380,15 @@ impl SwitcherView {
         let mut flat_hwnds = Vec::new();
         let mut flat_idx = 0usize;
 
-        if !pinned_windows.is_empty() {
+        if filter.is_none() && !pinned_windows.is_empty() {
             let mut cards = Vec::with_capacity(pinned_windows.len());
-            for info in pinned_windows {
+            for info in pinned_windows.clone() {
                 let icon = self.cached_icon(&info);
                 let (monogram, accent_color) = monogram_and_color(&info.process_name, &info.title);
                 flat_hwnds.push(info.hwnd);
                 cards.push(WindowCard {
                     flat_index: flat_idx,
                     info,
-                    desktop_label: SharedString::from("所有桌面"),
                     icon,
                     monogram,
                     accent_color,
@@ -285,15 +396,19 @@ impl SwitcherView {
                 flat_idx += 1;
             }
             groups.push(DesktopGroup {
-                title: SharedString::from("固定到所有桌面"),
+                title: SharedString::from("所有桌面"),
                 desktop_id: None,
                 is_current: false,
-                is_pinned_group: true,
                 cards,
             });
         }
 
         for (d_idx, d_info) in desktops.iter().enumerate() {
+            if let Some(fid) = filter {
+                if d_info.id != fid {
+                    continue;
+                }
+            }
             let label = d_info
                 .custom_name
                 .clone()
@@ -307,23 +422,38 @@ impl SwitcherView {
                 cards.push(WindowCard {
                     flat_index: flat_idx,
                     info,
-                    desktop_label: label_shared.clone(),
                     icon,
                     monogram,
                     accent_color,
                 });
                 flat_idx += 1;
             }
+            // When filtering a single desktop, also include pinned windows ("shown on all desktops")
+            if filter.is_some() {
+                for info in &pinned_windows {
+                    let icon = self.cached_icon(info);
+                    let (monogram, accent_color) =
+                        monogram_and_color(&info.process_name, &info.title);
+                    flat_hwnds.push(info.hwnd);
+                    cards.push(WindowCard {
+                        flat_index: flat_idx,
+                        info: info.clone(),
+                        icon,
+                        monogram,
+                        accent_color,
+                    });
+                    flat_idx += 1;
+                }
+            }
             groups.push(DesktopGroup {
                 title: label_shared,
                 desktop_id: Some(d_info.id),
                 is_current: d_info.is_current,
-                is_pinned_group: false,
                 cards,
             });
         }
 
-        if !unassigned.is_empty() {
+        if filter.is_none() && !unassigned.is_empty() {
             let mut cards = Vec::with_capacity(unassigned.len());
             for info in unassigned {
                 let icon = self.cached_icon(&info);
@@ -332,7 +462,6 @@ impl SwitcherView {
                 cards.push(WindowCard {
                     flat_index: flat_idx,
                     info,
-                    desktop_label: SharedString::from("未分配桌面"),
                     icon,
                     monogram,
                     accent_color,
@@ -340,28 +469,189 @@ impl SwitcherView {
                 flat_idx += 1;
             }
             groups.push(DesktopGroup {
-                title: SharedString::from("其他窗口"),
+                title: SharedString::from("其他"),
                 desktop_id: None,
                 is_current: false,
-                is_pinned_group: false,
                 cards,
             });
         }
 
-        self.desktops = desktops;
         self.total_window_count = flat_hwnds.len();
         self.groups = groups;
         self.flat_hwnds = flat_hwnds;
+        if pick_smart_initial {
+            self.selected_flat = self.pick_initial_selection();
+        } else if self.flat_hwnds.is_empty() {
+            self.selected_flat = 0;
+        } else {
+            self.selected_flat = self.selected_flat.min(self.flat_hwnds.len() - 1);
+        }
+    }
 
-        // Smart initial selection: prefer first non-current-foreground window on current desktop, else 0.
-        self.selected_flat = self.pick_initial_selection();
+    fn set_desktop_filter(
+        &mut self,
+        new_filter: Option<DesktopId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.desktop_filter == new_filter {
+            return;
+        }
+        self.desktop_filter = new_filter;
+        self.scroll_y = 0.0;
+        self.hovered_flat = None;
+        self.selected_flat = 0;
+        self.rebuild_visible_groups(false);
+        // Immediately synchronize DWM thumbnails so filtered-out desktops release their surfaces (zero ghosts)
+        self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
+        window.refresh();
+        cx.notify();
+    }
+
+    fn create_new_desktop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.vdm.create_desktop() {
+            Ok(new_id) => {
+                self.refresh_snapshot();
+                self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
+                let new_label = self
+                    .desktops
+                    .iter()
+                    .find(|d| d.id == new_id)
+                    .map(|d| {
+                        d.custom_name
+                            .clone()
+                            .unwrap_or_else(|| format!("桌面 {}", d.index + 1))
+                    })
+                    .unwrap_or_else(|| format!("桌面 {}", self.desktops.len()));
+                self.transient_toast = Some((
+                    SharedString::from(format!("已新建 {new_label}（双击顶部胶囊可直接切换）")),
+                    Instant::now(),
+                ));
+                append_log(&format!(
+                    "CREATE_DESKTOP id={} total_desktops={}",
+                    new_id,
+                    self.desktops.len()
+                ));
+                window.refresh();
+                cx.notify();
+            }
+            Err(e) => {
+                self.transient_toast = Some((
+                    SharedString::from(format!("新建桌面失败：{e}")),
+                    Instant::now(),
+                ));
+                append_log(&format!("CREATE_DESKTOP ERROR: {e:#}"));
+                cx.notify();
+            }
+        }
+    }
+
+    /// If a desktop tab is currently armed as a trash-can button, cancels it and returns `true`.
+    fn dismiss_armed_delete(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.armed_delete_desktop.take().is_some() {
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn remove_desktop_by_id(
+        &mut self,
+        desktop_id: DesktopId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.armed_delete_desktop = None;
+        if self.desktops.len() <= 1 {
+            self.transient_toast = Some((
+                SharedString::from("至少需要保留 1 个虚拟桌面"),
+                Instant::now(),
+            ));
+            cx.notify();
+            return;
+        }
+        let Some(idx) = self.desktops.iter().position(|d| d.id == desktop_id) else {
+            return;
+        };
+        let fallback_idx = if idx > 0 { idx - 1 } else { 1 };
+        let fallback_id = self.desktops[fallback_idx].id;
+
+        let removed_label = self.desktops[idx]
+            .custom_name
+            .clone()
+            .unwrap_or_else(|| format!("桌面 {}", idx + 1));
+        let fallback_label = self.desktops[fallback_idx]
+            .custom_name
+            .clone()
+            .unwrap_or_else(|| format!("桌面 {}", fallback_idx + 1));
+        let was_current = self.desktops[idx].is_current;
+        let moved_windows_count = self
+            .all_windows
+            .iter()
+            .filter(|w| !w.is_pinned && w.desktop_id == Some(desktop_id))
+            .count();
+
+        // Guard against transient focus loss while Explorer tears down the desktop
+        self.shown_at = Some(Instant::now());
+
+        match self.vdm.remove_desktop(desktop_id, fallback_id) {
+            Ok(()) => {
+                if self.desktop_filter == Some(desktop_id) {
+                    self.desktop_filter = None;
+                    self.scroll_y = 0.0;
+                }
+                if moved_windows_count > 0 || was_current {
+                    std::thread::sleep(Duration::from_millis(45));
+                }
+                self.refresh_snapshot();
+                self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
+                if was_current {
+                    unsafe {
+                        let _ = SetForegroundWindow(self.gpui_hwnd);
+                    }
+                    window.focus(&self.focus_handle);
+                }
+                let toast = if moved_windows_count > 0 {
+                    format!(
+                        "已关闭 {removed_label}，{moved_windows_count} 个窗口已移至 {fallback_label}"
+                    )
+                } else {
+                    format!("已关闭 {removed_label}")
+                };
+                self.transient_toast = Some((SharedString::from(toast), Instant::now()));
+                append_log(&format!(
+                    "REMOVE_DESKTOP id={} fallback={} was_current={} moved={} total_desktops={}",
+                    desktop_id,
+                    fallback_id,
+                    was_current,
+                    moved_windows_count,
+                    self.desktops.len()
+                ));
+                self.clamp_scroll();
+                window.refresh();
+                cx.notify();
+            }
+            Err(e) => {
+                self.transient_toast = Some((
+                    SharedString::from(format!("关闭桌面失败：{e}")),
+                    Instant::now(),
+                ));
+                append_log(&format!("REMOVE_DESKTOP ERROR id={}: {e:#}", desktop_id));
+                cx.notify();
+            }
+        }
     }
 
     fn pick_initial_selection(&self) -> usize {
         if self.flat_hwnds.is_empty() {
             return 0;
         }
-        if let Some(cur_group) = self.groups.iter().find(|g| g.is_current && !g.cards.is_empty()) {
+        if let Some(cur_group) = self
+            .groups
+            .iter()
+            .find(|g| g.is_current && !g.cards.is_empty())
+        {
             if let Some(card) = cur_group
                 .cards
                 .iter()
@@ -375,7 +665,6 @@ impl SwitcherView {
     }
 
     fn cached_icon(&mut self, info: &WindowInfo) -> Option<Arc<RenderImage>> {
-        // Cache by exe_path for regular apps; by HWND for UWP ApplicationFrameHost so each UWP app keeps its own icon!
         let is_uwp_host = info
             .process_name
             .eq_ignore_ascii_case("ApplicationFrameHost.exe")
@@ -389,8 +678,8 @@ impl SwitcherView {
         if let Some(cached) = self.icon_cache.get(&cache_key) {
             return cached.clone();
         }
-        let decoded = extract_window_icon(info.hwnd, &info.exe_path)
-            .and_then(icon_bgra_to_render_image);
+        let decoded =
+            extract_window_icon(info.hwnd, &info.exe_path).and_then(icon_bgra_to_render_image);
         self.icon_cache.insert(cache_key, decoded.clone());
         decoded
     }
@@ -399,13 +688,44 @@ impl SwitcherView {
         self.groups.iter().map(|g| g.cards.len()).collect()
     }
 
-    fn current_cols(&self) -> usize {
-        self.config.resolve_columns(self.viewport_width_px.get())
+    /// Returns `(cols, preview_w, preview_h, tile_outer_w, grid_total_w)`.
+    /// Every window card uses the exact uniform fixed `(preview_w, preview_h)`.
+    fn fixed_grid_geometry(&self) -> (usize, f32, f32, f32, f32) {
+        let vw = self.viewport_width_px.get().max(640.0);
+        let max_avail_w = (vw - CANVAS_PAD_X * 2.0).clamp(320.0, CANVAS_MAX_W);
+
+        // Respect fixed configured preview size (clamped only if single card exceeds entire viewport)
+        let preview_w = self
+            .config
+            .preview_width
+            .min((max_avail_w - TOTAL_RING_PAD * 2.0).max(160.0));
+        let preview_h = self.config.preview_height;
+        let tile_outer_w = preview_w + TOTAL_RING_PAD * 2.0;
+
+        let cols = self
+            .config
+            .resolve_columns(max_avail_w, tile_outer_w, COL_GAP);
+        let grid_total_w =
+            (cols as f32) * tile_outer_w + (cols.saturating_sub(1) as f32) * COL_GAP;
+
+        (cols, preview_w, preview_h, tile_outer_w, grid_total_w)
     }
 
-    /// Computes `(total_content_height, selected_card_y_range)` deterministically.
-    fn compute_layout_metrics(&self, cols: usize) -> (f32, Option<(f32, f32)>) {
+    fn extra_item_h(&self) -> f32 {
+        if self.config.label_position.is_embedded() {
+            TOTAL_RING_PAD * 2.0
+        } else {
+            TOTAL_RING_PAD * 2.0 + BELOW_LABEL_GAP + BELOW_LABEL_H
+        }
+    }
+
+    fn compute_layout_metrics(
+        &self,
+        cols: usize,
+        preview_h: f32,
+    ) -> (f32, Option<(f32, f32)>) {
         let cols = cols.max(1);
+        let item_h = preview_h + self.extra_item_h();
         let mut y = CONTENT_PAD_TOP;
         let mut selected_range = None;
 
@@ -424,12 +744,11 @@ impl SwitcherView {
             let rows = group.cards.len().div_ceil(cols);
             for r in 0..rows {
                 let row_top = y;
-                let row_bottom = row_top + CARD_TOTAL_H;
+                let row_bottom = row_top + item_h;
                 let start = r * cols;
                 let end = (start + cols).min(group.cards.len());
                 for card in &group.cards[start..end] {
                     if card.flat_index == self.selected_flat {
-                        // Include group header when on row 0 so jumping to a new desktop reveals its title too.
                         let top = if r == 0 { group_header_top } else { row_top };
                         selected_range = Some((top, row_bottom));
                     }
@@ -445,21 +764,22 @@ impl SwitcherView {
         (y, selected_range)
     }
 
-    fn clamp_scroll(&mut self, cols: usize) {
-        let (total_h, _) = self.compute_layout_metrics(cols);
+    fn clamp_scroll(&mut self) {
+        let (cols, _, preview_h, _, _) = self.fixed_grid_geometry();
+        let (total_h, _) = self.compute_layout_metrics(cols, preview_h);
         let view_h = self.viewport_height_px.get().max(100.0);
         let max_scroll = (total_h - view_h).max(0.0);
         self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
     }
 
     fn ensure_selected_visible(&mut self) {
-        let cols = self.current_cols();
-        let (total_h, selected_range) = self.compute_layout_metrics(cols);
+        let (cols, _, preview_h, _, _) = self.fixed_grid_geometry();
+        let (total_h, selected_range) = self.compute_layout_metrics(cols, preview_h);
         let view_h = self.viewport_height_px.get().max(100.0);
         let max_scroll = (total_h - view_h).max(0.0);
 
         if let Some((top, bottom)) = selected_range {
-            let margin = 12.0;
+            let margin = 14.0;
             if top - margin < self.scroll_y {
                 self.scroll_y = (top - margin).max(0.0);
             } else if bottom + margin > self.scroll_y + view_h {
@@ -470,20 +790,19 @@ impl SwitcherView {
     }
 
     fn activate_window(&mut self, target_hwnd: isize, cx: &mut Context<Self>) {
-        // Guard against a window that closed while the overlay was open
         let raw = HWND(target_hwnd as *mut std::ffi::c_void);
         if !unsafe { IsWindow(Some(raw)) }.as_bool() {
-            self.status_notice = Some(SharedString::from("该窗口已关闭，已刷新列表"));
             self.refresh_snapshot();
             self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
             cx.notify();
             return;
         }
 
-        // Release thumbnails first before hiding & switching
         self.thumbs.borrow_mut().unregister_all();
+        hide_layered_overlay(self.gpui_hwnd, self.thumb_host.hwnd());
         self.visible = false;
         self.shown_at = None;
+        self.hovered_flat = None;
 
         match switch_to_window(&self.vdm, target_hwnd, Some(self.gpui_hwnd.0 as isize)) {
             Ok(report) => {
@@ -501,17 +820,44 @@ impl SwitcherView {
             }
             Err(e) => {
                 append_log(&format!("SWITCH ERROR hwnd=0x{:X}: {e:#}", target_hwnd));
-                hide_overlay(self.gpui_hwnd);
+                hide_layered_overlay(self.gpui_hwnd, self.thumb_host.hwnd());
             }
         }
         cx.notify();
     }
 
     fn switch_to_desktop_only(&mut self, desktop_id: DesktopId, cx: &mut Context<Self>) {
-        self.hide(cx);
+        // Locate frontmost non-minimized window on destination desktop to prevent UWP late-activation pull-back
+        let dest_front_hwnd = self
+            .all_windows
+            .iter()
+            .find(|w| w.desktop_id == Some(desktop_id) && !w.is_minimized)
+            .map(|w| HWND(w.hwnd as *mut std::ffi::c_void));
+
+        self.thumbs.borrow_mut().unregister_all();
+        self.visible = false;
+        self.shown_at = None;
+        self.hovered_flat = None;
+
         if let Err(e) = self.vdm.switch_to_desktop(desktop_id) {
             append_log(&format!("DESKTOP SWITCH ERROR {}: {e:#}", desktop_id));
+            hide_layered_overlay(self.gpui_hwnd, self.thumb_host.hwnd());
+            cx.notify();
+            return;
         }
+
+        // Hand off foreground to the destination desktop (or Shell desktop if empty) while we still own foreground
+        unsafe {
+            let target = dest_front_hwnd
+                .filter(|&h| IsWindow(Some(h)).as_bool())
+                .unwrap_or_else(|| GetShellWindow());
+            if !target.is_invalid() {
+                let _ = SetForegroundWindow(target);
+            }
+        }
+        hide_layered_overlay(self.gpui_hwnd, self.thumb_host.hwnd());
+        append_log(&format!("DESKTOP_SWITCH target={}", desktop_id));
+        cx.notify();
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -520,16 +866,26 @@ impl SwitcherView {
         }
         let key = event.keystroke.key.as_str();
         let shift = event.keystroke.modifiers.shift;
-        let cols = self.current_cols();
+        let (cols, _, _, _, _) = self.fixed_grid_geometry();
         let sizes = self.group_sizes();
 
-        match key {
-            "escape" => {
-                self.hide(cx);
+        if key == "escape" {
+            if self.dismiss_armed_delete(cx) {
+                return;
             }
+            self.hide(cx);
+            return;
+        }
+        if self.armed_delete_desktop.take().is_some() {
+            cx.notify();
+        }
+
+        match key {
             "enter" | "space" => {
                 if let Some(&hwnd) = self.flat_hwnds.get(self.selected_flat) {
                     self.activate_window(hwnd, cx);
+                } else if let Some(did) = self.desktop_filter {
+                    self.switch_to_desktop_only(did, cx);
                 }
             }
             "right" => {
@@ -598,13 +954,86 @@ impl SwitcherView {
                 self.ensure_selected_visible();
                 cx.notify();
             }
+            // Press L to live-cycle label placement: bottom_right -> bottom_left -> center -> below
+            "l" => {
+                self.config.label_position = self.config.label_position.next();
+                self.transient_toast = Some((
+                    SharedString::from(format!(
+                        "标签位置：{}（config.toml: label_position = \"{}\"）",
+                        self.config.label_position.display_label(),
+                        self.config.label_position.as_config_str()
+                    )),
+                    Instant::now(),
+                ));
+                self.ensure_selected_visible();
+                window.refresh();
+                cx.notify();
+            }
+            // Press F to live-toggle fixed box fit mode: cover <-> contain
+            "f" => {
+                self.config.preview_fit = self.config.preview_fit.toggle();
+                self.transient_toast = Some((
+                    SharedString::from(format!(
+                        "预览适配：{}（config.toml: preview_fit = \"{}\"）",
+                        self.config.preview_fit.display_label(),
+                        self.config.preview_fit.as_config_str()
+                    )),
+                    Instant::now(),
+                ));
+                window.refresh();
+                cx.notify();
+            }
+            // Press - / = to live-tune Gaussian blur transparency
+            "-" | "_" => {
+                self.config.blur_opacity = (self.config.blur_opacity - 0.05).clamp(0.05, 0.85);
+                self.thumb_host.configure(
+                    self.config.immersive,
+                    self.config.background,
+                    self.config.blur_opacity,
+                );
+                self.transient_toast = Some((
+                    SharedString::from(format!(
+                        "毛玻璃暗度：{:.2}（越低越通透，config.toml: blur_opacity = {:.2}）",
+                        self.config.blur_opacity, self.config.blur_opacity
+                    )),
+                    Instant::now(),
+                ));
+                cx.notify();
+            }
+            "=" | "+" => {
+                self.config.blur_opacity = (self.config.blur_opacity + 0.05).clamp(0.05, 0.85);
+                self.thumb_host.configure(
+                    self.config.immersive,
+                    self.config.background,
+                    self.config.blur_opacity,
+                );
+                self.transient_toast = Some((
+                    SharedString::from(format!(
+                        "毛玻璃暗度：{:.2}（越低越通透，config.toml: blur_opacity = {:.2}）",
+                        self.config.blur_opacity, self.config.blur_opacity
+                    )),
+                    Instant::now(),
+                ));
+                cx.notify();
+            }
             "f5" | "r" => {
                 self.refresh_snapshot();
                 self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
-                self.clamp_scroll(cols);
-                self.status_notice = Some(SharedString::from("已刷新窗口列表"));
+                self.clamp_scroll();
                 window.refresh();
                 cx.notify();
+            }
+            // Number keys: 0 = 全部, 1..9 = filter Desktop 1..9
+            "0" => {
+                self.set_desktop_filter(None, window, cx);
+            }
+            "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
+                if let Ok(n) = key.parse::<usize>() {
+                    if let Some(d) = self.desktops.get(n - 1) {
+                        let did = d.id;
+                        self.set_desktop_filter(Some(did), window, cx);
+                    }
+                }
             }
             _ => {}
         }
@@ -617,27 +1046,22 @@ impl SwitcherView {
         cx: &mut Context<Self>,
     ) {
         let delta_y = match event.delta {
-            ScrollDelta::Lines(pt) => -pt.y * 56.0,
+            ScrollDelta::Lines(pt) => -pt.y * 64.0,
             ScrollDelta::Pixels(pt) => -f32::from(pt.y),
         };
-        let cols = self.current_cols();
         self.scroll_y += delta_y;
-        self.clamp_scroll(cols);
+        self.clamp_scroll();
         cx.notify();
     }
 
-    fn selected_card(&self) -> Option<&WindowCard> {
-        self.groups
-            .iter()
-            .flat_map(|g| g.cards.iter())
-            .find(|c| c.flat_index == self.selected_flat)
-    }
-
-    /// Runs automated 50-cycle hide/show + enumerate + DWM register/unregister benchmark.
     pub fn run_self_benchmark(&mut self, window: &mut Window, cx: &mut Context<Self>) -> String {
         use win_platform::capture_process_resources;
 
-        // Warmup 10 cycles so lazy Windows caches stabilize
+        self.show_and_refresh(window, cx);
+        let ((win_w, win_h), (cli_w, cli_h)) = query_window_and_client_sizes(self.gpui_hwnd);
+        let ((host_w, host_h), _) = query_window_and_client_sizes(self.thumb_host.hwnd());
+        self.hide(cx);
+
         for _ in 0..10 {
             self.show_and_refresh(window, cx);
             self.hide(cx);
@@ -659,7 +1083,6 @@ impl SwitcherView {
         let p95 = open_ms[(open_ms.len() * 95) / 100];
         let max = *open_ms.last().unwrap_or(&0.0);
 
-        // Hidden idle 2s check
         let r_idle0 = capture_process_resources();
         let t_idle = Instant::now();
         std::thread::sleep(Duration::from_millis(2000));
@@ -668,10 +1091,19 @@ impl SwitcherView {
         let cpu_ms = r_idle1.cpu_time_ms - r_idle0.cpu_time_ms;
 
         format!(
-            "BENCH 50-cycles: p50={:.2}ms p95={:.2}ms max={:.2}ms | GDI {}->{} (d={:+}) USER {}->{} (d={:+}) Handles {}->{} (d={:+}) | Hidden 2s CPU={:.2}ms ({:.2}% of 1 core)",
+            "BENCH 50-cycles: p50={:.2}ms p95={:.2}ms max={:.2}ms | Layered gpui={}x{} (insets={}x{}) host={}x{} | FixedPreview={}x{} ({}) | GDI {}->{} (d={:+}) USER {}->{} (d={:+}) Handles {}->{} (d={:+}) | Hidden 2s CPU={:.2}ms ({:.2}% of 1 core)",
             p50,
             p95,
             max,
+            win_w,
+            win_h,
+            win_w - cli_w,
+            win_h - cli_h,
+            host_w,
+            host_h,
+            self.config.preview_width as i32,
+            self.config.preview_height as i32,
+            self.config.preview_fit.as_config_str(),
             before.gdi_objects,
             after.gdi_objects,
             after.gdi_objects as i64 - before.gdi_objects as i64,
@@ -692,10 +1124,15 @@ impl Render for SwitcherView {
         let viewport_sz = window.viewport_size();
         let logical_w = f32::from(viewport_sz.width);
         if logical_w > 100.0 {
-            self.viewport_width_px.set((logical_w - 48.0).max(320.0));
+            self.viewport_width_px.set(logical_w);
         }
-        let cols = self.current_cols();
-        let (total_content_h, _) = self.compute_layout_metrics(cols);
+
+        let (cols, preview_w, preview_h, tile_outer_w, grid_total_w) = self.fixed_grid_geometry();
+        let item_total_h = preview_h + self.extra_item_h();
+        let label_pos = self.config.label_position;
+        let preview_fit = self.config.preview_fit;
+
+        let (total_content_h, _) = self.compute_layout_metrics(cols, preview_h);
         let view_h = self.viewport_height_px.get().max(100.0);
         let max_scroll = (total_content_h - view_h).max(0.0);
         if self.scroll_y > max_scroll {
@@ -703,21 +1140,11 @@ impl Render for SwitcherView {
         }
         let scroll_y = self.scroll_y;
 
-        let selected_summary = self
-            .selected_card()
-            .map(|c| {
-                format!(
-                    "{} · {} · {}",
-                    c.desktop_label,
-                    if c.info.process_name.is_empty() {
-                        "应用"
-                    } else {
-                        c.info.process_name.as_str()
-                    },
-                    c.info.title
-                )
-            })
-            .unwrap_or_else(|| "当前没有可切换的窗口".to_string());
+        let optical_top_pad = if max_scroll <= 1.0 && total_content_h < view_h {
+            ((view_h - total_content_h) * 0.32).min(76.0)
+        } else {
+            0.0
+        };
 
         let viewport_clip_rc = self.viewport_clip.clone();
         let viewport_h_cell = self.viewport_height_px.clone();
@@ -725,74 +1152,241 @@ impl Render for SwitcherView {
         let thumbs_rc = self.thumbs.clone();
         let is_visible = self.visible;
         let selected_flat = self.selected_flat;
+        let hovered_flat = self.hovered_flat;
 
-        // Build all desktop group sections inside one unified scrollable list
-        let mut group_elements = Vec::with_capacity(self.groups.len());
-        for (g_idx, group) in self.groups.iter().enumerate() {
-            let desktop_id = group.desktop_id;
-            let count = group.cards.len();
-            let dot_color = if group.is_pinned_group {
-                rgb(0xA855F7)
-            } else if group.is_current {
-                rgb(0x3B82F6)
+        // === TOP FLOATING APPLE SPACES BAR: [ 全部 ] [ 桌面 1 ] [ 桌面 2 ] ... [ + ] ===
+        let mut space_pills = Vec::with_capacity(self.desktops.len() + 3);
+        let all_selected = self.desktop_filter.is_none();
+
+        // 1. [ 全部 ] pill
+        space_pills.push(
+            div()
+                .id("space-pill-all")
+                .h(px(24.0))
+                .px(px(14.0))
+                .rounded_full()
+                .cursor_pointer()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .bg(if all_selected {
+                    rgba(0xFFFFFF2E)
+                } else {
+                    rgba(0x00000000)
+                })
+                .hover(|s| {
+                    s.bg(if all_selected {
+                        rgba(0xFFFFFF38)
+                    } else {
+                        rgba(0xFFFFFF18)
+                    })
+                })
+                .on_click(cx.listener(|this, _, window, cx| {
+                    cx.stop_propagation();
+                    if this.dismiss_armed_delete(cx) {
+                        return;
+                    }
+                    this.set_desktop_filter(None, window, cx);
+                }))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(if all_selected {
+                            gpui::FontWeight::SEMIBOLD
+                        } else {
+                            gpui::FontWeight::MEDIUM
+                        })
+                        .text_color(if all_selected {
+                            rgba(0xFFFFFFFA)
+                        } else {
+                            rgba(0xFFFFFFA0)
+                        })
+                        .child("全部"),
+                ),
+        );
+
+        // 2. [ 桌面 1 ] [ 桌面 2 ] ... pills
+        //    Left click = filter, Left double-click = switch directly
+        //    Right click = morph pill into red trash button; Left click trash = close; click anywhere else = cancel
+        for (d_idx, d_info) in self.desktops.iter().enumerate() {
+            let did = d_info.id;
+            let is_cur = d_info.is_current;
+            let is_filtered = self.desktop_filter == Some(did);
+            let is_armed_delete = self.armed_delete_desktop == Some(did);
+            let label = d_info
+                .custom_name
+                .clone()
+                .unwrap_or_else(|| format!("桌面 {}", d_idx + 1));
+
+            let pill = div()
+                .id(("space-pill", d_idx))
+                .h(px(24.0))
+                .min_w(px(58.0))
+                .px(px(14.0))
+                .rounded_full()
+                .cursor_pointer()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .gap(px(5.0))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        if this.desktops.len() <= 1 {
+                            this.armed_delete_desktop = None;
+                            this.transient_toast = Some((
+                                SharedString::from("至少需要保留 1 个虚拟桌面"),
+                                Instant::now(),
+                            ));
+                        } else if this.armed_delete_desktop == Some(did) {
+                            this.armed_delete_desktop = None;
+                        } else {
+                            this.armed_delete_desktop = Some(did);
+                        }
+                        cx.notify();
+                    }),
+                )
+                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    if this.armed_delete_desktop == Some(did) {
+                        this.remove_desktop_by_id(did, window, cx);
+                    } else if this.dismiss_armed_delete(cx) {
+                        // Clicking any other pill cancels the armed trash state
+                    } else if event.click_count() >= 2 {
+                        this.switch_to_desktop_only(did, cx);
+                    } else {
+                        this.set_desktop_filter(Some(did), window, cx);
+                    }
+                }));
+
+            let pill = if is_armed_delete {
+                pill.bg(rgba(0xFF453AD8))
+                    .border_1()
+                    .border_color(rgba(0xFFFFFF38))
+                    .hover(|s| s.bg(rgba(0xFF453AF5)).border_color(rgba(0xFFFFFF66)))
+                    .child(trash_icon())
             } else {
-                rgb(0x64748B)
+                pill.bg(if is_filtered {
+                    rgba(0xFFFFFF2E)
+                } else {
+                    rgba(0x00000000)
+                })
+                .hover(|s| {
+                    s.bg(if is_filtered {
+                        rgba(0xFFFFFF38)
+                    } else {
+                        rgba(0xFFFFFF18)
+                    })
+                })
+                .when(is_cur, |el| {
+                    el.child(div().size(px(5.0)).rounded_full().bg(rgb(0x0A84FF)))
+                })
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(if is_filtered || is_cur {
+                            gpui::FontWeight::SEMIBOLD
+                        } else {
+                            gpui::FontWeight::MEDIUM
+                        })
+                        .text_color(if is_filtered {
+                            rgba(0xFFFFFFFA)
+                        } else if is_cur {
+                            rgba(0xFFFFFFDC)
+                        } else {
+                            rgba(0xFFFFFF99)
+                        })
+                        .child(label),
+                )
             };
 
+            space_pills.push(pill);
+        }
+
+        // Subtle hairline divider + minimalist [ + ] create-desktop button
+        space_pills.push(
+            div()
+                .id("space-bar-sep")
+                .w(px(1.0))
+                .h(px(14.0))
+                .mx(px(2.0))
+                .bg(rgba(0xFFFFFF24)),
+        );
+        space_pills.push(
+            div()
+                .id("space-pill-add")
+                .size(px(24.0))
+                .rounded_full()
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(0xFFFFFF10))
+                .hover(|s| s.bg(rgba(0xFFFFFF28)))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    cx.stop_propagation();
+                    if this.dismiss_armed_delete(cx) {
+                        return;
+                    }
+                    this.create_new_desktop(window, cx);
+                }))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgba(0xFFFFFFE8))
+                        .child("+"),
+                ),
+        );
+
+        // === FIXED-SIZE UNIFORM MISSION CONTROL GROUPS ===
+        let show_group_labels = self.groups.len() > 1;
+        let mut group_elements = Vec::with_capacity(self.groups.len());
+
+        for (g_idx, group) in self.groups.iter().enumerate() {
+            let desktop_id = group.desktop_id;
+
             let header = div()
-                .id(("desktop-header", g_idx))
+                .id(("desktop-label", g_idx))
                 .h(px(GROUP_HEADER_H))
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap_2()
-                .px_1()
+                .px(px(TOTAL_RING_PAD))
                 .when_some(desktop_id, |el, did| {
                     el.cursor_pointer()
-                        .hover(|s| s.opacity(0.85))
+                        .hover(|s| s.opacity(1.0))
                         .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            if this.dismiss_armed_delete(cx) {
+                                return;
+                            }
                             this.switch_to_desktop_only(did, cx);
                         }))
                 })
-                .child(div().size(px(8.0)).rounded_full().bg(dot_color))
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                        .text_color(if group.is_current {
-                            rgb(0xF8FAFC)
-                        } else {
-                            rgb(0xCBD5E1)
-                        })
-                        .child(group.title.clone()),
-                )
-                .when(group.is_current, |el| {
+                .when(show_group_labels, |el| {
                     el.child(
                         div()
-                            .px_2()
-                            .py(px(1.0))
-                            .rounded(px(4.0))
-                            .bg(rgba(0x3B82F633))
-                            .border_1()
-                            .border_color(rgba(0x3B82F680))
                             .text_xs()
-                            .text_color(rgb(0x93C5FD))
-                            .child("当前桌面"),
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(if group.is_current {
+                                rgba(0xFFFFFFDC)
+                            } else {
+                                rgba(0xFFFFFF78)
+                            })
+                            .child(if group.is_current {
+                                format!("{} · 当前", group.title)
+                            } else {
+                                group.title.to_string()
+                            }),
                     )
-                })
-                .child(
-                    div()
-                        .px(px(6.0))
-                        .py(px(1.0))
-                        .rounded(px(4.0))
-                        .bg(rgba(0xFFFFFF12))
-                        .text_xs()
-                        .text_color(rgb(0x94A3B8))
-                        .child(format!("{count}")),
-                )
-                .child(div().flex_1().h(px(1.0)).ml_2().bg(rgba(0xFFFFFF14)));
+                });
 
             let mut section = div()
+                .w_full()
                 .flex()
                 .flex_col()
                 .when(g_idx > 0, |el| el.mt(px(GROUP_TOP_GAP)))
@@ -801,49 +1395,62 @@ impl Render for SwitcherView {
             if group.cards.is_empty() {
                 section = section.child(
                     div()
-                        .id(("empty-desktop", g_idx))
+                        .id(("empty-space", g_idx))
                         .h(px(EMPTY_GROUP_H))
                         .flex()
                         .items_center()
                         .px_3()
-                        .rounded_md()
-                        .bg(rgba(0xFFFFFF08))
-                        .border_1()
-                        .border_color(rgba(0xFFFFFF10))
+                        .rounded_full()
+                        .bg(rgba(0xFFFFFF0D))
                         .text_xs()
-                        .text_color(rgb(0x64748B))
+                        .text_color(rgba(0xFFFFFF66))
                         .when_some(desktop_id, |el, did| {
                             el.cursor_pointer()
-                                .hover(|s| s.bg(rgba(0xFFFFFF12)).text_color(rgb(0xCBD5E1)))
+                                .hover(|s| s.bg(rgba(0xFFFFFF1A)).text_color(rgba(0xFFFFFFD0)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
+                                    cx.stop_propagation();
+                                    if this.dismiss_armed_delete(cx) {
+                                        return;
+                                    }
                                     this.switch_to_desktop_only(did, cx);
                                 }))
                         })
-                        .child("该桌面当前无窗口（点击可直接切换到此桌面）"),
+                        .child(if self.desktop_filter.is_some() {
+                            "空白桌面 · 点击或按 Enter 切换到此桌面"
+                        } else {
+                            "空白桌面"
+                        }),
                 );
             } else {
                 let mut rows_col = div().flex().flex_col().gap(px(ROW_GAP));
 
                 for row_chunk in group.cards.chunks(cols) {
-                    let mut row_el = div().flex().flex_row().gap(px(14.0)).w_full();
+                    let mut row_el = div().flex().flex_row().gap(px(COL_GAP)).w_full();
 
                     for card in row_chunk {
                         let card_flat_index = card.flat_index;
                         let is_selected = card_flat_index == selected_flat;
+                        let is_hovered = hovered_flat == Some(card_flat_index);
                         let target_hwnd = card.info.hwnd;
-                        let has_live_surface = thumbs_rc.borrow().has_live_surface(target_hwnd);
+
+                        let has_live_surface = thumbs_rc.borrow().source_size(target_hwnd).is_some();
 
                         let thumbs_for_card = thumbs_rc.clone();
                         let clip_for_card = viewport_clip_rc.clone();
 
+                        let icon_px = if label_pos == LabelPosition::Center {
+                            18.0
+                        } else {
+                            16.0
+                        };
                         let icon_el = if let Some(ref render_img) = card.icon {
                             div()
-                                .size(px(18.0))
+                                .size(px(icon_px))
                                 .flex_shrink_0()
-                                .child(img(render_img.clone()).size(px(18.0)).rounded(px(3.0)))
+                                .child(img(render_img.clone()).size(px(icon_px)).rounded(px(3.0)))
                         } else {
                             div()
-                                .size(px(18.0))
+                                .size(px(icon_px))
                                 .flex_shrink_0()
                                 .rounded(px(4.0))
                                 .bg(rgb(card.accent_color))
@@ -856,167 +1463,244 @@ impl Render for SwitcherView {
                                 .child(card.monogram.clone())
                         };
 
-                        let card_el = div()
-                            .id(("win-card", card.flat_index))
-                            .flex_1()
-                            .min_w_0()
-                            .h(px(CARD_TOTAL_H))
-                            .flex()
-                            .flex_col()
-                            .rounded(px(10.0))
-                            .overflow_hidden()
-                            .cursor_pointer()
-                            .bg(if is_selected {
-                                rgb(0x1D2B44)
+                        let title_text = if card.info.is_minimized {
+                            format!("{} · 最小化", card.info.title)
+                        } else {
+                            card.info.title.clone()
+                        };
+
+                        let pill_max_w = if label_pos.is_embedded() {
+                            (preview_w - 18.0).clamp(96.0, 270.0)
+                        } else {
+                            preview_w.max(120.0)
+                        };
+                        let label_pill = div()
+                            .max_w(px(pill_max_w))
+                            .h(px(if label_pos == LabelPosition::Center {
+                                28.0
                             } else {
-                                rgba(0x161B26E8)
-                            })
-                            .border(px(if is_selected { 2.0 } else { 1.0 }))
-                            .border_color(if is_selected {
-                                rgb(0x3B82F6)
-                            } else {
-                                rgba(0xFFFFFF18)
-                            })
-                            .when(is_selected, |el| {
-                                el.shadow(vec![BoxShadow {
-                                    color: hsla(0.60, 0.90, 0.56, 0.45),
-                                    blur_radius: px(14.0),
-                                    spread_radius: px(1.0),
-                                    offset: point(px(0.0), px(0.0)),
-                                }])
-                            })
-                            .hover(|s| {
-                                if is_selected {
-                                    s.border_color(rgb(0x60A5FA))
-                                } else {
-                                    s.bg(rgba(0x1E2636F2)).border_color(rgba(0xFFFFFF38))
-                                }
-                            })
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.selected_flat = card_flat_index;
-                                this.activate_window(target_hwnd, cx);
+                                BELOW_LABEL_H
                             }))
-                            // Dedicated header ABOVE thumbnail (never overlapped by DWM thumbnail)
+                            .px(px(10.0))
+                            .rounded_full()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0))
+                            .bg(if is_selected {
+                                rgba(0x0A84FFEC)
+                            } else if is_hovered {
+                                rgba(0x111622DC)
+                            } else if label_pos.is_embedded() {
+                                rgba(0x0B0F18C8)
+                            } else {
+                                rgba(0x0A0D1478)
+                            })
+                            .when(label_pos.is_embedded(), |el| {
+                                el.border_1().border_color(if is_selected {
+                                    rgba(0xFFFFFF44)
+                                } else {
+                                    rgba(0xFFFFFF22)
+                                })
+                            })
+                            .child(icon_el)
                             .child(
                                 div()
-                                    .h(px(CARD_HEADER_H))
-                                    .px(px(10.0))
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap_2()
-                                    .bg(if is_selected {
-                                        rgba(0x2563EB30)
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_xs()
+                                    .font_weight(if is_selected {
+                                        gpui::FontWeight::SEMIBOLD
                                     } else {
-                                        rgba(0xFFFFFF06)
+                                        gpui::FontWeight::MEDIUM
                                     })
-                                    .border_b_1()
-                                    .border_color(rgba(0xFFFFFF10))
-                                    .child(icon_el)
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .overflow_hidden()
-                                            .whitespace_nowrap()
-                                            .text_ellipsis()
-                                            .text_xs()
-                                            .font_weight(if is_selected {
-                                                gpui::FontWeight::SEMIBOLD
-                                            } else {
-                                                gpui::FontWeight::MEDIUM
-                                            })
-                                            .text_color(if is_selected {
-                                                rgb(0xFFFFFF)
-                                            } else {
-                                                rgb(0xE2E8F0)
-                                            })
-                                            .child(card.info.title.clone()),
-                                    )
-                                    .when(card.info.is_minimized, |el| {
-                                        el.child(
-                                            div()
-                                                .flex_shrink_0()
-                                                .px(px(5.0))
-                                                .py(px(1.0))
-                                                .rounded(px(3.0))
-                                                .bg(rgba(0xF59E0B28))
-                                                .text_xs()
-                                                .text_color(rgb(0xFCD34D))
-                                                .child("最小化"),
-                                        )
+                                    .text_color(if is_selected || is_hovered {
+                                        rgb(0xFFFFFF)
+                                    } else {
+                                        rgba(0xFFFFFFEC)
                                     })
-                                    .when(card.info.is_elevated == Some(true), |el| {
-                                        el.child(
+                                    .child(title_text),
+                            );
+
+                        // Multi-ring transparent-interior Apple blue outer glow + soft ambient depth
+                        let (outer_glow, mid_glow, inner_ring) = if is_selected {
+                            (rgba(0x0A84FF24), rgba(0x0A84FF5A), rgb(0x0A84FF).into())
+                        } else if is_hovered {
+                            (rgba(0xFFFFFF18), rgba(0xFFFFFF36), rgba(0xFFFFFF8C))
+                        } else if preview_fit == PreviewFit::Contain {
+                            (rgba(0x00000010), rgba(0x0000001E), rgba(0xFFFFFF14))
+                        } else {
+                            (rgba(0x00000014), rgba(0x00000028), rgba(0x00000000))
+                        };
+
+                        let thumb_pane = div()
+                            .relative()
+                            .w(px(preview_w))
+                            .h(px(preview_h))
+                            .rounded(px(4.0))
+                            .bg(if has_live_surface {
+                                rgba(0x00000000)
+                            } else {
+                                rgba(0xFFFFFF16)
+                            })
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .when(!has_live_surface, |el| {
+                                el.child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .items_center()
+                                        .gap_2()
+                                        .when_some(card.icon.clone(), |inner, r_img| {
+                                            inner.child(
+                                                img(r_img).size(px(36.0)).rounded(px(8.0)),
+                                            )
+                                        })
+                                        .child(
                                             div()
-                                                .flex_shrink_0()
-                                                .px(px(5.0))
-                                                .py(px(1.0))
-                                                .rounded(px(3.0))
-                                                .bg(rgba(0xEF444428))
                                                 .text_xs()
-                                                .text_color(rgb(0xFCA5A5))
-                                                .child("管理员"),
-                                        )
-                                    }),
-                            )
-                            // Dedicated dark recessed preview well for DWM live thumbnail
-                            .child(
-                                div()
-                                    .relative()
-                                    .h(px(CARD_THUMB_H))
-                                    .w_full()
-                                    .bg(rgb(0x0B0F17))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .when(!has_live_surface, |el| {
-                                        el.child(
-                                            div()
-                                                .flex()
-                                                .flex_col()
-                                                .items_center()
-                                                .gap_1()
-                                                .text_xs()
-                                                .text_color(rgb(0x64748B))
+                                                .text_color(rgba(0xFFFFFF88))
                                                 .child(if card.info.process_name.is_empty() {
-                                                    "暂无预览".to_string()
+                                                    "已最小化".to_string()
                                                 } else {
                                                     card.info.process_name.clone()
                                                 }),
-                                        )
-                                    })
-                                    .child(
-                                        canvas(
-                                            |bounds, _, _| bounds,
-                                            move |bounds, _, window, _| {
-                                                if !is_visible {
-                                                    return;
-                                                }
-                                                let sf = window.scale_factor();
-                                                let clip = clip_for_card
-                                                    .borrow()
-                                                    .unwrap_or(bounds);
-                                                thumbs_for_card.borrow_mut().update_slot(
-                                                    target_hwnd,
-                                                    bounds,
-                                                    clip,
-                                                    sf,
-                                                );
-                                            },
-                                        )
+                                        ),
+                                )
+                            })
+                            .child(
+                                canvas(
+                                    |bounds, _, _| bounds,
+                                    move |bounds, _, window, _| {
+                                        if !is_visible {
+                                            return;
+                                        }
+                                        let sf = window.scale_factor();
+                                        let clip = clip_for_card.borrow().unwrap_or(bounds);
+                                        thumbs_for_card.borrow_mut().update_slot(
+                                            target_hwnd,
+                                            bounds,
+                                            clip,
+                                            sf,
+                                            preview_fit,
+                                        );
+                                    },
+                                )
+                                .absolute()
+                                .inset_0()
+                                .size_full(),
+                            );
+
+                        let (thumb_pane, below_label) = match label_pos {
+                            LabelPosition::BottomRight => (
+                                thumb_pane.child(
+                                    div()
+                                        .absolute()
+                                        .bottom(px(8.0))
+                                        .right(px(8.0))
+                                        .child(label_pill),
+                                ),
+                                None,
+                            ),
+                            LabelPosition::BottomLeft => (
+                                thumb_pane.child(
+                                    div()
+                                        .absolute()
+                                        .bottom(px(8.0))
+                                        .left(px(8.0))
+                                        .child(label_pill),
+                                ),
+                                None,
+                            ),
+                            LabelPosition::Center => (
+                                thumb_pane.child(
+                                    div()
                                         .absolute()
                                         .inset_0()
-                                        .size_full(),
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .px_2()
+                                        .child(label_pill),
+                                ),
+                                None,
+                            ),
+                            LabelPosition::Below => (thumb_pane, Some(label_pill)),
+                        };
+
+                        let mut item_el = div()
+                            .id(("mission-item", card_flat_index))
+                            .w(px(tile_outer_w))
+                            .flex_shrink_0()
+                            .h(px(item_total_h))
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                                if *hovered {
+                                    this.hovered_flat = Some(card_flat_index);
+                                } else if this.hovered_flat == Some(card_flat_index) {
+                                    this.hovered_flat = None;
+                                }
+                                cx.notify();
+                            }))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                if this.dismiss_armed_delete(cx) {
+                                    return;
+                                }
+                                this.selected_flat = card_flat_index;
+                                this.activate_window(target_hwnd, cx);
+                            }))
+                            .child(
+                                div()
+                                    .w(px(tile_outer_w))
+                                    .h(px(preview_h + TOTAL_RING_PAD * 2.0))
+                                    .rounded(px(12.0))
+                                    .border(px(OUTER_GLOW_PAD))
+                                    .border_color(outer_glow)
+                                    .bg(rgba(0x00000000))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        div()
+                                            .w(px(preview_w + (MID_GLOW_PAD + INNER_RING_PAD) * 2.0))
+                                            .h(px(preview_h + (MID_GLOW_PAD + INNER_RING_PAD) * 2.0))
+                                            .rounded(px(9.0))
+                                            .border(px(MID_GLOW_PAD))
+                                            .border_color(mid_glow)
+                                            .bg(rgba(0x00000000))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(
+                                                div()
+                                                    .w(px(preview_w + INNER_RING_PAD * 2.0))
+                                                    .h(px(preview_h + INNER_RING_PAD * 2.0))
+                                                    .rounded(px(6.0))
+                                                    .border(px(INNER_RING_PAD))
+                                                    .border_color(inner_ring)
+                                                    .bg(rgba(0x00000000))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .child(thumb_pane),
+                                            ),
                                     ),
                             );
 
-                        row_el = row_el.child(card_el);
-                    }
+                        if let Some(pill) = below_label {
+                            item_el = item_el.child(div().mt(px(BELOW_LABEL_GAP)).child(pill));
+                        }
 
-                    // Fill trailing empty grid slots so partial rows keep identical card width!
-                    for _ in row_chunk.len()..cols {
-                        row_el = row_el.child(div().flex_1().min_w_0());
+                        row_el = row_el.child(item_el);
                     }
 
                     rows_col = rows_col.child(row_el);
@@ -1028,9 +1712,8 @@ impl Render for SwitcherView {
             group_elements.push(section);
         }
 
-        // Scrollbar geometry when content overflows viewport
         let show_scrollbar = max_scroll > 1.0;
-        let thumb_ratio = (view_h / total_content_h.max(1.0)).clamp(0.12, 1.0);
+        let thumb_ratio = (view_h / total_content_h.max(1.0)).clamp(0.10, 1.0);
         let thumb_h = (view_h * thumb_ratio).max(32.0);
         let thumb_top = if max_scroll > 0.0 {
             (scroll_y / max_scroll) * (view_h - thumb_h).max(0.0)
@@ -1038,97 +1721,65 @@ impl Render for SwitcherView {
             0.0
         };
 
-        let root_bg = match self.config.background {
-            gpui::WindowBackgroundAppearance::Opaque => rgb(0x11151E).into(),
-            gpui::WindowBackgroundAppearance::Transparent => rgba(0x0E121AE0),
-            gpui::WindowBackgroundAppearance::Blurred => rgba(0x0E121BD4),
-        };
+        let active_toast = self.transient_toast.as_ref().and_then(|(msg, at)| {
+            (at.elapsed() < Duration::from_secs(3)).then(|| msg.clone())
+        });
 
         div()
-            .id("windeck-root")
+            .id("windeck-mission-control")
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _, _, cx| {
+                    this.dismiss_armed_delete(cx);
+                }),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                if this.dismiss_armed_delete(cx) {
+                    return;
+                }
+                this.hide(cx);
+            }))
             .size_full()
             .flex()
             .flex_col()
-            .bg(root_bg)
-            .border_1()
-            .border_color(rgba(0xFFFFFF22))
-            .text_color(rgb(0xF1F5F9))
-            // === TOP HEADER BAR ===
+            .bg(rgba(0x00000001))
+            .text_color(rgb(0xFFFFFF))
+            // === TOP FLOATING APPLE SPACES BAR ===
             .child(
                 div()
-                    .h(px(50.0))
+                    .h(px(TOP_SPACES_BAR_H))
                     .flex_shrink_0()
-                    .px_5()
+                    .w_full()
+                    .pt(px(18.0))
+                    .pb(px(8.0))
                     .flex()
                     .flex_row()
                     .items_center()
-                    .justify_between()
-                    .border_b_1()
-                    .border_color(rgba(0xFFFFFF14))
-                    .bg(rgba(0x0B0F1788))
+                    .justify_center()
                     .child(
                         div()
+                            .id("space-bar-capsule")
+                            .px(px(6.0))
+                            .py(px(4.0))
+                            .rounded_full()
+                            .bg(rgba(0x0B0F1866))
+                            .border_1()
+                            .border_color(rgba(0xFFFFFF18))
                             .flex()
                             .flex_row()
                             .items_center()
-                            .gap_3()
-                            .child(
-                                div()
-                                    .text_base()
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(rgb(0xF8FAFC))
-                                    .child("WinDeck"),
-                            )
-                            .child(
-                                div()
-                                    .px_2()
-                                    .py(px(2.0))
-                                    .rounded(px(5.0))
-                                    .bg(rgba(0x3B82F626))
-                                    .border_1()
-                                    .border_color(rgba(0x3B82F655))
-                                    .text_xs()
-                                    .text_color(rgb(0x93C5FD))
-                                    .child(format!(
-                                        "{} 个桌面 · {} 个窗口",
-                                        self.desktops.len(),
-                                        self.total_window_count
-                                    )),
-                            )
-                            .when_some(self.hotkey_warning.clone(), |el, warn| {
-                                el.child(
-                                    div()
-                                        .px_2()
-                                        .py(px(2.0))
-                                        .rounded(px(4.0))
-                                        .bg(rgba(0xEF444433))
-                                        .text_xs()
-                                        .text_color(rgb(0xFCA5A5))
-                                        .child(warn),
-                                )
-                            }),
-                    )
-                    .child(
-                        div()
-                            .flex()
-                            .flex_row()
-                            .items_center()
-                            .gap_3()
-                            .text_xs()
-                            .text_color(rgb(0x94A3B8))
-                            .child(format!("热键 {}", self.config.hotkey))
-                            .child("·")
-                            .child("↑↓←→ / Tab 选择")
-                            .child("·")
-                            .child("Enter / 点击 跳转")
-                            .child("·")
-                            .child("Esc 收起"),
+                            .gap(px(4.0))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.dismiss_armed_delete(cx);
+                            }))
+                            .children(space_pills),
                     ),
             )
-            // === SCROLLABLE UNIFIED VIEWPORT (ALL DESKTOPS + ALL APPS) ===
+            // === FIXED-SIZE MISSION CONTROL CANVAS ===
             .child(
                 div()
                     .relative()
@@ -1136,7 +1787,6 @@ impl Render for SwitcherView {
                     .min_h_0()
                     .w_full()
                     .overflow_hidden()
-                    // Capture exact viewport clip bounds in prepaint BEFORE card canvases paint
                     .child(
                         canvas(
                             move |bounds, _, _| {
@@ -1144,7 +1794,7 @@ impl Render for SwitcherView {
                                 let w = f32::from(bounds.size.width);
                                 let h = f32::from(bounds.size.height);
                                 if w > 100.0 {
-                                    viewport_w_cell.set(w - 40.0);
+                                    viewport_w_cell.set(w);
                                 }
                                 if h > 100.0 {
                                     viewport_h_cell.set(h);
@@ -1159,66 +1809,78 @@ impl Render for SwitcherView {
                     .child(
                         div()
                             .relative()
-                            .top(px(-scroll_y))
+                            .top(px(optical_top_pad - scroll_y))
                             .w_full()
-                            .px_5()
-                            .pt(px(CONTENT_PAD_TOP))
-                            .pb(px(CONTENT_PAD_BOTTOM))
                             .flex()
                             .flex_col()
-                            .children(group_elements),
+                            .items_center()
+                            .px(px(CANVAS_PAD_X))
+                            .pt(px(CONTENT_PAD_TOP))
+                            .pb(px(CONTENT_PAD_BOTTOM))
+                            .child(
+                                div()
+                                    .w(px(grid_total_w))
+                                    .flex()
+                                    .flex_col()
+                                    .children(group_elements),
+                            ),
                     )
                     .when(show_scrollbar, |el| {
                         el.child(
                             div()
                                 .absolute()
-                                .top(px(thumb_top + 4.0))
+                                .top(px(thumb_top + 6.0))
                                 .right(px(5.0))
-                                .w(px(5.0))
-                                .h(px((thumb_h - 8.0).max(20.0)))
+                                .w(px(4.0))
+                                .h(px((thumb_h - 12.0).max(22.0)))
                                 .rounded_full()
-                                .bg(rgba(0xFFFFFF44)),
+                                .bg(rgba(0xFFFFFF38)),
                         )
                     }),
             )
-            // === BOTTOM STATUS BAR ===
-            .child(
-                div()
-                    .h(px(32.0))
-                    .flex_shrink_0()
-                    .px_5()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_between()
-                    .border_t_1()
-                    .border_color(rgba(0xFFFFFF12))
-                    .bg(rgba(0x0B0F1799))
-                    .text_xs()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .overflow_hidden()
-                            .whitespace_nowrap()
-                            .text_ellipsis()
-                            .text_color(rgb(0xCBD5E1))
-                            .child(
-                                self.status_notice
-                                    .clone()
-                                    .unwrap_or_else(|| SharedString::from(selected_summary)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .ml_4()
-                            .text_color(rgb(0x64748B))
-                            .child(format!(
-                                "呼出 {:.1}ms · 枚举 {:.1}ms · 滚轮翻页 · F5 刷新",
-                                self.last_open_ms, self.last_enum_ms
-                            )),
-                    ),
-            )
+            .when_some(active_toast, |el, msg| {
+                el.child(
+                    div()
+                        .absolute()
+                        .bottom(px(16.0))
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .px_4()
+                                .py(px(6.0))
+                                .rounded_full()
+                                .bg(rgba(0x0B0F18DC))
+                                .border_1()
+                                .border_color(rgba(0xFFFFFF28))
+                                .text_xs()
+                                .text_color(rgba(0xFFFFFFF2))
+                                .child(msg),
+                        ),
+                )
+            })
+            .when_some(self.hotkey_warning.clone(), |el, warn| {
+                el.child(
+                    div()
+                        .absolute()
+                        .bottom(px(16.0))
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .px_4()
+                                .py(px(6.0))
+                                .rounded_full()
+                                .bg(rgba(0xEF444455))
+                                .text_xs()
+                                .text_color(rgba(0xFFFFFFEB))
+                                .child(warn),
+                        ),
+                )
+            })
     }
 }

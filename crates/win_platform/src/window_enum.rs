@@ -277,7 +277,7 @@ pub fn enumerate_windows(
     vdm: &VirtualDesktopClient,
     desktops: &[VirtualDesktopInfo],
     monitors: &[MonitorInfo],
-    exclude_hwnd: Option<isize>,
+    exclude_hwnds: &[isize],
     collect_diagnostics: bool,
 ) -> Result<(Vec<WindowInfo>, Vec<RawWindowDiagnostic>)> {
     let mut raw_hwnds: Vec<HWND> = Vec::new();
@@ -319,7 +319,7 @@ pub fn enumerate_windows(
         let mut pid = 0u32;
         unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
 
-        let reject_reason: Option<String> = if exclude_hwnd == Some(raw_id) {
+        let reject_reason: Option<String> = if exclude_hwnds.contains(&raw_id) {
             Some("self_window".into())
         } else if (ex_style & WS_EX_TOOLWINDOW.0) != 0 {
             Some("WS_EX_TOOLWINDOW".into())

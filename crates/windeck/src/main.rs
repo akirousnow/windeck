@@ -12,13 +12,13 @@ use std::time::Duration;
 
 use anyhow::Result;
 use gpui::{
-    App, Application, Bounds, Window, WindowBounds, WindowKind, WindowOptions, prelude::*, px,
-    size,
+    App, Application, Bounds, TitlebarOptions, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowKind, WindowOptions, prelude::*, px, size,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use win_platform::{
-    ShellEvent, ShellHost, VirtualDesktopClient, apply_win11_rounded_corners,
-    current_session_desktop_names,
+    ShellEvent, ShellHost, SingleInstanceGuard, ThumbnailHostWindow, VirtualDesktopClient,
+    configure_borderless_immersive, current_session_desktop_names, notify_existing_instance,
 };
 use windows::Win32::Foundation::HWND;
 
@@ -51,11 +51,36 @@ fn main() -> Result<()> {
         attach_parent_console_if_needed();
     }
 
+    // Single-instance guard: prevent duplicate tray icons & hotkey conflicts.
+    // When launched a second time interactively, wake the already-running instance and exit cleanly.
+    let _single_instance_guard = if bench_mode {
+        None
+    } else {
+        match SingleInstanceGuard::try_acquire()? {
+            Some(guard) => Some(guard),
+            None => {
+                if !start_hidden {
+                    let woke = notify_existing_instance();
+                    append_log(&format!(
+                        "SECOND_INSTANCE detected -> notified existing instance (woke={woke}), exiting"
+                    ));
+                }
+                return Ok(());
+            }
+        }
+    };
+
     let config = AppConfig::load_or_create();
     let (winsta, desk) = current_session_desktop_names();
     append_log(&format!(
-        "STARTUP hotkey='{}' desktop='{}\\{}' hidden={} bench={}",
-        config.hotkey, winsta, desk, start_hidden, bench_mode
+        "STARTUP hotkey='{}' immersive={} label='{}' desktop='{}\\{}' hidden={} bench={}",
+        config.hotkey,
+        config.immersive,
+        config.label_position.as_config_str(),
+        winsta,
+        desk,
+        start_hidden,
+        bench_mode
     ));
 
     let vdm = Arc::new(VirtualDesktopClient::new()?);
@@ -93,7 +118,9 @@ fn main() -> Result<()> {
     }
 
     let shell_host = Arc::new(shell_host);
-    let initial_bg = config.background;
+    let initial_immersive = config.immersive;
+    let initial_backdrop = config.background;
+    let initial_blur_opacity = config.blur_opacity;
 
     Application::new().run(move |cx: &mut App| {
         let initial_bounds = Bounds::centered(None, size(px(1440.0), px(860.0)), cx);
@@ -101,26 +128,40 @@ fn main() -> Result<()> {
         let config_clone = config.clone();
         let shell_for_loop = shell_host.clone();
 
+        // Two-layer compositing:
+        // - Top layer (this GPUI window): per-pixel transparent DirectComposition interactive UI + embedded badges
+        // - Bottom layer (ThumbnailHostWindow): frosted Win11 Acrylic backdrop + live DWM thumbnails
         let opened = cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(initial_bounds)),
-                titlebar: None,
+                titlebar: Some(TitlebarOptions {
+                    title: None,
+                    appears_transparent: false,
+                    traffic_light_position: None,
+                }),
                 focus: false,
                 show: false,
                 kind: WindowKind::PopUp,
                 is_movable: false,
                 is_resizable: false,
                 is_minimizable: false,
-                window_background: initial_bg,
+                window_background: WindowBackgroundAppearance::Transparent,
                 ..Default::default()
             },
             move |window, cx| {
                 let gpui_hwnd = extract_hwnd(window).expect("extract GPUI Win32 HWND");
-                apply_win11_rounded_corners(gpui_hwnd);
+                configure_borderless_immersive(gpui_hwnd, initial_immersive);
+                let thumb_host = ThumbnailHostWindow::create(
+                    initial_immersive,
+                    initial_backdrop,
+                    initial_blur_opacity,
+                )
+                .expect("create bottom ThumbnailHostWindow");
 
                 let view = cx.new(|cx| {
                     let v = SwitcherView::new(
                         gpui_hwnd,
+                        thumb_host,
                         vdm_clone,
                         config_clone,
                         hotkey_warning,
@@ -156,7 +197,6 @@ fn main() -> Result<()> {
                     })
                     .detach();
                 } else {
-                    // Show immediately on launch unless --hidden was passed (great for immediate user testing).
                     if !start_hidden {
                         let view_init = view.clone();
                         cx.spawn(async move |cx| {
@@ -171,7 +211,6 @@ fn main() -> Result<()> {
                         .detach();
                     }
 
-                    // Bridge Win32 ShellHost events (hotkey / tray / Explorer restart) into GPUI
                     cx.spawn(async move |cx| {
                         while let Ok(ev) = event_rx.recv().await {
                             let _ = cx.update(|cx| match ev {
@@ -181,6 +220,16 @@ fn main() -> Result<()> {
                                             v.toggle(window, cx);
                                         });
                                     });
+                                }
+                                ShellEvent::ShowOverlay => {
+                                    let _ = window_handle.update(cx, |_, window, cx| {
+                                        view_for_events.update(cx, |v, cx| {
+                                            v.show_and_refresh(window, cx);
+                                        });
+                                    });
+                                }
+                                ShellEvent::AutostartToggled(enabled) => {
+                                    append_log(&format!("AUTOSTART toggled -> enabled={enabled}"));
                                 }
                                 ShellEvent::ReloadConfig => {
                                     let new_cfg = AppConfig::load_or_create();

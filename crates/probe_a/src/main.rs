@@ -97,7 +97,7 @@ fn run_self_test(vdm: &VirtualDesktopClient) -> Result<()> {
 
     let desktops = vdm.get_desktops()?;
     let monitors = enumerate_monitors();
-    let (kept, diags) = enumerate_windows(vdm, &desktops, &monitors, None, true)?;
+    let (kept, diags) = enumerate_windows(vdm, &desktops, &monitors, &[], true)?;
 
     let kept_normal = kept.iter().any(|w| w.hwnd == normal_hwnd.0 as isize);
     let kept_tool = kept.iter().any(|w| w.hwnd == tool_hwnd.0 as isize);
@@ -146,6 +146,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let dump_all = args.iter().any(|a| a == "--dump-all");
     let self_test = args.iter().any(|a| a == "--self-test");
+    let test_create_desktop = args.iter().any(|a| a == "--test-create-desktop");
     let switch_target = args
         .windows(2)
         .find(|w| w[0] == "--switch")
@@ -221,6 +222,38 @@ fn main() -> Result<()> {
         );
     }
 
+    if test_create_desktop {
+        println!("\n=== TEST CREATE + REMOVE VIRTUAL DESKTOP ===");
+        let before = vdm.get_desktops()?;
+        let cur_id = before
+            .iter()
+            .find(|d| d.is_current)
+            .map(|d| d.id)
+            .unwrap_or(before[0].id);
+        let new_id = vdm.create_desktop()?;
+        let after_create = vdm.get_desktops()?;
+        println!(
+            "Created desktop {} | count {} -> {} (active unchanged: {})",
+            new_id,
+            before.len(),
+            after_create.len(),
+            after_create.iter().any(|d| d.is_current && d.id == cur_id)
+        );
+        assert_eq!(after_create.len(), before.len() + 1);
+        assert!(after_create.iter().any(|d| d.id == new_id));
+        vdm.remove_desktop(new_id, cur_id)?;
+        let after_remove = vdm.get_desktops()?;
+        println!(
+            "Removed desktop {} | count {} -> {}",
+            new_id,
+            after_create.len(),
+            after_remove.len()
+        );
+        assert_eq!(after_remove.len(), before.len());
+        println!("CREATE+REMOVE DESKTOP ROUND-TRIP PASSED!");
+        return Ok(());
+    }
+
     if self_test {
         return run_self_test(&vdm);
     }
@@ -235,7 +268,7 @@ fn main() -> Result<()> {
     }
 
     let t2 = Instant::now();
-    let (windows, diagnostics) = enumerate_windows(&vdm, &desktops, &monitors, None, dump_all)?;
+    let (windows, diagnostics) = enumerate_windows(&vdm, &desktops, &monitors, &[], dump_all)?;
     println!(
         "\n=== ALT-TAB WINDOWS ({} kept in {:.2} ms) ===",
         windows.len(),

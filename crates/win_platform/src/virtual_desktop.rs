@@ -6,6 +6,7 @@ use std::thread;
 
 use anyhow::{Context, Result, anyhow};
 use windows::Win32::Foundation::HWND;
+use windows::Win32::Graphics::Gdi::HMONITOR;
 use windows::Win32::System::Com::{
     CLSCTX_ALL, CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
     CoUninitialize, IServiceProvider,
@@ -15,6 +16,8 @@ use windows::Win32::UI::Shell::{IVirtualDesktopManager, VirtualDesktopManager};
 use windows_core::{BOOL, GUID, HRESULT, HSTRING, IUnknown, IUnknown_Vtbl, Interface, PCWSTR, interface};
 use windows_registry::CURRENT_USER;
 
+use crate::os_version::OsVersion;
+
 const CLSID_IMMERSIVE_SHELL: GUID = GUID::from_u128(0xc2f03a33_21f5_47fa_b4bb_156362a2f239);
 const CLSID_VIRTUAL_DESKTOP_MANAGER_INTERNAL: GUID =
     GUID::from_u128(0xc5e0cdca_7b6e_41b2_9fc4_d93975cc467b);
@@ -23,10 +26,12 @@ const CLSID_VIRTUAL_DESKTOP_PINNED_APPS: GUID =
 const CLSID_APPLICATION_VIEW_COLLECTION: GUID =
     GUID::from_u128(0x1841c6d7_4f9d_42c0_af41_8747538f10e5);
 
-// Candidate IIDs for IVirtualDesktopManagerInternal across Win11 builds:
-// - 24H2 (26100+) / 25H2 / 26H1 (28000): 53F5CA0B-158F-4124-900C-057158060B27
-// - 23H2 (22631.3085+):                 A3175A2D-ED79-4907-A53E-91B73B1467B5
-// - 22H2 (22621):                       B2F925B9-5A0F-4D2E-9F4D-2B1507593C10 (different vtable, HMONITOR arg)
+// Complete IVirtualDesktopManagerInternal & IVirtualDesktop compatibility profiles across Win10 & Win11:
+// 1. Win11 24H2 (26100.2605+) / 25H2 / 26H1 (28000+): IID 53F5CA0B (has SwitchDesktopAndMoveForegroundView) + IVirtualDesktop 3F07F4BE
+// 2. Win11 23H2 (22631.3085+) / early 24H2 (<26100.2605): IID 53F5CA0B (no SwitchDesktopAndMoveForegroundView) + IVirtualDesktop 3F07F4BE
+// 3. Win11 22H2 (22621.2215..3084) / early 23H2: IID A3175F2D + IVirtualDesktop 3F07F4BE
+// 4. Win11 21H2 (22000) / early 22H2 (<22621.2215): IID B2F925B9 (HMONITOR arg) + IVirtualDesktop 536D3495
+// 5. Win10 1809..22H2 (17763..19045): IID F31574D6 + IVirtualDesktop FF72FFDD
 
 #[interface("372E1D3B-38D3-42E4-A15B-8AB2B178F513")]
 unsafe trait IApplicationView: IUnknown {}
@@ -39,13 +44,31 @@ unsafe trait IApplicationViewCollection: IUnknown {
     fn get_view_for_hwnd(&self, hwnd: HWND, out: *mut *mut c_void) -> HRESULT;
 }
 
+/// Win11 22H2 (22621.2215+) .. 26H1
 #[interface("3F07F4BE-B107-441A-AF0F-39D82529072C")]
-unsafe trait IVirtualDesktop24H2: IUnknown {
+unsafe trait IVirtualDesktopModern: IUnknown {
     fn is_view_visible(&self, view: *mut c_void, visible: *mut i32) -> HRESULT;
     fn get_id(&self, id: *mut GUID) -> HRESULT;
     fn get_name(&self, name: *mut HSTRING) -> HRESULT;
 }
 
+/// Win11 21H2 (22000) & 22H2 (< 22621.2215)
+#[interface("536D3495-B208-4CC9-AE26-DE8111275BF8")]
+unsafe trait IVirtualDesktopWin11Legacy: IUnknown {
+    fn is_view_visible(&self, view: *mut c_void, visible: *mut i32) -> HRESULT;
+    fn get_id(&self, id: *mut GUID) -> HRESULT;
+    fn get_monitor(&self, monitor: *mut HMONITOR) -> HRESULT;
+    fn get_name(&self, name: *mut HSTRING) -> HRESULT;
+}
+
+/// Windows 10 1809..22H2 (Build 17763..19045)
+#[interface("FF72FFDD-BE7E-43FC-9C03-AD81681E88E4")]
+unsafe trait IVirtualDesktopWin10: IUnknown {
+    fn is_view_visible(&self, view: *mut c_void, visible: *mut i32) -> HRESULT;
+    fn get_id(&self, id: *mut GUID) -> HRESULT;
+}
+
+/// Profile 1: Win11 24H2 (26100.2605+) / 25H2 / 26H1 (28000+)
 #[interface("53F5CA0B-158F-4124-900C-057158060B27")]
 unsafe trait IVirtualDesktopManagerInternal24H2: IUnknown {
     fn get_count(&self, count: *mut u32) -> HRESULT;
@@ -60,10 +83,15 @@ unsafe trait IVirtualDesktopManagerInternal24H2: IUnknown {
         out: *mut *mut c_void,
     ) -> HRESULT;
     fn switch_desktop(&self, desktop: *mut c_void) -> HRESULT;
+    fn switch_desktop_and_move_foreground_view(&self, desktop: *mut c_void) -> HRESULT;
+    fn create_desktop(&self, out: *mut *mut c_void) -> HRESULT;
+    fn move_desktop(&self, desktop: *mut c_void, index: i32) -> HRESULT;
+    fn remove_desktop(&self, destroy: *mut c_void, fallback: *mut c_void) -> HRESULT;
 }
 
-#[interface("A3175A2D-ED79-4907-A53E-91B73B1467B5")]
-unsafe trait IVirtualDesktopManagerInternal23H2: IUnknown {
+/// Profile 2: Win11 23H2 (22631.3085+) & early 24H2 (< 26100.2605) — same IID 53F5CA0B, no SwitchDesktopAndMoveForegroundView
+#[interface("53F5CA0B-158F-4124-900C-057158060B27")]
+unsafe trait IVirtualDesktopManagerInternal23H2Late: IUnknown {
     fn get_count(&self, count: *mut u32) -> HRESULT;
     fn move_view_to_desktop(&self, view: *mut c_void, desktop: *mut c_void) -> HRESULT;
     fn can_view_move_desktops(&self, view: *mut c_void, can_move: *mut i32) -> HRESULT;
@@ -76,6 +104,69 @@ unsafe trait IVirtualDesktopManagerInternal23H2: IUnknown {
         out: *mut *mut c_void,
     ) -> HRESULT;
     fn switch_desktop(&self, desktop: *mut c_void) -> HRESULT;
+    fn create_desktop(&self, out: *mut *mut c_void) -> HRESULT;
+    fn move_desktop(&self, desktop: *mut c_void, index: i32) -> HRESULT;
+    fn remove_desktop(&self, destroy: *mut c_void, fallback: *mut c_void) -> HRESULT;
+}
+
+/// Profile 3: Win11 22H2 (22621.2215..3084) & early 23H2
+#[interface("A3175F2D-239C-4BD2-8AA0-EEBA8B0B138E")]
+unsafe trait IVirtualDesktopManagerInternal23H2Early: IUnknown {
+    fn get_count(&self, count: *mut u32) -> HRESULT;
+    fn move_view_to_desktop(&self, view: *mut c_void, desktop: *mut c_void) -> HRESULT;
+    fn can_view_move_desktops(&self, view: *mut c_void, can_move: *mut i32) -> HRESULT;
+    fn get_current_desktop(&self, out: *mut *mut c_void) -> HRESULT;
+    fn get_desktops(&self, out: *mut *mut c_void) -> HRESULT;
+    fn get_adjacent_desktop(
+        &self,
+        from: *mut c_void,
+        direction: i32,
+        out: *mut *mut c_void,
+    ) -> HRESULT;
+    fn switch_desktop(&self, desktop: *mut c_void) -> HRESULT;
+    fn create_desktop(&self, out: *mut *mut c_void) -> HRESULT;
+    fn move_desktop(&self, desktop: *mut c_void, index: i32) -> HRESULT;
+    fn remove_desktop(&self, destroy: *mut c_void, fallback: *mut c_void) -> HRESULT;
+}
+
+/// Profile 4: Win11 21H2 (22000) & 22H2 (< 22621.2215) — HMONITOR parameter on manager calls
+#[interface("B2F925B9-5A0F-4D2E-9F4D-2B1507593C10")]
+unsafe trait IVirtualDesktopManagerInternal21H2: IUnknown {
+    fn get_count(&self, monitor: HMONITOR, count: *mut u32) -> HRESULT;
+    fn move_view_to_desktop(&self, view: *mut c_void, desktop: *mut c_void) -> HRESULT;
+    fn can_view_move_desktops(&self, view: *mut c_void, can_move: *mut i32) -> HRESULT;
+    fn get_current_desktop(&self, monitor: HMONITOR, out: *mut *mut c_void) -> HRESULT;
+    fn get_all_current_desktops(&self, out: *mut *mut c_void) -> HRESULT;
+    fn get_desktops(&self, monitor: HMONITOR, out: *mut *mut c_void) -> HRESULT;
+    fn get_adjacent_desktop(
+        &self,
+        from: *mut c_void,
+        direction: i32,
+        out: *mut *mut c_void,
+    ) -> HRESULT;
+    fn switch_desktop(&self, monitor: HMONITOR, desktop: *mut c_void) -> HRESULT;
+    fn create_desktop(&self, monitor: HMONITOR, out: *mut *mut c_void) -> HRESULT;
+    fn move_desktop(&self, desktop: *mut c_void, monitor: HMONITOR, index: i32) -> HRESULT;
+    fn remove_desktop(&self, destroy: *mut c_void, fallback: *mut c_void) -> HRESULT;
+}
+
+/// Profile 5: Windows 10 1809..22H2 (Build 17763..19045)
+#[interface("F31574D6-B682-4CDC-BD56-1827860ABEC6")]
+unsafe trait IVirtualDesktopManagerInternalWin10: IUnknown {
+    fn get_count(&self, count: *mut u32) -> HRESULT;
+    fn move_view_to_desktop(&self, view: *mut c_void, desktop: *mut c_void) -> HRESULT;
+    fn can_view_move_desktops(&self, view: *mut c_void, can_move: *mut i32) -> HRESULT;
+    fn get_current_desktop(&self, out: *mut *mut c_void) -> HRESULT;
+    fn get_desktops(&self, out: *mut *mut c_void) -> HRESULT;
+    fn get_adjacent_desktop(
+        &self,
+        from: *mut c_void,
+        direction: i32,
+        out: *mut *mut c_void,
+    ) -> HRESULT;
+    fn switch_desktop(&self, desktop: *mut c_void) -> HRESULT;
+    fn create_desktop(&self, out: *mut *mut c_void) -> HRESULT;
+    fn remove_desktop(&self, destroy: *mut c_void, fallback: *mut c_void) -> HRESULT;
 }
 
 #[interface("4CE81583-1E4C-4632-A621-07A53543148F")]
@@ -206,16 +297,107 @@ pub fn read_registry_desktops() -> Result<RegistryDesktopSnapshot> {
     })
 }
 
+enum ComVirtualDesktop {
+    Modern(IVirtualDesktopModern),
+    Win11Legacy(IVirtualDesktopWin11Legacy),
+    Win10(IVirtualDesktopWin10),
+}
+
+impl ComVirtualDesktop {
+    fn as_raw(&self) -> *mut c_void {
+        match self {
+            ComVirtualDesktop::Modern(d) => d.as_raw(),
+            ComVirtualDesktop::Win11Legacy(d) => d.as_raw(),
+            ComVirtualDesktop::Win10(d) => d.as_raw(),
+        }
+    }
+
+    unsafe fn get_id(&self) -> windows_core::Result<DesktopId> {
+        let mut guid = GUID::zeroed();
+        let hr = match self {
+            ComVirtualDesktop::Modern(d) => unsafe { d.get_id(&mut guid) },
+            ComVirtualDesktop::Win11Legacy(d) => unsafe { d.get_id(&mut guid) },
+            ComVirtualDesktop::Win10(d) => unsafe { d.get_id(&mut guid) },
+        };
+        hr.ok()?;
+        Ok(DesktopId(guid))
+    }
+
+    unsafe fn get_name(&self) -> Option<String> {
+        let mut hstr = HSTRING::new();
+        let hr = match self {
+            ComVirtualDesktop::Modern(d) => unsafe { d.get_name(&mut hstr) },
+            ComVirtualDesktop::Win11Legacy(d) => unsafe { d.get_name(&mut hstr) },
+            // Win10 IVirtualDesktop (FF72FFDD) has no GetName; Registry supplies custom names on Win10 2004+.
+            ComVirtualDesktop::Win10(_) => return None,
+        };
+        if hr.is_ok() {
+            let s = hstr.to_string();
+            if s.trim().is_empty() { None } else { Some(s) }
+        } else {
+            None
+        }
+    }
+
+    unsafe fn is_view_visible(&self, view: *mut c_void) -> bool {
+        let mut vis = 0i32;
+        let hr = match self {
+            ComVirtualDesktop::Modern(d) => unsafe { d.is_view_visible(view, &mut vis) },
+            ComVirtualDesktop::Win11Legacy(d) => unsafe { d.is_view_visible(view, &mut vis) },
+            ComVirtualDesktop::Win10(d) => unsafe { d.is_view_visible(view, &mut vis) },
+        };
+        hr.is_ok() && vis != 0
+    }
+}
+
 enum InternalVdm {
     Win11_24H2(IVirtualDesktopManagerInternal24H2),
-    Win11_23H2(IVirtualDesktopManagerInternal23H2),
+    Win11_23H2Late(IVirtualDesktopManagerInternal23H2Late),
+    Win11_23H2Early(IVirtualDesktopManagerInternal23H2Early),
+    Win11_21H2(IVirtualDesktopManagerInternal21H2),
+    Win10(IVirtualDesktopManagerInternalWin10),
 }
 
 impl InternalVdm {
     fn profile_name(&self) -> &'static str {
         match self {
-            InternalVdm::Win11_24H2(_) => "Win11_24H2+ (53F5CA0B)",
-            InternalVdm::Win11_23H2(_) => "Win11_23H2 (A3175A2D)",
+            InternalVdm::Win11_24H2(_) => "Win11_24H2+ (53F5CA0B, 26100.2605+)",
+            InternalVdm::Win11_23H2Late(_) => "Win11_23H2+ (53F5CA0B, <26100.2605)",
+            InternalVdm::Win11_23H2Early(_) => "Win11_22H2/23H2 (A3175F2D)",
+            InternalVdm::Win11_21H2(_) => "Win11_21H2/22H2 (B2F925B9)",
+            InternalVdm::Win10(_) => "Win10_1809..22H2 (F31574D6)",
+        }
+    }
+
+    unsafe fn wrap_raw_desktop(&self, raw: *mut c_void) -> ComVirtualDesktop {
+        match self {
+            InternalVdm::Win11_24H2(_)
+            | InternalVdm::Win11_23H2Late(_)
+            | InternalVdm::Win11_23H2Early(_) => {
+                ComVirtualDesktop::Modern(unsafe { IVirtualDesktopModern::from_raw(raw) })
+            }
+            InternalVdm::Win11_21H2(_) => {
+                ComVirtualDesktop::Win11Legacy(unsafe { IVirtualDesktopWin11Legacy::from_raw(raw) })
+            }
+            InternalVdm::Win10(_) => {
+                ComVirtualDesktop::Win10(unsafe { IVirtualDesktopWin10::from_raw(raw) })
+            }
+        }
+    }
+
+    unsafe fn get_at(&self, array: &IObjectArray, idx: u32) -> windows_core::Result<ComVirtualDesktop> {
+        match self {
+            InternalVdm::Win11_24H2(_)
+            | InternalVdm::Win11_23H2Late(_)
+            | InternalVdm::Win11_23H2Early(_) => {
+                Ok(ComVirtualDesktop::Modern(unsafe { array.GetAt::<IVirtualDesktopModern>(idx)? }))
+            }
+            InternalVdm::Win11_21H2(_) => Ok(ComVirtualDesktop::Win11Legacy(unsafe {
+                array.GetAt::<IVirtualDesktopWin11Legacy>(idx)?
+            })),
+            InternalVdm::Win10(_) => {
+                Ok(ComVirtualDesktop::Win10(unsafe { array.GetAt::<IVirtualDesktopWin10>(idx)? }))
+            }
         }
     }
 
@@ -223,17 +405,25 @@ impl InternalVdm {
         let mut count = 0u32;
         let hr = match self {
             InternalVdm::Win11_24H2(v) => unsafe { v.get_count(&mut count) },
-            InternalVdm::Win11_23H2(v) => unsafe { v.get_count(&mut count) },
+            InternalVdm::Win11_23H2Late(v) => unsafe { v.get_count(&mut count) },
+            InternalVdm::Win11_23H2Early(v) => unsafe { v.get_count(&mut count) },
+            InternalVdm::Win11_21H2(v) => unsafe { v.get_count(HMONITOR::default(), &mut count) },
+            InternalVdm::Win10(v) => unsafe { v.get_count(&mut count) },
         };
         hr.ok()?;
         Ok(count)
     }
 
-    unsafe fn get_current_desktop(&self) -> windows_core::Result<IVirtualDesktop24H2> {
+    unsafe fn get_current_desktop(&self) -> windows_core::Result<ComVirtualDesktop> {
         let mut raw: *mut c_void = std::ptr::null_mut();
         let hr = match self {
             InternalVdm::Win11_24H2(v) => unsafe { v.get_current_desktop(&mut raw) },
-            InternalVdm::Win11_23H2(v) => unsafe { v.get_current_desktop(&mut raw) },
+            InternalVdm::Win11_23H2Late(v) => unsafe { v.get_current_desktop(&mut raw) },
+            InternalVdm::Win11_23H2Early(v) => unsafe { v.get_current_desktop(&mut raw) },
+            InternalVdm::Win11_21H2(v) => unsafe {
+                v.get_current_desktop(HMONITOR::default(), &mut raw)
+            },
+            InternalVdm::Win10(v) => unsafe { v.get_current_desktop(&mut raw) },
         };
         hr.ok()?;
         if raw.is_null() {
@@ -241,14 +431,17 @@ impl InternalVdm {
                 windows::Win32::Foundation::E_POINTER,
             ));
         }
-        Ok(unsafe { IVirtualDesktop24H2::from_raw(raw) })
+        Ok(unsafe { self.wrap_raw_desktop(raw) })
     }
 
     unsafe fn get_desktops(&self) -> windows_core::Result<IObjectArray> {
         let mut raw: *mut c_void = std::ptr::null_mut();
         let hr = match self {
             InternalVdm::Win11_24H2(v) => unsafe { v.get_desktops(&mut raw) },
-            InternalVdm::Win11_23H2(v) => unsafe { v.get_desktops(&mut raw) },
+            InternalVdm::Win11_23H2Late(v) => unsafe { v.get_desktops(&mut raw) },
+            InternalVdm::Win11_23H2Early(v) => unsafe { v.get_desktops(&mut raw) },
+            InternalVdm::Win11_21H2(v) => unsafe { v.get_desktops(HMONITOR::default(), &mut raw) },
+            InternalVdm::Win10(v) => unsafe { v.get_desktops(&mut raw) },
         };
         hr.ok()?;
         if raw.is_null() {
@@ -259,13 +452,69 @@ impl InternalVdm {
         Ok(unsafe { IObjectArray::from_raw(raw) })
     }
 
-    unsafe fn switch_desktop(&self, desktop: &IVirtualDesktop24H2) -> windows_core::Result<()> {
+    unsafe fn switch_desktop(&self, desktop: &ComVirtualDesktop) -> windows_core::Result<()> {
         let hr = match self {
             InternalVdm::Win11_24H2(v) => unsafe { v.switch_desktop(desktop.as_raw()) },
-            InternalVdm::Win11_23H2(v) => unsafe { v.switch_desktop(desktop.as_raw()) },
+            InternalVdm::Win11_23H2Late(v) => unsafe { v.switch_desktop(desktop.as_raw()) },
+            InternalVdm::Win11_23H2Early(v) => unsafe { v.switch_desktop(desktop.as_raw()) },
+            InternalVdm::Win11_21H2(v) => unsafe {
+                v.switch_desktop(HMONITOR::default(), desktop.as_raw())
+            },
+            InternalVdm::Win10(v) => unsafe { v.switch_desktop(desktop.as_raw()) },
         };
         hr.ok()
     }
+
+    unsafe fn create_desktop(&self) -> windows_core::Result<ComVirtualDesktop> {
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        let hr = match self {
+            InternalVdm::Win11_24H2(v) => unsafe { v.create_desktop(&mut raw) },
+            InternalVdm::Win11_23H2Late(v) => unsafe { v.create_desktop(&mut raw) },
+            InternalVdm::Win11_23H2Early(v) => unsafe { v.create_desktop(&mut raw) },
+            InternalVdm::Win11_21H2(v) => unsafe {
+                v.create_desktop(HMONITOR::default(), &mut raw)
+            },
+            InternalVdm::Win10(v) => unsafe { v.create_desktop(&mut raw) },
+        };
+        hr.ok()?;
+        if raw.is_null() {
+            return Err(windows_core::Error::from(
+                windows::Win32::Foundation::E_POINTER,
+            ));
+        }
+        Ok(unsafe { self.wrap_raw_desktop(raw) })
+    }
+
+    unsafe fn remove_desktop(
+        &self,
+        destroy: &ComVirtualDesktop,
+        fallback: &ComVirtualDesktop,
+    ) -> windows_core::Result<()> {
+        let hr = match self {
+            InternalVdm::Win11_24H2(v) => unsafe {
+                v.remove_desktop(destroy.as_raw(), fallback.as_raw())
+            },
+            InternalVdm::Win11_23H2Late(v) => unsafe {
+                v.remove_desktop(destroy.as_raw(), fallback.as_raw())
+            },
+            InternalVdm::Win11_23H2Early(v) => unsafe {
+                v.remove_desktop(destroy.as_raw(), fallback.as_raw())
+            },
+            InternalVdm::Win11_21H2(v) => unsafe {
+                v.remove_desktop(destroy.as_raw(), fallback.as_raw())
+            },
+            InternalVdm::Win10(v) => unsafe {
+                v.remove_desktop(destroy.as_raw(), fallback.as_raw())
+            },
+        };
+        hr.ok()
+    }
+}
+
+fn has_24h2_2605_vtable() -> bool {
+    OsVersion::current()
+        .map(|v| v.build > 26100 || (v.build == 26100 && v.ubr >= 2605))
+        .unwrap_or(true)
 }
 
 struct ComSession {
@@ -314,27 +563,48 @@ impl ComSession {
         let mut pinned_apps = None;
 
         if let Some(ref sp) = sp {
-            // Try 24H2+ profile first (covers 26100, 26200, 28000/26H1), then 23H2.
-            match unsafe {
-                sp.QueryService::<IVirtualDesktopManagerInternal24H2>(
+            // Probe COM profiles newest-to-oldest, using OS build/UBR to disambiguate IID 53F5CA0B's 26100.2605 vtable shift.
+            let try_53f5 = if has_24h2_2605_vtable() {
+                unsafe {
+                    sp.QueryService::<IVirtualDesktopManagerInternal24H2>(
+                        &CLSID_VIRTUAL_DESKTOP_MANAGER_INTERNAL,
+                    )
+                }
+                .map(InternalVdm::Win11_24H2)
+            } else {
+                unsafe {
+                    sp.QueryService::<IVirtualDesktopManagerInternal23H2Late>(
+                        &CLSID_VIRTUAL_DESKTOP_MANAGER_INTERNAL,
+                    )
+                }
+                .map(InternalVdm::Win11_23H2Late)
+            };
+
+            if let Ok(v) = try_53f5 {
+                internal = Some(v);
+            } else if let Ok(v) = unsafe {
+                sp.QueryService::<IVirtualDesktopManagerInternal23H2Early>(
                     &CLSID_VIRTUAL_DESKTOP_MANAGER_INTERNAL,
                 )
             } {
-                Ok(v) => internal = Some(InternalVdm::Win11_24H2(v)),
-                Err(e24) => {
-                    match unsafe {
-                        sp.QueryService::<IVirtualDesktopManagerInternal23H2>(
-                            &CLSID_VIRTUAL_DESKTOP_MANAGER_INTERNAL,
-                        )
-                    } {
-                        Ok(v) => internal = Some(InternalVdm::Win11_23H2(v)),
-                        Err(e23) => {
-                            init_errors.push(format!(
-                                "IVirtualDesktopManagerInternal (24H2: {e24}; 23H2: {e23})"
-                            ));
-                        }
-                    }
-                }
+                internal = Some(InternalVdm::Win11_23H2Early(v));
+            } else if let Ok(v) = unsafe {
+                sp.QueryService::<IVirtualDesktopManagerInternal21H2>(
+                    &CLSID_VIRTUAL_DESKTOP_MANAGER_INTERNAL,
+                )
+            } {
+                internal = Some(InternalVdm::Win11_21H2(v));
+            } else if let Ok(v) = unsafe {
+                sp.QueryService::<IVirtualDesktopManagerInternalWin10>(
+                    &CLSID_VIRTUAL_DESKTOP_MANAGER_INTERNAL,
+                )
+            } {
+                internal = Some(InternalVdm::Win10(v));
+            } else {
+                init_errors.push(
+                    "IVirtualDesktopManagerInternal: no supported IID matched (53F5CA0B/A3175F2D/B2F925B9/F31574D6)"
+                        .to_string(),
+                );
             }
 
             match unsafe {
@@ -377,23 +647,24 @@ impl ComSession {
         }
     }
 
-    fn list_com_desktops(&self) -> windows_core::Result<(Vec<IVirtualDesktop24H2>, Option<DesktopId>)> {
+    fn list_com_desktops(
+        &self,
+    ) -> windows_core::Result<(Vec<ComVirtualDesktop>, Option<DesktopId>)> {
         let Some(ref internal) = self.internal else {
             return Err(windows_core::Error::from(
                 windows::Win32::Foundation::E_NOINTERFACE,
             ));
         };
 
-        let current_id = unsafe { internal.get_current_desktop() }.ok().and_then(|d| {
-            let mut guid = GUID::zeroed();
-            unsafe { d.get_id(&mut guid) }.ok().ok().map(|_| DesktopId(guid))
-        });
+        let current_id = unsafe { internal.get_current_desktop() }
+            .ok()
+            .and_then(|d| unsafe { d.get_id() }.ok());
 
         let array = unsafe { internal.get_desktops()? };
         let count = unsafe { array.GetCount()? };
         let mut out = Vec::with_capacity(count as usize);
         for i in 0..count {
-            if let Ok(d) = unsafe { array.GetAt::<IVirtualDesktop24H2>(i) } {
+            if let Ok(d) = unsafe { internal.get_at(&array, i) } {
                 out.push(d);
             }
         }
@@ -416,18 +687,10 @@ impl ComSession {
             if !com_desktops.is_empty() {
                 let mut result = Vec::with_capacity(com_desktops.len());
                 for (index, d) in com_desktops.iter().enumerate() {
-                    let mut guid = GUID::zeroed();
-                    if unsafe { d.get_id(&mut guid) }.is_err() {
+                    let Ok(id) = (unsafe { d.get_id() }) else {
                         continue;
-                    }
-                    let id = DesktopId(guid);
-                    let mut hstr = HSTRING::new();
-                    let com_name = if unsafe { d.get_name(&mut hstr) }.is_ok() {
-                        let s = hstr.to_string();
-                        if s.trim().is_empty() { None } else { Some(s) }
-                    } else {
-                        None
                     };
+                    let com_name = unsafe { d.get_name() };
                     let custom_name = com_name.or_else(|| {
                         reg.as_ref()
                             .and_then(|r| r.custom_names.get(&id).cloned())
@@ -476,17 +739,11 @@ impl ComSession {
         let mut results = HashMap::with_capacity(hwnds.len());
 
         // Pre-fetch COM desktop objects once per batch so checking IsViewVisible is O(desktops) without repeated IPC.
-        let com_desktops: Vec<(DesktopId, IVirtualDesktop24H2)> = self
+        let com_desktops: Vec<(DesktopId, ComVirtualDesktop)> = self
             .list_com_desktops()
             .map(|(list, _)| {
                 list.into_iter()
-                    .filter_map(|d| {
-                        let mut guid = GUID::zeroed();
-                        unsafe { d.get_id(&mut guid) }
-                            .ok()
-                            .ok()
-                            .map(|_| (DesktopId(guid), d))
-                    })
+                    .filter_map(|d| unsafe { d.get_id() }.ok().map(|id| (id, d)))
                     .collect()
             })
             .unwrap_or_default();
@@ -524,10 +781,7 @@ impl ComSession {
                     // If not pinned, locate the desktop where IsViewVisible returns true
                     if !lookup.is_pinned {
                         for (desktop_id, desktop) in &com_desktops {
-                            let mut vis = 0i32;
-                            if unsafe { desktop.is_view_visible(view.as_raw(), &mut vis) }.is_ok()
-                                && vis != 0
-                            {
+                            if unsafe { desktop.is_view_visible(view.as_raw()) } {
                                 lookup.view_desktop_id = Some(*desktop_id);
                                 break;
                             }
@@ -558,8 +812,7 @@ impl ComSession {
             };
 
             for desktop in &list {
-                let mut guid = GUID::zeroed();
-                if unsafe { desktop.get_id(&mut guid) }.is_ok() && DesktopId(guid) == target_id {
+                if unsafe { desktop.get_id() }.ok() == Some(target_id) {
                     if let Some(ref internal) = self.internal {
                         match unsafe { internal.switch_desktop(desktop) } {
                             Ok(()) => return Ok(()),
@@ -578,6 +831,66 @@ impl ComSession {
         }
         Err(anyhow!("SwitchDesktop failed after reconnect retry"))
     }
+
+    fn create_desktop(&mut self) -> Result<DesktopId> {
+        for attempt in 0..2 {
+            let Some(ref internal) = self.internal else {
+                return Err(anyhow!("Internal COM IVirtualDesktopManagerInternal unavailable"));
+            };
+            match unsafe { internal.create_desktop() } {
+                Ok(new_desktop) => {
+                    let id = unsafe { new_desktop.get_id() }
+                        .context("GetId on newly created virtual desktop")?;
+                    return Ok(id);
+                }
+                Err(e) if attempt == 0 && is_rpc_disconnect(&e) => {
+                    *self = ComSession::connect();
+                    continue;
+                }
+                Err(e) => return Err(anyhow!("CreateDesktop failed: {e}")),
+            }
+        }
+        Err(anyhow!("CreateDesktop failed after reconnect retry"))
+    }
+
+    fn remove_desktop(&mut self, destroy_id: DesktopId, fallback_id: DesktopId) -> Result<()> {
+        for attempt in 0..2 {
+            let list = match self.list_com_desktops() {
+                Ok((list, _)) => list,
+                Err(e) if attempt == 0 && is_rpc_disconnect(&e) => {
+                    *self = ComSession::connect();
+                    continue;
+                }
+                Err(e) => return Err(anyhow!("Cannot list desktops for removal: {e}")),
+            };
+            let mut destroy_obj = None;
+            let mut fallback_obj = None;
+            for d in &list {
+                if let Ok(id) = unsafe { d.get_id() } {
+                    if id == destroy_id {
+                        destroy_obj = Some(d);
+                    }
+                    if id == fallback_id {
+                        fallback_obj = Some(d);
+                    }
+                }
+            }
+            let (Some(destroy_d), Some(fallback_d)) = (destroy_obj, fallback_obj) else {
+                return Err(anyhow!("Desktop or fallback desktop not found"));
+            };
+            if let Some(ref internal) = self.internal {
+                match unsafe { internal.remove_desktop(destroy_d, fallback_d) } {
+                    Ok(()) => return Ok(()),
+                    Err(e) if attempt == 0 && is_rpc_disconnect(&e) => {
+                        *self = ComSession::connect();
+                        continue;
+                    }
+                    Err(e) => return Err(anyhow!("RemoveDesktop failed: {e}")),
+                }
+            }
+        }
+        Err(anyhow!("RemoveDesktop failed after reconnect retry"))
+    }
 }
 
 enum Command {
@@ -585,6 +898,8 @@ enum Command {
     GetDesktops(mpsc::Sender<Result<Vec<VirtualDesktopInfo>>>),
     QueryWindows(Vec<isize>, mpsc::Sender<HashMap<isize, WindowDesktopLookup>>),
     SwitchToDesktop(DesktopId, mpsc::Sender<Result<()>>),
+    CreateDesktop(mpsc::Sender<Result<DesktopId>>),
+    RemoveDesktop(DesktopId, DesktopId, mpsc::Sender<Result<()>>),
     Reconnect(mpsc::Sender<ComProbeStatus>),
     Shutdown,
 }
@@ -624,6 +939,12 @@ impl VirtualDesktopClient {
                         }
                         Command::SwitchToDesktop(id, reply) => {
                             let _ = reply.send(session.switch_to_desktop(id));
+                        }
+                        Command::CreateDesktop(reply) => {
+                            let _ = reply.send(session.create_desktop());
+                        }
+                        Command::RemoveDesktop(destroy_id, fallback_id, reply) => {
+                            let _ = reply.send(session.remove_desktop(destroy_id, fallback_id));
                         }
                         Command::Reconnect(reply) => {
                             session = ComSession::connect();
@@ -678,6 +999,22 @@ impl VirtualDesktopClient {
             .send(Command::SwitchToDesktop(id, tx))
             .map_err(|_| anyhow!("vdm worker stopped"))?;
         rx.recv().context("recv switch_to_desktop")?
+    }
+
+    pub fn create_desktop(&self) -> Result<DesktopId> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(Command::CreateDesktop(tx))
+            .map_err(|_| anyhow!("vdm worker stopped"))?;
+        rx.recv().context("recv create_desktop")?
+    }
+
+    pub fn remove_desktop(&self, destroy_id: DesktopId, fallback_id: DesktopId) -> Result<()> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(Command::RemoveDesktop(destroy_id, fallback_id, tx))
+            .map_err(|_| anyhow!("vdm worker stopped"))?;
+        rx.recv().context("recv remove_desktop")?
     }
 
     pub fn reconnect(&self) -> Result<ComProbeStatus> {
