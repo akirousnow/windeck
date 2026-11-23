@@ -19,13 +19,14 @@ use win_platform::{
 };
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetShellWindow, IsWindow, SetForegroundWindow,
+    GetForegroundWindow, GetShellWindow, GetWindowThreadProcessId, IsWindow, SetForegroundWindow,
 };
 
 use crate::config::{AppConfig, LabelPosition, PreviewFit, append_log};
 use crate::nav::{NavDirection, navigate};
 use crate::thumb_manager::ThumbnailManager;
 use crate::update_dialog::UpdateStatus;
+use crate::window_order::{StableWindowOrder, pick_initial_selection_index};
 
 // Balanced, breathable macOS Mission Control spatial constants (logical px)
 const TOP_SPACES_BAR_H: f32 = 58.0;
@@ -60,6 +61,19 @@ struct DesktopGroup {
     desktop_id: Option<DesktopId>,
     is_current: bool,
     cards: Vec<WindowCard>,
+}
+
+fn is_window_alive_with_pid(hwnd_raw: isize, expected_pid: u32) -> bool {
+    let hwnd = HWND(hwnd_raw as *mut std::ffi::c_void);
+    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        return false;
+    }
+    if expected_pid == 0 {
+        return true;
+    }
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
+    pid == expected_pid
 }
 
 fn icon_bgra_to_render_image(icon: IconBgra) -> Option<Arc<RenderImage>> {
@@ -161,6 +175,7 @@ pub struct SwitcherView {
     prev_foreground_hwnd: isize,
     desktops: Vec<VirtualDesktopInfo>,
     all_windows: Vec<WindowInfo>,
+    window_order: StableWindowOrder,
     desktop_filter: Option<DesktopId>,
     groups: Vec<DesktopGroup>,
     pub(crate) flat_hwnds: Vec<isize>,
@@ -237,6 +252,7 @@ impl SwitcherView {
             prev_foreground_hwnd: 0,
             desktops: Vec::new(),
             all_windows: Vec::new(),
+            window_order: StableWindowOrder::new(),
             desktop_filter: None,
             groups: Vec::new(),
             flat_hwnds: Vec::new(),
@@ -511,13 +527,18 @@ impl SwitcherView {
 
         self.desktops = desktops;
         self.all_windows = windows;
+        self.window_order.sync(
+            &self.all_windows,
+            &self.desktops,
+            is_window_alive_with_pid,
+        );
         self.rebuild_visible_groups(true);
     }
 
     /// Rebuilds visible desktop groups & flat HWND index list according to `self.desktop_filter`.
     fn rebuild_visible_groups(&mut self, pick_smart_initial: bool) {
         let desktops = self.desktops.clone();
-        let windows = self.all_windows.clone();
+        let windows = self.window_order.ordered(&self.all_windows);
         let filter = self.desktop_filter;
 
         let mut pinned_windows = Vec::new();
@@ -817,14 +838,16 @@ impl SwitcherView {
             .iter()
             .find(|g| g.is_current && !g.cards.is_empty())
         {
-            if let Some(card) = cur_group
+            let cards: Vec<(isize, usize)> = cur_group
                 .cards
                 .iter()
-                .find(|c| c.info.hwnd != self.prev_foreground_hwnd)
-            {
-                return card.flat_index;
-            }
-            return cur_group.cards[0].flat_index;
+                .map(|c| (c.info.hwnd, c.flat_index))
+                .collect();
+            return pick_initial_selection_index(
+                &self.all_windows,
+                &cards,
+                self.prev_foreground_hwnd,
+            );
         }
         0
     }
@@ -2216,5 +2239,29 @@ impl Render for SwitcherView {
                         ),
                 )
             })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use windows::Win32::UI::WindowsAndMessaging::{GetDesktopWindow, GetWindowThreadProcessId};
+
+    use super::*;
+
+    #[test]
+    fn alive_with_pid_check_validates_real_win32_hwnd_and_pid() {
+        assert!(!is_window_alive_with_pid(0, 0));
+        assert!(!is_window_alive_with_pid(0, 1234));
+
+        let desktop_hwnd = unsafe { GetDesktopWindow() };
+        let raw = desktop_hwnd.0 as isize;
+        let mut real_pid = 0u32;
+        unsafe { GetWindowThreadProcessId(desktop_hwnd, Some(&mut real_pid)) };
+
+        assert!(is_window_alive_with_pid(raw, 0));
+        if real_pid != 0 {
+            assert!(is_window_alive_with_pid(raw, real_pid));
+            assert!(!is_window_alive_with_pid(raw, real_pid.wrapping_add(1)));
+        }
     }
 }
