@@ -3,8 +3,8 @@
 1 ICON "windeck.ico"
 
 1 VERSIONINFO
-FILEVERSION     0,2,1,0
-PRODUCTVERSION  0,2,1,0
+FILEVERSION     0,2,2,0
+PRODUCTVERSION  0,2,2,0
 FILEFLAGSMASK   0x3fL
 FILEFLAGS       0x0L
 FILEOS          0x40004L
@@ -17,12 +17,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "WinDeck"
             VALUE "FileDescription",  "WinDeck — Windows Mission Control 全局窗口切换器"
-            VALUE "FileVersion",      "0.2.1.0"
+            VALUE "FileVersion",      "0.2.2.0"
             VALUE "InternalName",     "windeck"
             VALUE "LegalCopyright",   "Copyright (c) 2026 WinDeck"
             VALUE "OriginalFilename", "windeck.exe"
             VALUE "ProductName",      "WinDeck"
-            VALUE "ProductVersion",   "0.2.1.0"
+            VALUE "ProductVersion",   "0.2.2.0"
         END
     END
     BLOCK "VarFileInfo"
