@@ -21,8 +21,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VK_LMENU, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RWIN, VK_UP,
 };
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
-    Shell_NotifyIconW,
+    NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+    NIN_BALLOONUSERCLICK, NOTIFYICONDATAW, Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     ASFW_ANY, AllowSetForegroundWindow, AppendMenuW, CallNextHookEx, CreateIconIndirect,
@@ -46,6 +46,7 @@ const WM_ACTIVATE_EXISTING: u32 = WM_APP + 3;
 const WM_HOLD_NAV: u32 = WM_APP + 4;
 const WM_HOLD_RELEASED: u32 = WM_APP + 5;
 const WM_DISARM_HOLD_HOOK: u32 = WM_APP + 6;
+const WM_SHOW_BALLOON: u32 = WM_APP + 7;
 
 const MENU_CMD_TOGGLE: u32 = 1001;
 const MENU_CMD_RELOAD: u32 = 1002;
@@ -53,6 +54,7 @@ const MENU_CMD_OPEN_CONFIG: u32 = 1003;
 const MENU_CMD_AUTOSTART: u32 = 1004;
 const MENU_CMD_QUIT: u32 = 1005;
 const MENU_CMD_SETTINGS: u32 = 1006;
+const MENU_CMD_CHECK_UPDATE: u32 = 1007;
 
 const RUN_REG_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE_NAME: &str = "WinDeck";
@@ -79,16 +81,21 @@ impl SingleInstanceGuard {
         }
         Ok(Some(Self { handle }))
     }
-}
 
-impl Drop for SingleInstanceGuard {
-    fn drop(&mut self) {
+    /// Explicitly closes the mutex handle before spawning a replacement process during self-update.
+    pub fn release(&mut self) {
         if !self.handle.is_invalid() {
             unsafe {
                 let _ = CloseHandle(self.handle);
             }
             self.handle = HANDLE::default();
         }
+    }
+}
+
+impl Drop for SingleInstanceGuard {
+    fn drop(&mut self) {
+        self.release();
     }
 }
 
@@ -346,6 +353,8 @@ pub enum ShellEvent {
     },
     ShowOverlay,
     OpenSettings,
+    CheckUpdate,
+    OpenUpdateDialog,
     HoldNavigate(HoldNavDirection),
     HoldModifierReleased {
         commit: bool,
@@ -360,6 +369,11 @@ pub enum ShellEvent {
 struct RebindRequest {
     hotkey: HotkeySpec,
     reply: mpsc::Sender<Result<()>>,
+}
+
+struct BalloonRequest {
+    title: String,
+    body: String,
 }
 
 struct ShellHostState {
@@ -679,6 +693,12 @@ fn show_tray_menu(hwnd: HWND, state: &ShellHostState) {
         let _ = AppendMenuW(
             menu,
             MF_STRING,
+            MENU_CMD_CHECK_UPDATE as usize,
+            w!("检查更新..."),
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
             MENU_CMD_RELOAD as usize,
             w!("重新加载配置"),
         );
@@ -730,6 +750,10 @@ fn show_tray_menu(hwnd: HWND, state: &ShellHostState) {
             MENU_CMD_SETTINGS => {
                 let _ = AllowSetForegroundWindow(ASFW_ANY);
                 (state.on_event)(ShellEvent::OpenSettings);
+            }
+            MENU_CMD_CHECK_UPDATE => {
+                let _ = AllowSetForegroundWindow(ASFW_ANY);
+                (state.on_event)(ShellEvent::CheckUpdate);
             }
             MENU_CMD_RELOAD => (state.on_event)(ShellEvent::ReloadConfig),
             MENU_CMD_OPEN_CONFIG => (state.on_event)(ShellEvent::OpenConfigDir),
@@ -816,6 +840,40 @@ unsafe extern "system" fn shell_wnd_proc(
                     });
                 } else if mouse_msg == WM_RBUTTONUP {
                     show_tray_menu(hwnd, state);
+                } else if mouse_msg == NIN_BALLOONUSERCLICK {
+                    let _ = unsafe { AllowSetForegroundWindow(ASFW_ANY) };
+                    disarm_hold_hook();
+                    (state.on_event)(ShellEvent::OpenUpdateDialog);
+                }
+                return LRESULT(0);
+            }
+            WM_SHOW_BALLOON => {
+                let req_ptr = lparam.0 as *mut BalloonRequest;
+                if !req_ptr.is_null() {
+                    let req = unsafe { Box::from_raw(req_ptr) };
+                    let mut nid = NOTIFYICONDATAW {
+                        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                        hWnd: hwnd,
+                        uID: 1,
+                        uFlags: NIF_INFO,
+                        dwInfoFlags: NIIF_INFO,
+                        ..Default::default()
+                    };
+                    let title_u16: Vec<u16> = req
+                        .title
+                        .encode_utf16()
+                        .take(nid.szInfoTitle.len() - 1)
+                        .collect();
+                    nid.szInfoTitle[..title_u16.len()].copy_from_slice(&title_u16);
+                    let body_u16: Vec<u16> = req
+                        .body
+                        .encode_utf16()
+                        .take(nid.szInfo.len() - 1)
+                        .collect();
+                    nid.szInfo[..body_u16.len()].copy_from_slice(&body_u16);
+                    unsafe {
+                        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+                    }
                 }
                 return LRESULT(0);
             }
@@ -1067,6 +1125,32 @@ impl ShellHost {
             let hwnd = HWND(self.hwnd_raw as *mut c_void);
             unsafe {
                 let _ = PostMessageW(Some(hwnd), WM_DISARM_HOLD_HOOK, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+
+    /// Shows a non-intrusive Windows tray notification balloon (e.g. when an update is found while hidden).
+    pub fn show_balloon(&self, title: impl Into<String>, body: impl Into<String>) {
+        if self.hwnd_raw == 0 {
+            return;
+        }
+        let hwnd = HWND(self.hwnd_raw as *mut c_void);
+        let req_ptr = Box::into_raw(Box::new(BalloonRequest {
+            title: title.into(),
+            body: body.into(),
+        }));
+        if unsafe {
+            PostMessageW(
+                Some(hwnd),
+                WM_SHOW_BALLOON,
+                WPARAM(0),
+                LPARAM(req_ptr as isize),
+            )
+        }
+        .is_err()
+        {
+            unsafe {
+                drop(Box::from_raw(req_ptr));
             }
         }
     }

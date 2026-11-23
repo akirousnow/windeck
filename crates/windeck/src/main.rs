@@ -5,11 +5,12 @@ mod nav;
 mod settings_panel;
 mod switcher_view;
 mod thumb_manager;
+mod update_dialog;
 
 use std::ffi::c_void;
 use std::process::Command;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use gpui::{
@@ -18,8 +19,9 @@ use gpui::{
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use win_platform::{
-    ShellEvent, ShellHost, SingleInstanceGuard, ThumbnailHostWindow, VirtualDesktopClient,
-    configure_borderless_immersive, current_session_desktop_names, notify_existing_instance,
+    CURRENT_VERSION, ShellEvent, ShellHost, SingleInstanceGuard, ThumbnailHostWindow,
+    UpdateCheckResult, VirtualDesktopClient, check_latest_release, configure_borderless_immersive,
+    current_session_desktop_names, notify_existing_instance, wait_for_pid_and_cleanup_old_exe,
 };
 use windows::Win32::Foundation::HWND;
 
@@ -43,18 +45,81 @@ fn attach_parent_console_if_needed() {
     }
 }
 
+fn parse_arg_value(args: &[String], flag: &str) -> Option<String> {
+    args.windows(2)
+        .find(|pair| pair[0] == flag)
+        .map(|pair| pair[1].clone())
+}
+
+fn run_cli_update_check(effective_version: &str, verify_etag: bool) -> Result<()> {
+    let t0 = Instant::now();
+    let res = check_latest_release(effective_version, None)?;
+    let ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let etag = match &res {
+        UpdateCheckResult::UpdateAvailable { release, etag } => {
+            println!(
+                "UPDATE_AVAILABLE current=v{} latest={} asset={:?} size={:?} url={:?} sha256={:?} elapsed={:.1}ms",
+                effective_version,
+                release.tag_name,
+                release.asset_name,
+                release.asset_size,
+                release.download_url,
+                release.sha256_url,
+                ms
+            );
+            etag.clone()
+        }
+        UpdateCheckResult::UpToDate { latest_tag, etag } => {
+            println!(
+                "UP_TO_DATE current=v{} latest={} elapsed={:.1}ms",
+                effective_version, latest_tag, ms
+            );
+            etag.clone()
+        }
+        UpdateCheckResult::NotModified => {
+            println!("NOT_MODIFIED elapsed={:.1}ms", ms);
+            None
+        }
+    };
+
+    if verify_etag {
+        if let Some(tag) = etag {
+            let t1 = Instant::now();
+            let res2 = check_latest_release(effective_version, Some(&tag))?;
+            let ms2 = t1.elapsed().as_secs_f64() * 1000.0;
+            println!(
+                "ETAG_RECHECK etag={} result={:?} elapsed={:.1}ms",
+                tag, res2, ms2
+            );
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let start_hidden = args.iter().any(|a| a == "--hidden");
     let bench_mode = args.iter().any(|a| a == "--bench");
+    let check_update_cli = args.iter().any(|a| a == "--check-update");
+    let verify_etag = args.iter().any(|a| a == "--verify-etag");
+    let wait_pid = parse_arg_value(&args, "--wait-pid").and_then(|s| s.parse::<u32>().ok());
+    let effective_version =
+        parse_arg_value(&args, "--simulate-version").unwrap_or_else(|| CURRENT_VERSION.to_string());
 
-    if bench_mode {
+    if bench_mode || check_update_cli {
         attach_parent_console_if_needed();
     }
 
+    if check_update_cli {
+        return run_cli_update_check(&effective_version, verify_etag);
+    }
+
+    // If relaunched after an in-place self-update, wait for the exiting old process and clean up `.exe.old`.
+    wait_for_pid_and_cleanup_old_exe(wait_pid);
+
     // Single-instance guard: prevent duplicate tray icons & hotkey conflicts.
     // When launched a second time interactively, wake the already-running instance and exit cleanly.
-    let _single_instance_guard = if bench_mode {
+    let single_instance_guard = Arc::new(Mutex::new(if bench_mode {
         None
     } else {
         match SingleInstanceGuard::try_acquire()? {
@@ -69,15 +134,17 @@ fn main() -> Result<()> {
                 return Ok(());
             }
         }
-    };
+    }));
 
     let config = AppConfig::load_or_create();
     let (winsta, desk) = current_session_desktop_names();
     append_log(&format!(
-        "STARTUP hotkey='{}' immersive={} label='{}' desktop='{}\\{}' hidden={} bench={}",
+        "STARTUP ver=v{} hotkey='{}' immersive={} label='{}' auto_update={} desktop='{}\\{}' hidden={} bench={}",
+        effective_version,
         config.hotkey,
         config.immersive,
         config.label_position.as_config_str(),
+        config.auto_update,
         winsta,
         desk,
         start_hidden,
@@ -122,12 +189,17 @@ fn main() -> Result<()> {
     let initial_immersive = config.immersive;
     let initial_backdrop = config.background;
     let initial_blur_opacity = config.blur_opacity;
+    let initial_auto_update = config.auto_update;
+    let guard_for_app = single_instance_guard.clone();
+    let ver_for_app = effective_version.clone();
 
     Application::new().run(move |cx: &mut App| {
         let initial_bounds = Bounds::centered(None, size(px(1440.0), px(860.0)), cx);
         let vdm_clone = vdm.clone();
         let config_clone = config.clone();
         let shell_for_loop = shell_host.clone();
+        let guard_for_view = guard_for_app.clone();
+        let ver_for_view = ver_for_app.clone();
 
         // Two-layer compositing:
         // - Top layer (this GPUI window): per-pixel transparent DirectComposition interactive UI + embedded badges
@@ -166,8 +238,11 @@ fn main() -> Result<()> {
                         thumb_host,
                         vdm_clone,
                         shell_for_view,
+                        guard_for_view,
                         config_clone,
                         hotkey_warning,
+                        ver_for_view,
+                        bench_mode,
                         window,
                         cx,
                     );
@@ -212,6 +287,20 @@ fn main() -> Result<()> {
                             });
                         })
                         .detach();
+                    } else if initial_auto_update {
+                        // Even when launched silently (--hidden at Windows startup), probe GitHub Releases once
+                        let view_upd = view.clone();
+                        cx.spawn(async move |cx| {
+                            cx.background_executor()
+                                .timer(Duration::from_secs(2))
+                                .await;
+                            let _ = cx.update(|cx| {
+                                view_upd.update(cx, |v, cx| {
+                                    v.trigger_update_check(false, cx);
+                                });
+                            });
+                        })
+                        .detach();
                     }
 
                     cx.spawn(async move |cx| {
@@ -235,6 +324,20 @@ fn main() -> Result<()> {
                                     let _ = window_handle.update(cx, |_, window, cx| {
                                         view_for_events.update(cx, |v, cx| {
                                             v.open_settings(window, cx);
+                                        });
+                                    });
+                                }
+                                ShellEvent::CheckUpdate => {
+                                    let _ = window_handle.update(cx, |_, window, cx| {
+                                        view_for_events.update(cx, |v, cx| {
+                                            v.check_update_from_shell(window, cx);
+                                        });
+                                    });
+                                }
+                                ShellEvent::OpenUpdateDialog => {
+                                    let _ = window_handle.update(cx, |_, window, cx| {
+                                        view_for_events.update(cx, |v, cx| {
+                                            v.open_update_dialog_from_shell(window, cx);
                                         });
                                     });
                                 }

@@ -3,6 +3,7 @@ pub mod os_version;
 pub mod overlay_win;
 pub mod process_metrics;
 pub mod shell_host;
+pub mod updater;
 pub mod virtual_desktop;
 pub mod window_enum;
 pub mod window_icon;
@@ -23,6 +24,11 @@ pub use process_metrics::{
 pub use shell_host::{
     HoldNavDirection, HotkeySpec, PrimaryModifier, ShellEvent, ShellHost, SingleInstanceGuard,
     is_autostart_enabled, notify_existing_instance, set_autostart_enabled,
+};
+pub use updater::{
+    CURRENT_VERSION, GITHUB_OWNER, GITHUB_RELEASES_PAGE, GITHUB_REPO, ReleaseInfo,
+    UpdateCheckResult, check_latest_release, download_and_stage_update, is_newer_version,
+    normalize_version_str, wait_for_pid_and_cleanup_old_exe,
 };
 pub use virtual_desktop::{
     ComProbeStatus, DesktopId, VirtualDesktopClient, VirtualDesktopInfo, WindowDesktopLookup,

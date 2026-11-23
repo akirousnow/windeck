@@ -224,6 +224,7 @@ pub struct AppConfig {
     pub preview_fit: PreviewFit,
     pub cross_desktop_nav: bool,
     pub hide_on_blur: bool,
+    pub auto_update: bool,
 }
 
 impl Default for AppConfig {
@@ -242,6 +243,7 @@ impl Default for AppConfig {
             preview_fit: PreviewFit::Cover,
             cross_desktop_nav: true,
             hide_on_blur: true,
+            auto_update: true,
         }
     }
 }
@@ -291,6 +293,9 @@ cross_desktop_nav = true
 
 # 点击切换器外部（失去焦点）时是否自动隐藏
 hide_on_blur = true
+
+# 自动检查 GitHub Release 新版本更新（每次打开时后台静默检测）
+auto_update = true
 "#;
 
 pub fn config_dir() -> PathBuf {
@@ -419,6 +424,11 @@ impl AppConfig {
                         cfg.hide_on_blur = b;
                     }
                 }
+                "auto_update" => {
+                    if let Ok(b) = val.parse::<bool>() {
+                        cfg.auto_update = b;
+                    }
+                }
                 _ => {}
             }
         }
@@ -489,6 +499,9 @@ cross_desktop_nav = {cross_desktop_nav}
 
 # 点击切换器外部（失去焦点）时是否自动隐藏
 hide_on_blur = {hide_on_blur}
+
+# 自动检查 GitHub Release 新版本更新（每次打开时后台静默检测）
+auto_update = {auto_update}
 "#,
             hotkey = self.parsed_hotkey().canonical_label(),
             force_quit_key = self.parsed_force_quit_key().canonical_label(),
@@ -503,6 +516,7 @@ hide_on_blur = {hide_on_blur}
             monitor = monitor_str,
             cross_desktop_nav = self.cross_desktop_nav,
             hide_on_blur = self.hide_on_blur,
+            auto_update = self.auto_update,
         )
     }
 
@@ -545,6 +559,7 @@ mod tests {
             monitor = "primary"
             cross_desktop_nav = false
             hide_on_blur = false
+            auto_update = false
         "#;
         let cfg = AppConfig::parse(raw);
         assert_eq!(cfg.hotkey, "Ctrl+E");
@@ -581,5 +596,7 @@ mod tests {
         assert_eq!(round_tripped.monitor, cfg.monitor);
         assert_eq!(round_tripped.cross_desktop_nav, cfg.cross_desktop_nav);
         assert_eq!(round_tripped.hide_on_blur, cfg.hide_on_blur);
+        assert!(!cfg.auto_update);
+        assert_eq!(round_tripped.auto_update, cfg.auto_update);
     }
 }

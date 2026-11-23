@@ -15,9 +15,10 @@ use crate::config::{
     AppConfig, ColumnsConfig, LabelPosition, LocalShortcut, PreviewFit, append_log, config_dir,
 };
 use crate::switcher_view::SwitcherView;
+use crate::update_dialog::UpdateStatus;
 
 const SHEET_W: f32 = 500.0;
-const SHEET_CONTENT_EST_H: f32 = 664.0;
+const SHEET_CONTENT_EST_H: f32 = 760.0;
 
 /// Minimalist 3-slider icon matching the hairline weight of the top Spaces bar.
 fn sliders_icon() -> Div {
@@ -406,6 +407,106 @@ impl SwitcherView {
         let monitor = self.config.monitor;
         let cross_nav = self.config.cross_desktop_nav;
         let hide_on_blur = self.config.hide_on_blur;
+        let auto_update = self.config.auto_update;
+        let cur_ver_tag = format!("v{}", self.effective_version);
+
+        let (update_hint_text, update_hint_color, update_btn_label, update_has_new, update_checking) =
+            match &self.update_status {
+                UpdateStatus::Checking => (
+                    "检查中...".to_string(),
+                    rgba(0xFFFFFF88),
+                    "检查中",
+                    false,
+                    true,
+                ),
+                UpdateStatus::UpToDate(tag) => (
+                    format!("最新 ({tag})"),
+                    rgba(0xFFFFFF78),
+                    "检查更新",
+                    false,
+                    false,
+                ),
+                UpdateStatus::Available(rel) => (
+                    format!("新版本 {}", rel.tag_name),
+                    rgba(0x64D2FFFF),
+                    "立即更新",
+                    true,
+                    false,
+                ),
+                UpdateStatus::Downloading { .. } => (
+                    "正在更新...".to_string(),
+                    rgba(0x64D2FFFF),
+                    "查看进度",
+                    true,
+                    false,
+                ),
+                UpdateStatus::Error => (
+                    "检查失败".to_string(),
+                    rgba(0xFF8A80EE),
+                    "重试",
+                    false,
+                    false,
+                ),
+                UpdateStatus::Idle => (cur_ver_tag, rgba(0xFFFFFF66), "检查更新", false, false),
+            };
+
+        let update_check_control = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(update_hint_color)
+                    .child(update_hint_text),
+            )
+            .child(
+                div()
+                    .id("settings-check-update")
+                    .h(px(26.0))
+                    .px(px(12.0))
+                    .rounded_full()
+                    .when(!update_checking, |d| d.cursor_pointer())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(if update_has_new {
+                        rgba(0x0A84FFD0)
+                    } else {
+                        rgba(0xFFFFFF18)
+                    })
+                    .border_1()
+                    .border_color(if update_has_new {
+                        rgba(0xFFFFFF30)
+                    } else {
+                        rgba(0xFFFFFF1C)
+                    })
+                    .when(!update_checking, |d| {
+                        d.hover(|s| {
+                            s.bg(if update_has_new {
+                                rgba(0x0A84FFEC)
+                            } else {
+                                rgba(0xFFFFFF2A)
+                            })
+                        })
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        if update_has_new && this.pending_update.is_some() {
+                            this.open_update_dialog(cx);
+                        } else {
+                            this.trigger_update_check(true, cx);
+                        }
+                    }))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(rgba(0xFFFFFFF2))
+                            .child(update_btn_label),
+                    ),
+            );
 
         let avail_h = (self.viewport_height_px.get() - 96.0).max(260.0);
         let max_scroll = (SHEET_CONTENT_EST_H - avail_h).max(0.0);
@@ -1052,7 +1153,26 @@ impl SwitcherView {
                                                 cx.notify();
                                             }),
                                         ),
-                                    )),
+                                    ))
+                                    .child(row_divider())
+                                    .child(setting_row(
+                                        "自动更新",
+                                        minimal_switch(
+                                            "sw-auto-update",
+                                            auto_update,
+                                            cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                let next = !auto_update;
+                                                this.config.auto_update = next;
+                                                this.apply_visual_and_save(window, cx);
+                                                if next {
+                                                    this.trigger_update_check(false, cx);
+                                                }
+                                            }),
+                                        ),
+                                    ))
+                                    .child(row_divider())
+                                    .child(setting_row("版本更新", update_check_control)),
                             ),
                     )
                     // Whisper-quiet footer links (no heavy buttons)

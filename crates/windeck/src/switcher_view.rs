@@ -1,7 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -11,11 +11,11 @@ use gpui::{
 };
 use smallvec::smallvec;
 use win_platform::{
-    DesktopId, ForceQuitOutcome, HoldNavDirection, IconBgra, ShellHost, ThumbnailHostWindow,
-    VirtualDesktopClient, VirtualDesktopInfo, WindowInfo, configure_borderless_immersive,
-    enumerate_monitors, enumerate_windows, extract_window_icon, force_quit_window,
-    hide_layered_overlay, query_window_and_client_sizes, show_and_focus_layered_overlay,
-    switch_to_window,
+    DesktopId, ForceQuitOutcome, HoldNavDirection, IconBgra, ReleaseInfo, ShellHost,
+    SingleInstanceGuard, ThumbnailHostWindow, VirtualDesktopClient, VirtualDesktopInfo, WindowInfo,
+    configure_borderless_immersive, enumerate_monitors, enumerate_windows, extract_window_icon,
+    force_quit_window, hide_layered_overlay, query_window_and_client_sizes,
+    show_and_focus_layered_overlay, switch_to_window,
 };
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -25,6 +25,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::config::{AppConfig, LabelPosition, PreviewFit, append_log};
 use crate::nav::{NavDirection, navigate};
 use crate::thumb_manager::ThumbnailManager;
+use crate::update_dialog::UpdateStatus;
 
 // Balanced, breathable macOS Mission Control spatial constants (logical px)
 const TOP_SPACES_BAR_H: f32 = 58.0;
@@ -140,11 +141,23 @@ pub struct SwitcherView {
     pub(crate) thumb_host: ThumbnailHostWindow,
     vdm: Arc<VirtualDesktopClient>,
     pub(crate) shell_host: Arc<Option<ShellHost>>,
+    pub(crate) single_instance_guard: Arc<Mutex<Option<SingleInstanceGuard>>>,
     pub(crate) config: AppConfig,
+    bench_mode: bool,
+    pub(crate) effective_version: String,
+    pub(crate) update_status: UpdateStatus,
+    pub(crate) pending_update: Option<ReleaseInfo>,
+    pub(crate) update_etag: Option<String>,
+    pub(crate) update_check_in_flight: bool,
+    pub(crate) last_update_check: Option<Instant>,
+    pub(crate) dismissed_update_tag: Option<String>,
+    pub(crate) notified_balloon_tag: Option<String>,
+    pub(crate) update_dialog_open: bool,
+    pub(crate) update_dialog_error: Option<SharedString>,
     pub(crate) visible: bool,
     shown_at: Option<Instant>,
-    hold_active: bool,
-    hold_navigated: bool,
+    pub(crate) hold_active: bool,
+    pub(crate) hold_navigated: bool,
     prev_foreground_hwnd: isize,
     desktops: Vec<VirtualDesktopInfo>,
     all_windows: Vec<WindowInfo>,
@@ -180,13 +193,17 @@ impl Focusable for SwitcherView {
 }
 
 impl SwitcherView {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         gpui_hwnd: HWND,
         thumb_host: ThumbnailHostWindow,
         vdm: Arc<VirtualDesktopClient>,
         shell_host: Arc<Option<ShellHost>>,
+        single_instance_guard: Arc<Mutex<Option<SingleInstanceGuard>>>,
         config: AppConfig,
         hotkey_warning: Option<String>,
+        effective_version: String,
+        bench_mode: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -200,7 +217,19 @@ impl SwitcherView {
             thumb_host,
             vdm,
             shell_host,
+            single_instance_guard,
             config,
+            bench_mode,
+            effective_version,
+            update_status: UpdateStatus::Idle,
+            pending_update: None,
+            update_etag: None,
+            update_check_in_flight: false,
+            last_update_check: None,
+            dismissed_update_tag: None,
+            notified_balloon_tag: None,
+            update_dialog_open: false,
+            update_dialog_error: None,
             visible: false,
             shown_at: None,
             hold_active: false,
@@ -261,7 +290,7 @@ impl SwitcherView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.visible || !self.config.hide_on_blur {
+        if !self.visible || !self.config.hide_on_blur || self.is_downloading_update() {
             return;
         }
         if !window.is_window_active() {
@@ -290,9 +319,11 @@ impl SwitcherView {
 
     pub fn toggle_with_hold(&mut self, hold_armed: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.visible {
-            self.hide(cx);
+            if !self.is_downloading_update() {
+                self.hide(cx);
+            }
         } else {
-            self.show_and_refresh(window, cx);
+            self.show_and_refresh_inner(window, hold_armed, cx);
             self.hold_active = hold_armed;
             self.hold_navigated = false;
             cx.notify();
@@ -340,6 +371,14 @@ impl SwitcherView {
                 cx.notify();
             }
         } else {
+            if self.visible && !self.update_dialog_open {
+                if let Some(ref rel) = self.pending_update {
+                    if self.dismissed_update_tag.as_deref() != Some(rel.tag_name.as_str()) {
+                        self.open_update_dialog(cx);
+                        return;
+                    }
+                }
+            }
             cx.notify();
         }
     }
@@ -354,6 +393,7 @@ impl SwitcherView {
         self.hovered_flat = None;
         self.armed_delete_desktop = None;
         self.settings_open = false;
+        self.update_dialog_open = false;
         self.recording_hotkey_letter = false;
         self.recording_force_quit_key = false;
         self.settings_error = None;
@@ -363,11 +403,21 @@ impl SwitcherView {
     }
 
     pub fn show_and_refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_and_refresh_inner(window, false, cx);
+    }
+
+    fn show_and_refresh_inner(
+        &mut self,
+        window: &mut Window,
+        hold_armed: bool,
+        cx: &mut Context<Self>,
+    ) {
         let t_start = Instant::now();
         self.prev_foreground_hwnd = unsafe { GetForegroundWindow() }.0 as isize;
         self.hovered_flat = None;
         self.armed_delete_desktop = None;
         self.settings_open = false;
+        self.update_dialog_open = false;
         self.recording_hotkey_letter = false;
         self.recording_force_quit_key = false;
         self.settings_error = None;
@@ -379,7 +429,18 @@ impl SwitcherView {
 
         self.refresh_snapshot();
 
-        self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
+        let prompt_cached_update = !self.bench_mode
+            && !hold_armed
+            && self.pending_update.as_ref().is_some_and(|rel| {
+                self.dismissed_update_tag.as_deref() != Some(rel.tag_name.as_str())
+            });
+
+        if prompt_cached_update {
+            self.thumbs.borrow_mut().unregister_all();
+            self.update_dialog_open = true;
+        } else {
+            self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
+        }
         self.visible = true;
         self.sync_visibility_to_host();
         self.shown_at = Some(Instant::now());
@@ -419,6 +480,11 @@ impl SwitcherView {
             self.config.preview_fit.as_config_str(),
             self.config.label_position.as_config_str(),
         ));
+
+        if !self.bench_mode && self.config.auto_update {
+            self.trigger_update_check(false, cx);
+        }
+
         cx.notify();
     }
 
@@ -1043,6 +1109,17 @@ impl SwitcherView {
         let key = event.keystroke.key.as_str();
         let mods = &event.keystroke.modifiers;
         let shift = mods.shift;
+
+        // When Update confirmation dialog is open, route keys exclusively to it
+        if self.update_dialog_open {
+            cx.stop_propagation();
+            if key == "escape" {
+                self.dismiss_update_dialog(window, cx);
+            } else if key == "enter" {
+                self.start_self_update(cx);
+            }
+            return;
+        }
 
         // When Settings view is open, route keys exclusively to Settings / shortcut capture
         if self.settings_open {
@@ -1982,7 +2059,9 @@ impl Render for SwitcherView {
             .bg(rgba(0x00000001))
             .text_color(rgb(0xFFFFFF));
 
-        let root = if self.settings_open {
+        let root = if self.update_dialog_open {
+            root.child(self.render_update_dialog(cx))
+        } else if self.settings_open {
             root.child(self.render_settings_view(cx))
         } else {
             root.on_mouse_down(

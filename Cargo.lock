@@ -6176,6 +6176,7 @@ name = "win_platform"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "serde_json",
  "windows 0.61.3",
  "windows-core 0.61.2",
  "windows-registry 0.5.3",
