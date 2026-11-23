@@ -3868,7 +3868,7 @@ dependencies = [
 
 [[package]]
 name = "probe_a"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "win_platform",
@@ -3877,7 +3877,7 @@ dependencies = [
 
 [[package]]
 name = "probe_b"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "gpui",
@@ -6173,7 +6173,7 @@ dependencies = [
 
 [[package]]
 name = "win_platform"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "serde_json",
@@ -6215,7 +6215,7 @@ checksum = "712e227841d057c1ee1cd2fb22fa7e5a5461ae8e48fa2ca79ec42cfc1931183f"
 
 [[package]]
 name = "windeck"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
