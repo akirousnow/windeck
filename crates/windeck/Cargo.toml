@@ -1,0 +1,18 @@
+[package]
+name = "windeck"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-channel.workspace = true
+gpui.workspace = true
+image.workspace = true
+raw-window-handle.workspace = true
+smallvec.workspace = true
+win_platform = { path = "../win_platform" }
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Console",
+    "Win32_UI_WindowsAndMessaging",
+] }

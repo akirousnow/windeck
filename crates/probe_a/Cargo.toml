@@ -1,0 +1,9 @@
+[package]
+name = "probe_a"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+win_platform = { path = "../win_platform" }
+windows = { workspace = true, features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_UI_HiDpi", "Win32_UI_WindowsAndMessaging"] }
