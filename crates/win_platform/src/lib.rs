@@ -21,8 +21,8 @@ pub use process_metrics::{
     ProcessResourceSnapshot, capture_process_resources, current_session_desktop_names,
 };
 pub use shell_host::{
-    HotkeySpec, ShellEvent, ShellHost, SingleInstanceGuard, is_autostart_enabled,
-    notify_existing_instance, set_autostart_enabled,
+    HoldNavDirection, HotkeySpec, PrimaryModifier, ShellEvent, ShellHost, SingleInstanceGuard,
+    is_autostart_enabled, notify_existing_instance, set_autostart_enabled,
 };
 pub use virtual_desktop::{
     ComProbeStatus, DesktopId, VirtualDesktopClient, VirtualDesktopInfo, WindowDesktopLookup,
@@ -31,4 +31,6 @@ pub use window_enum::{
     MonitorInfo, RawWindowDiagnostic, WindowInfo, enumerate_monitors, enumerate_windows,
 };
 pub use window_icon::{IconBgra, extract_window_icon};
-pub use window_switch::{SwitchReport, switch_to_window};
+pub use window_switch::{
+    ForceQuitOutcome, ForceQuitReport, SwitchReport, force_quit_window, switch_to_window,
+};

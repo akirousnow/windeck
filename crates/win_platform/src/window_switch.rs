@@ -1,18 +1,27 @@
 use std::ffi::c_void;
+use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{
+    CloseHandle, ERROR_ACCESS_DENIED, GetLastError, HWND, LPARAM, WPARAM,
+};
+use windows::Win32::System::Threading::{
+    GetCurrentProcessId, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
     VK_MENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowPlacement, IsIconic, IsWindow, IsWindowVisible, IsZoomed,
-    SW_HIDE, SW_RESTORE, SW_SHOWMAXIMIZED, SetForegroundWindow, ShowWindow, WINDOWPLACEMENT,
+    EnumChildWindows, GetForegroundWindow, GetWindowPlacement, GetWindowThreadProcessId,
+    IsHungAppWindow, IsIconic, IsWindow, IsWindowVisible, IsZoomed, PostMessageW, SW_HIDE,
+    SW_RESTORE, SW_SHOWMAXIMIZED, SetForegroundWindow, ShowWindow, WINDOWPLACEMENT, WM_CLOSE,
     WPF_RESTORETOMAXIMIZED,
 };
+use windows_core::{BOOL, PWSTR};
 
 use crate::virtual_desktop::{DesktopId, VirtualDesktopClient};
 
@@ -176,4 +185,253 @@ pub fn switch_to_window(
         is_zoomed_after,
         elapsed_ms: start.elapsed().as_secs_f64() * 1000.0,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForceQuitOutcome {
+    /// Target process was forcefully terminated via `TerminateProcess`.
+    ProcessTerminated { pid: u32 },
+    /// Window closed cleanly via `WM_CLOSE` (e.g. File Explorer shell window or responsive multi-window app).
+    WindowClosedSafely,
+}
+
+#[derive(Debug, Clone)]
+pub struct ForceQuitReport {
+    pub target_hwnd: isize,
+    pub pid: u32,
+    pub process_name: String,
+    pub outcome: ForceQuitOutcome,
+}
+
+fn process_name_for_pid(pid: u32) -> String {
+    if pid == 0 {
+        return String::new();
+    }
+    unsafe {
+        let Ok(handle) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
+            return String::new();
+        };
+        let mut buf = [0u16; 512];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(
+            handle,
+            PROCESS_NAME_WIN32,
+            PWSTR(buf.as_mut_ptr()),
+            &mut len,
+        )
+        .is_ok();
+        let _ = CloseHandle(handle);
+        if ok && len > 0 {
+            let full = String::from_utf16_lossy(&buf[..len as usize]);
+            Path::new(&full)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or(full)
+        } else {
+            String::new()
+        }
+    }
+}
+
+fn is_protected_shell_process(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "explorer.exe"
+            | "dwm.exe"
+            | "csrss.exe"
+            | "winlogon.exe"
+            | "sihost.exe"
+            | "shellexperiencehost.exe"
+            | "startmenuexperiencehost.exe"
+            | "searchhost.exe"
+            | "taskmgr.exe"
+    )
+}
+
+/// For UWP windows hosted by `ApplicationFrameHost.exe`, finds the real inner app process PID
+/// from its `CoreWindow` child so we never kill `ApplicationFrameHost.exe` itself.
+fn resolve_uwp_child_pid(frame_hwnd: HWND, host_pid: u32) -> Option<u32> {
+    struct SearchCtx {
+        host_pid: u32,
+        found_pid: Option<u32>,
+    }
+
+    unsafe extern "system" fn enum_child(child: HWND, lparam: LPARAM) -> BOOL {
+        let ctx = unsafe { &mut *(lparam.0 as *mut SearchCtx) };
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(child, Some(&mut pid)) };
+        if pid != 0 && pid != ctx.host_pid {
+            ctx.found_pid = Some(pid);
+            return BOOL(0);
+        }
+        BOOL(1)
+    }
+
+    let mut ctx = SearchCtx {
+        host_pid,
+        found_pid: None,
+    };
+    unsafe {
+        let _ = EnumChildWindows(
+            Some(frame_hwnd),
+            Some(enum_child),
+            LPARAM(&mut ctx as *mut SearchCtx as isize),
+        );
+    }
+    ctx.found_pid
+}
+
+fn terminate_pid(pid: u32) -> Result<()> {
+    if pid == 0 || pid == unsafe { GetCurrentProcessId() } {
+        return Err(anyhow!("拒绝终止当前或无效进程"));
+    }
+    unsafe {
+        let handle = match OpenProcess(PROCESS_TERMINATE, false, pid) {
+            Ok(h) => h,
+            Err(e) => {
+                if GetLastError() == ERROR_ACCESS_DENIED {
+                    return Err(anyhow!("权限不足（该窗口为管理员权限运行）"));
+                }
+                return Err(anyhow!("无法打开目标进程 PID {pid}：{e}"));
+            }
+        };
+        let res = TerminateProcess(handle, 1);
+        let err = if res.is_err() {
+            Some(GetLastError())
+        } else {
+            None
+        };
+        let _ = CloseHandle(handle);
+        if let Some(code) = err {
+            if code == ERROR_ACCESS_DENIED {
+                return Err(anyhow!("权限不足（该窗口为管理员权限运行）"));
+            }
+            return Err(anyhow!("TerminateProcess(PID {pid}) 失败：{code:?}"));
+        }
+    }
+    Ok(())
+}
+
+fn wait_until_window_closed(hwnd: HWND, max_wait: Duration) -> bool {
+    let deadline = Instant::now() + max_wait;
+    while Instant::now() < deadline {
+        if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(15));
+    }
+    !unsafe { IsWindow(Some(hwnd)) }.as_bool()
+}
+
+/// Force-quits a targeted window safely:
+/// - Protected shell hosts (e.g. `explorer.exe` File Explorer): sends `WM_CLOSE` only (never kills taskbar/shell).
+/// - UWP apps (`ApplicationFrameHost.exe`): resolves inner app child PID and terminates ONLY that UWP app.
+/// - Single-window or hung apps: calls `TerminateProcess` immediately (zero modal dialogs, kills frozen apps).
+/// - Healthy multi-window processes (`same_pid_window_count > 1`): attempts `WM_CLOSE` for 120ms so sibling
+///   windows survive if responsive; escalates directly to `TerminateProcess` if the window refuses or hangs.
+pub fn force_quit_window(target_raw: isize, same_pid_window_count: usize) -> Result<ForceQuitReport> {
+    let hwnd = HWND(target_raw as *mut c_void);
+    if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        return Err(anyhow!("目标窗口已关闭"));
+    }
+
+    let mut outer_pid = 0u32;
+    unsafe { GetWindowThreadProcessId(hwnd, Some(&mut outer_pid)) };
+    if outer_pid == 0 {
+        return Err(anyhow!("无法获取目标窗口进程 ID"));
+    }
+    if outer_pid == unsafe { GetCurrentProcessId() } {
+        return Err(anyhow!("不能强制退出 WinDeck 自身"));
+    }
+
+    let outer_name = process_name_for_pid(outer_pid);
+
+    // 1. Never terminate critical Windows Shell processes (e.g. explorer.exe); close the window cleanly instead.
+    if is_protected_shell_process(&outer_name) {
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+        wait_until_window_closed(hwnd, Duration::from_millis(160));
+        return Ok(ForceQuitReport {
+            target_hwnd: target_raw,
+            pid: outer_pid,
+            process_name: outer_name,
+            outcome: ForceQuitOutcome::WindowClosedSafely,
+        });
+    }
+
+    // 2. UWP apps hosted inside ApplicationFrameHost.exe -> resolve inner app PID so we don't kill other UWP apps.
+    if outer_name.eq_ignore_ascii_case("ApplicationFrameHost.exe") {
+        if let Some(real_pid) = resolve_uwp_child_pid(hwnd, outer_pid) {
+            let real_name = process_name_for_pid(real_pid);
+            terminate_pid(real_pid)?;
+            wait_until_window_closed(hwnd, Duration::from_millis(140));
+            return Ok(ForceQuitReport {
+                target_hwnd: target_raw,
+                pid: real_pid,
+                process_name: if real_name.is_empty() {
+                    outer_name
+                } else {
+                    real_name
+                },
+                outcome: ForceQuitOutcome::ProcessTerminated { pid: real_pid },
+            });
+        }
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+        wait_until_window_closed(hwnd, Duration::from_millis(160));
+        return Ok(ForceQuitReport {
+            target_hwnd: target_raw,
+            pid: outer_pid,
+            process_name: outer_name,
+            outcome: ForceQuitOutcome::WindowClosedSafely,
+        });
+    }
+
+    // 3. Multi-window responsive process: give the single window 120ms to close cleanly before escalating to kill.
+    let is_hung = unsafe { IsHungAppWindow(hwnd) }.as_bool();
+    if same_pid_window_count > 1 && !is_hung {
+        unsafe {
+            let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+        }
+        if wait_until_window_closed(hwnd, Duration::from_millis(120)) {
+            return Ok(ForceQuitReport {
+                target_hwnd: target_raw,
+                pid: outer_pid,
+                process_name: outer_name,
+                outcome: ForceQuitOutcome::WindowClosedSafely,
+            });
+        }
+    }
+
+    // 4. Single-window, hung, or unresponsive window -> immediate TerminateProcess.
+    terminate_pid(outer_pid)?;
+    wait_until_window_closed(hwnd, Duration::from_millis(140));
+    Ok(ForceQuitReport {
+        target_hwnd: target_raw,
+        pid: outer_pid,
+        process_name: outer_name,
+        outcome: ForceQuitOutcome::ProcessTerminated { pid: outer_pid },
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn protected_shell_processes_are_guarded() {
+        assert!(is_protected_shell_process("explorer.exe"));
+        assert!(is_protected_shell_process("EXPLORER.EXE"));
+        assert!(is_protected_shell_process("dwm.exe"));
+        assert!(!is_protected_shell_process("notepad.exe"));
+        assert!(!is_protected_shell_process("chrome.exe"));
+    }
+
+    #[test]
+    fn force_quit_rejects_invalid_hwnd_and_self_pid() {
+        assert!(force_quit_window(0, 1).is_err());
+        assert!(terminate_pid(unsafe { GetCurrentProcessId() }).is_err());
+    }
 }

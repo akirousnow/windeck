@@ -1,4 +1,7 @@
+use std::cell::RefCell;
 use std::ffi::c_void;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
@@ -13,22 +16,25 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, RegisterHotKey,
-    UnregisterHotKey, VK_OEM_3, VK_SPACE, VK_TAB,
+    GetAsyncKeyState, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_WIN,
+    RegisterHotKey, UnregisterHotKey, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LCONTROL, VK_LEFT,
+    VK_LMENU, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RWIN, VK_UP,
 };
 use windows::Win32::UI::Shell::{
-    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
+    NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+    Shell_NotifyIconW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    ASFW_ANY, AllowSetForegroundWindow, AppendMenuW, CreateIconIndirect, CreatePopupMenu,
-    CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow, DispatchMessageW,
-    FindWindowExW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW, HICON,
-    HWND_MESSAGE, ICONINFO, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW, MF_CHECKED, MF_SEPARATOR,
-    MF_STRING, MF_UNCHECKED, MSG, PostMessageW, RegisterClassW, RegisterWindowMessageW,
-    SetForegroundWindow, SetWindowLongPtrW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_NONOTIFY,
-    TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP,
-    WM_CLOSE, WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONUP,
-    WNDCLASSW,
+    ASFW_ANY, AllowSetForegroundWindow, AppendMenuW, CallNextHookEx, CreateIconIndirect,
+    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow,
+    DispatchMessageW, FindWindowExW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW,
+    HHOOK, HICON, HWND_MESSAGE, ICONINFO, IMAGE_ICON, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
+    LR_DEFAULTCOLOR, LoadImageW, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG,
+    PostMessageW, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetWindowLongPtrW,
+    SetWindowsHookExW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD,
+    TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP,
+    WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
 };
 use windows_core::{HSTRING, PCWSTR, w};
 use windows_registry::CURRENT_USER;
@@ -37,12 +43,16 @@ const HOTKEY_ID: i32 = 1;
 const WM_TRAY_ICON: u32 = WM_APP + 1;
 const WM_REBIND_HOTKEY: u32 = WM_APP + 2;
 const WM_ACTIVATE_EXISTING: u32 = WM_APP + 3;
+const WM_HOLD_NAV: u32 = WM_APP + 4;
+const WM_HOLD_RELEASED: u32 = WM_APP + 5;
+const WM_DISARM_HOLD_HOOK: u32 = WM_APP + 6;
 
 const MENU_CMD_TOGGLE: u32 = 1001;
 const MENU_CMD_RELOAD: u32 = 1002;
 const MENU_CMD_OPEN_CONFIG: u32 = 1003;
 const MENU_CMD_AUTOSTART: u32 = 1004;
 const MENU_CMD_QUIT: u32 = 1005;
+const MENU_CMD_SETTINGS: u32 = 1006;
 
 const RUN_REG_PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE_NAME: &str = "WinDeck";
@@ -127,14 +137,138 @@ pub fn set_autostart_enabled(enabled: bool) -> Result<()> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimaryModifier {
+    Ctrl,
+    Alt,
+    Win,
+}
+
+impl PrimaryModifier {
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Ctrl => "Ctrl",
+            Self::Alt => "Alt",
+            Self::Win => "Win",
+        }
+    }
+
+    pub fn win32_mod_flag(self) -> u32 {
+        match self {
+            Self::Ctrl => MOD_CONTROL.0,
+            Self::Alt => MOD_ALT.0,
+            Self::Win => MOD_WIN.0,
+        }
+    }
+
+    pub fn from_mod_flags(mods: u32) -> Option<Self> {
+        if (mods & MOD_CONTROL.0) != 0 {
+            Some(Self::Ctrl)
+        } else if (mods & MOD_ALT.0) != 0 {
+            Some(Self::Alt)
+        } else if (mods & MOD_WIN.0) != 0 {
+            Some(Self::Win)
+        } else {
+            None
+        }
+    }
+
+    fn is_vk_down(vk: u16) -> bool {
+        (unsafe { GetAsyncKeyState(vk as i32) } as u16 & 0x8000) != 0
+    }
+
+    pub fn is_physically_held(self) -> bool {
+        match self {
+            Self::Ctrl => Self::is_vk_down(VK_LCONTROL.0) || Self::is_vk_down(VK_RCONTROL.0),
+            Self::Alt => Self::is_vk_down(VK_LMENU.0) || Self::is_vk_down(VK_RMENU.0),
+            Self::Win => Self::is_vk_down(VK_LWIN.0) || Self::is_vk_down(VK_RWIN.0),
+        }
+    }
+
+    fn matches_vk(self, vk: u32) -> bool {
+        match self {
+            Self::Ctrl => {
+                vk == VK_LCONTROL.0 as u32 || vk == VK_RCONTROL.0 as u32 || vk == VK_CONTROL.0 as u32
+            }
+            Self::Alt => {
+                vk == VK_LMENU.0 as u32 || vk == VK_RMENU.0 as u32 || vk == VK_MENU.0 as u32
+            }
+            Self::Win => vk == VK_LWIN.0 as u32 || vk == VK_RWIN.0 as u32,
+        }
+    }
+
+    fn sibling_still_held(self, released_vk: u32) -> bool {
+        match self {
+            Self::Ctrl => {
+                if released_vk == VK_LCONTROL.0 as u32 {
+                    Self::is_vk_down(VK_RCONTROL.0)
+                } else if released_vk == VK_RCONTROL.0 as u32 {
+                    Self::is_vk_down(VK_LCONTROL.0)
+                } else {
+                    false
+                }
+            }
+            Self::Alt => {
+                if released_vk == VK_LMENU.0 as u32 {
+                    Self::is_vk_down(VK_RMENU.0)
+                } else if released_vk == VK_RMENU.0 as u32 {
+                    Self::is_vk_down(VK_LMENU.0)
+                } else {
+                    false
+                }
+            }
+            Self::Win => {
+                if released_vk == VK_LWIN.0 as u32 {
+                    Self::is_vk_down(VK_RWIN.0)
+                } else if released_vk == VK_RWIN.0 as u32 {
+                    Self::is_vk_down(VK_LWIN.0)
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HoldNavDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+impl HoldNavDirection {
+    fn to_wparam(self) -> usize {
+        match self {
+            Self::Left => 0,
+            Self::Right => 1,
+            Self::Up => 2,
+            Self::Down => 3,
+        }
+    }
+
+    fn from_wparam(v: usize) -> Option<Self> {
+        match v {
+            0 => Some(Self::Left),
+            1 => Some(Self::Right),
+            2 => Some(Self::Up),
+            3 => Some(Self::Down),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HotkeySpec {
+    pub primary: PrimaryModifier,
     pub modifiers: u32,
     pub vk: u32,
 }
 
 impl HotkeySpec {
+    /// Parses a `(Ctrl | Alt | Win) + <Letter>` hotkey such as `"Alt+Q"`, `"Ctrl+E"`, or `"Win+Q"`.
     pub fn parse(spec: &str) -> Result<Self> {
-        let mut modifiers = MOD_NOREPEAT.0;
+        let mut primary: Option<PrimaryModifier> = None;
         let mut vk: Option<u32> = None;
 
         for raw in spec.split('+') {
@@ -143,50 +277,79 @@ impl HotkeySpec {
                 continue;
             }
             match token.to_ascii_lowercase().as_str() {
-                "alt" => modifiers |= MOD_ALT.0,
-                "ctrl" | "control" => modifiers |= MOD_CONTROL.0,
-                "shift" => modifiers |= MOD_SHIFT.0,
-                "win" | "super" | "meta" => modifiers |= MOD_WIN.0,
-                "space" => vk = Some(VK_SPACE.0 as u32),
-                "tab" => vk = Some(VK_TAB.0 as u32),
-                "`" | "~" | "grave" | "backquote" => vk = Some(VK_OEM_3.0 as u32),
+                "alt" => {
+                    if primary.replace(PrimaryModifier::Alt).is_some() {
+                        return Err(anyhow!(
+                            "Hotkey '{spec}' must use a single primary modifier (Ctrl, Alt, or Win)"
+                        ));
+                    }
+                }
+                "ctrl" | "control" => {
+                    if primary.replace(PrimaryModifier::Ctrl).is_some() {
+                        return Err(anyhow!(
+                            "Hotkey '{spec}' must use a single primary modifier (Ctrl, Alt, or Win)"
+                        ));
+                    }
+                }
+                "win" | "super" | "meta" => {
+                    if primary.replace(PrimaryModifier::Win).is_some() {
+                        return Err(anyhow!(
+                            "Hotkey '{spec}' must use a single primary modifier (Ctrl, Alt, or Win)"
+                        ));
+                    }
+                }
                 other if other.len() == 1 => {
                     let ch = other.as_bytes()[0].to_ascii_uppercase();
-                    if ch.is_ascii_alphanumeric() {
-                        vk = Some(ch as u32);
+                    if ch.is_ascii_alphabetic() {
+                        if vk.replace(ch as u32).is_some() {
+                            return Err(anyhow!("Hotkey '{spec}' must contain only one letter key"));
+                        }
                     } else {
-                        return Err(anyhow!("Unsupported hotkey key: '{token}'"));
+                        return Err(anyhow!(
+                            "Unsupported hotkey key '{token}': secondary key must be an A-Z letter"
+                        ));
                     }
                 }
-                other if other.starts_with('f') => {
-                    let num: u32 = other[1..]
-                        .parse()
-                        .map_err(|_| anyhow!("Unsupported hotkey key: '{token}'"))?;
-                    if (1..=24).contains(&num) {
-                        vk = Some(0x70 + (num - 1));
-                    } else {
-                        return Err(anyhow!("Function key out of range: '{token}'"));
-                    }
+                _ => {
+                    return Err(anyhow!(
+                        "Unsupported hotkey token '{token}': format must be (Ctrl|Alt|Win)+<A-Z>"
+                    ));
                 }
-                _ => return Err(anyhow!("Unsupported hotkey token: '{token}'")),
             }
         }
 
-        let vk = vk.ok_or_else(|| anyhow!("Hotkey '{spec}' is missing a primary key"))?;
-        if (modifiers & !MOD_NOREPEAT.0) == 0 {
-            return Err(anyhow!(
-                "Hotkey '{spec}' must include at least one modifier (Alt/Ctrl/Shift/Win)"
-            ));
-        }
+        let primary = primary.ok_or_else(|| {
+            anyhow!("Hotkey '{spec}' must include a primary modifier (Ctrl, Alt, or Win)")
+        })?;
+        let vk = vk.ok_or_else(|| {
+            anyhow!("Hotkey '{spec}' must include a secondary letter key (A-Z)")
+        })?;
 
-        Ok(Self { modifiers, vk })
+        Ok(Self {
+            primary,
+            modifiers: MOD_NOREPEAT.0 | primary.win32_mod_flag(),
+            vk,
+        })
+    }
+
+    pub fn canonical_label(self) -> String {
+        let letter = char::from_u32(self.vk).unwrap_or('Q');
+        format!("{}+{}", self.primary.display_name(), letter)
     }
 }
 
 #[derive(Debug, Clone)]
 pub enum ShellEvent {
-    ToggleOverlay { hotkey_triggered: bool },
+    ToggleOverlay {
+        hotkey_triggered: bool,
+        hold_armed: bool,
+    },
     ShowOverlay,
+    OpenSettings,
+    HoldNavigate(HoldNavDirection),
+    HoldModifierReleased {
+        commit: bool,
+    },
     ReloadConfig,
     OpenConfigDir,
     AutostartToggled(bool),
@@ -194,13 +357,176 @@ pub enum ShellEvent {
     Quit,
 }
 
+struct RebindRequest {
+    hotkey: HotkeySpec,
+    reply: mpsc::Sender<Result<()>>,
+}
+
 struct ShellHostState {
     on_event: Box<dyn Fn(ShellEvent) + Send>,
     tray_icon: HICON,
     tooltip: String,
+    hotkey: HotkeySpec,
     hotkey_label: String,
     taskbar_created_msg: u32,
     hotkey_registered: bool,
+    overlay_visible: Arc<AtomicBool>,
+}
+
+struct HoldHookContext {
+    hook: HHOOK,
+    shell_hwnd: HWND,
+    primary: PrimaryModifier,
+    navigated: bool,
+}
+
+thread_local! {
+    static HOLD_HOOK: RefCell<Option<HoldHookContext>> = const { RefCell::new(None) };
+}
+
+fn disarm_hold_hook() {
+    HOLD_HOOK.with(|slot| {
+        if let Some(ctx) = slot.borrow_mut().take() {
+            unsafe {
+                let _ = UnhookWindowsHookEx(ctx.hook);
+            }
+        }
+    });
+}
+
+fn arm_hold_hook(shell_hwnd: HWND, primary: PrimaryModifier) -> bool {
+    disarm_hold_hook();
+    if !primary.is_physically_held() {
+        return false;
+    }
+    let Ok(hook) = (unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(hold_keyboard_ll_proc), None, 0) })
+    else {
+        return false;
+    };
+    HOLD_HOOK.with(|slot| {
+        *slot.borrow_mut() = Some(HoldHookContext {
+            hook,
+            shell_hwnd,
+            primary,
+            navigated: false,
+        });
+    });
+    true
+}
+
+unsafe extern "system" fn hold_keyboard_ll_proc(
+    n_code: i32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if n_code < 0 {
+        return unsafe { CallNextHookEx(None, n_code, wparam, lparam) };
+    }
+
+    let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
+    // Never react to synthetic SendInput events
+    if (kb.flags.0 & LLKHF_INJECTED.0) != 0 {
+        return unsafe { CallNextHookEx(None, n_code, wparam, lparam) };
+    }
+
+    let msg = wparam.0 as u32;
+    let vk = kb.vkCode;
+    let is_keydown = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+    let is_keyup = msg == WM_KEYUP || msg == WM_SYSKEYUP;
+
+    enum Action {
+        Pass,
+        Swallow,
+    }
+
+    let action = HOLD_HOOK.with(|slot| {
+        let mut borrow = slot.borrow_mut();
+        let Some(ctx) = borrow.as_mut() else {
+            return Action::Pass;
+        };
+
+        // 1. Primary modifier physically released -> unhook immediately & notify shell_hwnd
+        if is_keyup && ctx.primary.matches_vk(vk) {
+            if !ctx.primary.sibling_still_held(vk) {
+                let finished = borrow.take().unwrap();
+                unsafe {
+                    let _ = UnhookWindowsHookEx(finished.hook);
+                    let _ = PostMessageW(
+                        Some(finished.shell_hwnd),
+                        WM_HOLD_RELEASED,
+                        WPARAM(finished.navigated as usize),
+                        LPARAM(0),
+                    );
+                }
+            }
+            // Always pass modifier KEYUP through so Windows never sees a stuck modifier!
+            return Action::Pass;
+        }
+
+        // 2. Escape or Enter cancels hold-to-jump and passes through to GPUI immediately
+        if is_keydown && (vk == VK_ESCAPE.0 as u32 || vk == VK_RETURN.0 as u32) {
+            let finished = borrow.take().unwrap();
+            unsafe {
+                let _ = UnhookWindowsHookEx(finished.hook);
+                let _ = PostMessageW(
+                    Some(finished.shell_hwnd),
+                    WM_HOLD_RELEASED,
+                    WPARAM(0),
+                    LPARAM(0),
+                );
+            }
+            return Action::Pass;
+        }
+
+        // 3. Arrow keys while primary modifier is held -> navigate WinDeck & swallow key
+        //    (prevents Win+Arrow Aero Snap, Alt+Arrow system ding, and Ctrl+Arrow double-fire)
+        let nav_dir = match vk {
+            x if x == VK_LEFT.0 as u32 => Some(HoldNavDirection::Left),
+            x if x == VK_RIGHT.0 as u32 => Some(HoldNavDirection::Right),
+            x if x == VK_UP.0 as u32 => Some(HoldNavDirection::Up),
+            x if x == VK_DOWN.0 as u32 => Some(HoldNavDirection::Down),
+            _ => None,
+        };
+
+        if let Some(dir) = nav_dir {
+            if !ctx.primary.is_physically_held() {
+                // Safety net: modifier was released without us seeing keyup
+                let finished = borrow.take().unwrap();
+                unsafe {
+                    let _ = UnhookWindowsHookEx(finished.hook);
+                    let _ = PostMessageW(
+                        Some(finished.shell_hwnd),
+                        WM_HOLD_RELEASED,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+                return Action::Pass;
+            }
+            if is_keydown {
+                ctx.navigated = true;
+                unsafe {
+                    let _ = PostMessageW(
+                        Some(ctx.shell_hwnd),
+                        WM_HOLD_NAV,
+                        WPARAM(dir.to_wparam()),
+                        LPARAM(0),
+                    );
+                }
+                return Action::Swallow;
+            }
+            if is_keyup && ctx.navigated {
+                return Action::Swallow;
+            }
+        }
+
+        Action::Pass
+    });
+
+    match action {
+        Action::Swallow => LRESULT(1),
+        Action::Pass => unsafe { CallNextHookEx(None, n_code, wparam, lparam) },
+    }
 }
 
 fn create_programmatic_tray_icon() -> Result<HICON> {
@@ -304,6 +630,22 @@ fn add_tray_icon(hwnd: HWND, icon: HICON, tip: &str) {
     }
 }
 
+fn update_tray_tooltip(hwnd: HWND, icon: HICON, tip: &str) {
+    let mut nid = NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: 1,
+        uFlags: NIF_ICON | NIF_TIP,
+        hIcon: icon,
+        ..Default::default()
+    };
+    let utf16: Vec<u16> = tip.encode_utf16().take(nid.szTip.len() - 1).collect();
+    nid.szTip[..utf16.len()].copy_from_slice(&utf16);
+    unsafe {
+        let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+    }
+}
+
 fn remove_tray_icon(hwnd: HWND) {
     let nid = NOTIFYICONDATAW {
         cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
@@ -327,6 +669,12 @@ fn show_tray_menu(hwnd: HWND, state: &ShellHostState) {
             MF_STRING,
             MENU_CMD_TOGGLE as usize,
             PCWSTR(toggle_label.as_ptr()),
+        );
+        let _ = AppendMenuW(
+            menu,
+            MF_STRING,
+            MENU_CMD_SETTINGS as usize,
+            w!("设置..."),
         );
         let _ = AppendMenuW(
             menu,
@@ -377,7 +725,12 @@ fn show_tray_menu(hwnd: HWND, state: &ShellHostState) {
         match cmd.0 as u32 {
             MENU_CMD_TOGGLE => (state.on_event)(ShellEvent::ToggleOverlay {
                 hotkey_triggered: false,
+                hold_armed: false,
             }),
+            MENU_CMD_SETTINGS => {
+                let _ = AllowSetForegroundWindow(ASFW_ANY);
+                (state.on_event)(ShellEvent::OpenSettings);
+            }
             MENU_CMD_RELOAD => (state.on_event)(ShellEvent::ReloadConfig),
             MENU_CMD_OPEN_CONFIG => (state.on_event)(ShellEvent::OpenConfigDir),
             MENU_CMD_AUTOSTART => {
@@ -421,17 +774,45 @@ unsafe extern "system" fn shell_wnd_proc(
             WM_HOTKEY if wparam.0 as i32 == HOTKEY_ID => {
                 // Propagate WM_HOTKEY's foreground activation right to GPUI's UI thread.
                 let _ = unsafe { AllowSetForegroundWindow(ASFW_ANY) };
+                let opening = !state.overlay_visible.load(Ordering::Acquire);
+                let hold_armed = if opening {
+                    arm_hold_hook(hwnd, state.hotkey.primary)
+                } else {
+                    disarm_hold_hook();
+                    false
+                };
                 (state.on_event)(ShellEvent::ToggleOverlay {
                     hotkey_triggered: true,
+                    hold_armed,
                 });
+                return LRESULT(0);
+            }
+            WM_HOLD_NAV => {
+                if let Some(dir) = HoldNavDirection::from_wparam(wparam.0) {
+                    (state.on_event)(ShellEvent::HoldNavigate(dir));
+                }
+                return LRESULT(0);
+            }
+            WM_HOLD_RELEASED => {
+                let commit = wparam.0 != 0;
+                if commit {
+                    let _ = unsafe { AllowSetForegroundWindow(ASFW_ANY) };
+                }
+                (state.on_event)(ShellEvent::HoldModifierReleased { commit });
+                return LRESULT(0);
+            }
+            WM_DISARM_HOLD_HOOK => {
+                disarm_hold_hook();
                 return LRESULT(0);
             }
             WM_TRAY_ICON => {
                 let mouse_msg = (lparam.0 & 0xFFFF) as u32;
                 if mouse_msg == WM_LBUTTONUP {
                     let _ = unsafe { AllowSetForegroundWindow(ASFW_ANY) };
+                    disarm_hold_hook();
                     (state.on_event)(ShellEvent::ToggleOverlay {
                         hotkey_triggered: false,
+                        hold_armed: false,
                     });
                 } else if mouse_msg == WM_RBUTTONUP {
                     show_tray_menu(hwnd, state);
@@ -439,25 +820,73 @@ unsafe extern "system" fn shell_wnd_proc(
                 return LRESULT(0);
             }
             WM_REBIND_HOTKEY => {
-                let new_mods = wparam.0 as u32;
-                let new_vk = lparam.0 as u32;
-                if state.hotkey_registered {
+                let req_ptr = lparam.0 as *mut RebindRequest;
+                if req_ptr.is_null() {
+                    return LRESULT(0);
+                }
+                let req = unsafe { Box::from_raw(req_ptr) };
+                disarm_hold_hook();
+
+                if req.hotkey == state.hotkey && state.hotkey_registered {
+                    let _ = req.reply.send(Ok(()));
+                    return LRESULT(0);
+                }
+
+                let prev_hotkey = state.hotkey;
+                let was_registered = state.hotkey_registered;
+                if was_registered {
                     let _ = unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_ID) };
                     state.hotkey_registered = false;
                 }
-                if unsafe { RegisterHotKey(Some(hwnd), HOTKEY_ID, HOT_KEY_MODIFIERS(new_mods), new_vk) }
-                    .is_ok()
-                {
-                    state.hotkey_registered = true;
+
+                match unsafe {
+                    RegisterHotKey(
+                        Some(hwnd),
+                        HOTKEY_ID,
+                        HOT_KEY_MODIFIERS(req.hotkey.modifiers),
+                        req.hotkey.vk,
+                    )
+                } {
+                    Ok(()) => {
+                        state.hotkey_registered = true;
+                        state.hotkey = req.hotkey;
+                        state.hotkey_label = req.hotkey.canonical_label();
+                        state.tooltip =
+                            format!("WinDeck — 全局窗口切换器 ({})", state.hotkey_label);
+                        update_tray_tooltip(hwnd, state.tray_icon, &state.tooltip);
+                        let _ = req.reply.send(Ok(()));
+                    }
+                    Err(e) => {
+                        // Roll back to previous working hotkey so user is never left without a shortcut
+                        if was_registered
+                            && unsafe {
+                                RegisterHotKey(
+                                    Some(hwnd),
+                                    HOTKEY_ID,
+                                    HOT_KEY_MODIFIERS(prev_hotkey.modifiers),
+                                    prev_hotkey.vk,
+                                )
+                            }
+                            .is_ok()
+                        {
+                            state.hotkey_registered = true;
+                        }
+                        let _ = req.reply.send(Err(anyhow!(
+                            "热键 {} 已被系统或其他程序占用（{e}）",
+                            req.hotkey.canonical_label()
+                        )));
+                    }
                 }
                 return LRESULT(0);
             }
             WM_ACTIVATE_EXISTING => {
                 let _ = unsafe { AllowSetForegroundWindow(ASFW_ANY) };
+                disarm_hold_hook();
                 (state.on_event)(ShellEvent::ShowOverlay);
                 return LRESULT(0);
             }
             WM_CLOSE => {
+                disarm_hold_hook();
                 if state.hotkey_registered {
                     let _ = unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_ID) };
                     state.hotkey_registered = false;
@@ -467,10 +896,12 @@ unsafe extern "system" fn shell_wnd_proc(
                 return LRESULT(0);
             }
             WM_DESTROY => {
+                disarm_hold_hook();
                 unsafe { windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0) };
                 return LRESULT(0);
             }
             WM_NCDESTROY => {
+                disarm_hold_hook();
                 unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
                 let boxed = unsafe { Box::from_raw(state_ptr) };
                 if !boxed.tray_icon.is_invalid() {
@@ -491,6 +922,7 @@ pub struct ShellHost {
     hwnd_raw: isize,
     hotkey_registered: bool,
     hotkey_error: Option<String>,
+    overlay_visible: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -500,6 +932,8 @@ impl ShellHost {
         F: Fn(ShellEvent) + Send + 'static,
     {
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(isize, bool, Option<String>)>>();
+        let overlay_visible = Arc::new(AtomicBool::new(false));
+        let overlay_visible_for_thread = overlay_visible.clone();
 
         let thread = thread::Builder::new()
             .name("windeck-shell-host".to_string())
@@ -523,9 +957,11 @@ impl ShellHost {
                         on_event: Box::new(on_event),
                         tray_icon,
                         tooltip: tooltip.clone(),
+                        hotkey,
                         hotkey_label,
                         taskbar_created_msg,
                         hotkey_registered: false,
+                        overlay_visible: overlay_visible_for_thread,
                     });
                     let state_ptr = Box::into_raw(state);
 
@@ -603,6 +1039,7 @@ impl ShellHost {
             hwnd_raw,
             hotkey_registered,
             hotkey_error,
+            overlay_visible,
             thread: Some(thread),
         })
     }
@@ -615,16 +1052,50 @@ impl ShellHost {
         self.hotkey_error.as_deref()
     }
 
-    pub fn rebind_hotkey(&self, hotkey: HotkeySpec) {
+    /// Keeps `ShellHost` aware of overlay visibility and guarantees any temporary
+    /// hold-modifier keyboard hook is immediately removed when hidden.
+    pub fn set_overlay_visible(&self, visible: bool) {
+        self.overlay_visible.store(visible, Ordering::Release);
+        if !visible {
+            self.disarm_hold_mode();
+        }
+    }
+
+    /// Cancels an active hold-modifier navigation hook (e.g. when switching to mouse interaction).
+    pub fn disarm_hold_mode(&self) {
+        if self.hwnd_raw != 0 {
+            let hwnd = HWND(self.hwnd_raw as *mut c_void);
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), WM_DISARM_HOLD_HOOK, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+
+    /// Synchronously rebinds the global hotkey on the shell thread with automatic rollback
+    /// to the previous working hotkey if the requested combo is occupied by Windows or another app.
+    pub fn rebind_hotkey(&self, hotkey: HotkeySpec) -> Result<()> {
+        if self.hwnd_raw == 0 {
+            return Err(anyhow!("ShellHost is not running"));
+        }
         let hwnd = HWND(self.hwnd_raw as *mut c_void);
-        unsafe {
-            let _ = PostMessageW(
+        let (tx, rx) = mpsc::channel();
+        let req_ptr = Box::into_raw(Box::new(RebindRequest { hotkey, reply: tx }));
+        let posted = unsafe {
+            PostMessageW(
                 Some(hwnd),
                 WM_REBIND_HOTKEY,
-                WPARAM(hotkey.modifiers as usize),
-                LPARAM(hotkey.vk as isize),
-            );
+                WPARAM(0),
+                LPARAM(req_ptr as isize),
+            )
+        };
+        if let Err(e) = posted {
+            unsafe {
+                drop(Box::from_raw(req_ptr));
+            }
+            return Err(anyhow!("PostMessageW(WM_REBIND_HOTKEY) failed: {e}"));
         }
+        rx.recv_timeout(std::time::Duration::from_millis(800))
+            .map_err(|_| anyhow!("热键更新超时"))?
     }
 }
 
@@ -648,23 +1119,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hotkey_spec_parses_common_combos() {
+    fn hotkey_spec_parses_primary_modifier_plus_letter() {
         let alt_q = HotkeySpec::parse("Alt+Q").unwrap();
+        assert_eq!(alt_q.primary, PrimaryModifier::Alt);
         assert_eq!(alt_q.vk, b'Q' as u32);
         assert_ne!(alt_q.modifiers & MOD_ALT.0, 0);
+        assert_eq!(alt_q.canonical_label(), "Alt+Q");
 
-        let ctrl_shift_space = HotkeySpec::parse("Ctrl+Shift+Space").unwrap();
-        assert_eq!(ctrl_shift_space.vk, VK_SPACE.0 as u32);
-        assert_ne!(ctrl_shift_space.modifiers & MOD_CONTROL.0, 0);
-        assert_ne!(ctrl_shift_space.modifiers & MOD_SHIFT.0, 0);
+        let ctrl_e = HotkeySpec::parse("ctrl + e").unwrap();
+        assert_eq!(ctrl_e.primary, PrimaryModifier::Ctrl);
+        assert_eq!(ctrl_e.vk, b'E' as u32);
+        assert_ne!(ctrl_e.modifiers & MOD_CONTROL.0, 0);
+        assert_eq!(ctrl_e.canonical_label(), "Ctrl+E");
 
-        let alt_grave = HotkeySpec::parse("Alt+`").unwrap();
-        assert_eq!(alt_grave.vk, VK_OEM_3.0 as u32);
-
-        let f_key = HotkeySpec::parse("Ctrl+Alt+F12").unwrap();
-        assert_eq!(f_key.vk, 0x7B);
+        let win_a = HotkeySpec::parse("Win+a").unwrap();
+        assert_eq!(win_a.primary, PrimaryModifier::Win);
+        assert_eq!(win_a.vk, b'A' as u32);
+        assert_ne!(win_a.modifiers & MOD_WIN.0, 0);
+        assert_eq!(win_a.canonical_label(), "Win+A");
 
         assert!(HotkeySpec::parse("Q").is_err(), "missing modifier should fail");
-        assert!(HotkeySpec::parse("Alt+").is_err(), "missing key should fail");
+        assert!(HotkeySpec::parse("Alt+").is_err(), "missing letter should fail");
+        assert!(HotkeySpec::parse("Shift+Q").is_err(), "shift is not a valid primary modifier");
+        assert!(HotkeySpec::parse("Ctrl+Alt+Q").is_err(), "multiple modifiers should fail");
+        assert!(HotkeySpec::parse("Alt+Space").is_err(), "non-letter secondary key should fail");
+        assert!(HotkeySpec::parse("Ctrl+1").is_err(), "digit secondary key should fail");
     }
 }

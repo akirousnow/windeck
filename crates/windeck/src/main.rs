@@ -2,6 +2,7 @@
 
 mod config;
 mod nav;
+mod settings_panel;
 mod switcher_view;
 mod thumb_manager;
 
@@ -91,7 +92,7 @@ fn main() -> Result<()> {
         None
     } else {
         let tx = event_tx.clone();
-        match ShellHost::start(hotkey_spec, config.hotkey.clone(), move |ev| {
+        match ShellHost::start(hotkey_spec, hotkey_spec.canonical_label(), move |ev| {
             let _ = tx.send_blocking(ev);
         }) {
             Ok(host) => Some(host),
@@ -158,11 +159,13 @@ fn main() -> Result<()> {
                 )
                 .expect("create bottom ThumbnailHostWindow");
 
+                let shell_for_view = shell_for_loop.clone();
                 let view = cx.new(|cx| {
                     let v = SwitcherView::new(
                         gpui_hwnd,
                         thumb_host,
                         vdm_clone,
+                        shell_for_view,
                         config_clone,
                         hotkey_warning,
                         window,
@@ -214,10 +217,10 @@ fn main() -> Result<()> {
                     cx.spawn(async move |cx| {
                         while let Ok(ev) = event_rx.recv().await {
                             let _ = cx.update(|cx| match ev {
-                                ShellEvent::ToggleOverlay { .. } => {
+                                ShellEvent::ToggleOverlay { hold_armed, .. } => {
                                     let _ = window_handle.update(cx, |_, window, cx| {
                                         view_for_events.update(cx, |v, cx| {
-                                            v.toggle(window, cx);
+                                            v.toggle_with_hold(hold_armed, window, cx);
                                         });
                                     });
                                 }
@@ -228,13 +231,37 @@ fn main() -> Result<()> {
                                         });
                                     });
                                 }
+                                ShellEvent::OpenSettings => {
+                                    let _ = window_handle.update(cx, |_, window, cx| {
+                                        view_for_events.update(cx, |v, cx| {
+                                            v.open_settings(window, cx);
+                                        });
+                                    });
+                                }
+                                ShellEvent::HoldNavigate(dir) => {
+                                    let _ = window_handle.update(cx, |_, _, cx| {
+                                        view_for_events.update(cx, |v, cx| {
+                                            v.handle_hold_navigate(dir, cx);
+                                        });
+                                    });
+                                }
+                                ShellEvent::HoldModifierReleased { commit } => {
+                                    let _ = window_handle.update(cx, |_, _, cx| {
+                                        view_for_events.update(cx, |v, cx| {
+                                            v.handle_hold_modifier_released(commit, cx);
+                                        });
+                                    });
+                                }
                                 ShellEvent::AutostartToggled(enabled) => {
                                     append_log(&format!("AUTOSTART toggled -> enabled={enabled}"));
                                 }
                                 ShellEvent::ReloadConfig => {
                                     let new_cfg = AppConfig::load_or_create();
                                     if let Some(ref host) = *shell_for_loop {
-                                        host.rebind_hotkey(new_cfg.parsed_hotkey());
+                                        if let Err(e) = host.rebind_hotkey(new_cfg.parsed_hotkey())
+                                        {
+                                            append_log(&format!("RELOAD HOTKEY ERROR: {e:#}"));
+                                        }
                                     }
                                     let _ = window_handle.update(cx, |_, window, cx| {
                                         view_for_events.update(cx, |v, cx| {

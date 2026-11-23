@@ -15,8 +15,8 @@ use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetModuleHandleW, 
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
-    VK_MENU,
+    GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
+    KEYEVENTF_KEYUP, SendInput, VK_MENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_EXSTYLE, GWL_STYLE, GetClientRect,
@@ -350,29 +350,33 @@ fn compute_overlay_rect(
 fn focus_hwnd(hwnd: HWND) {
     unsafe {
         if !SetForegroundWindow(hwnd).as_bool() {
-            let inputs = [
-                INPUT {
-                    r#type: INPUT_KEYBOARD,
-                    Anonymous: INPUT_0 {
-                        ki: KEYBDINPUT {
-                            wVk: VK_MENU,
-                            dwFlags: KEYBD_EVENT_FLAGS(0),
-                            ..Default::default()
+            // Never inject a synthetic VK_MENU KEYUP while the user is physically holding Alt,
+            // as doing so would break hold-Alt + arrow + release-to-jump tracking.
+            if (GetAsyncKeyState(VK_MENU.0 as i32) as u16 & 0x8000) == 0 {
+                let inputs = [
+                    INPUT {
+                        r#type: INPUT_KEYBOARD,
+                        Anonymous: INPUT_0 {
+                            ki: KEYBDINPUT {
+                                wVk: VK_MENU,
+                                dwFlags: KEYBD_EVENT_FLAGS(0),
+                                ..Default::default()
+                            },
                         },
                     },
-                },
-                INPUT {
-                    r#type: INPUT_KEYBOARD,
-                    Anonymous: INPUT_0 {
-                        ki: KEYBDINPUT {
-                            wVk: VK_MENU,
-                            dwFlags: KEYEVENTF_KEYUP,
-                            ..Default::default()
+                    INPUT {
+                        r#type: INPUT_KEYBOARD,
+                        Anonymous: INPUT_0 {
+                            ki: KEYBDINPUT {
+                                wVk: VK_MENU,
+                                dwFlags: KEYEVENTF_KEYUP,
+                                ..Default::default()
+                            },
                         },
                     },
-                },
-            ];
-            SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+                ];
+                SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+            }
             let _ = SetForegroundWindow(hwnd);
         }
     }

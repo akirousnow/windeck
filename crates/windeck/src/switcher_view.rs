@@ -11,8 +11,9 @@ use gpui::{
 };
 use smallvec::smallvec;
 use win_platform::{
-    DesktopId, IconBgra, ThumbnailHostWindow, VirtualDesktopClient, VirtualDesktopInfo, WindowInfo,
-    configure_borderless_immersive, enumerate_monitors, enumerate_windows, extract_window_icon,
+    DesktopId, ForceQuitOutcome, HoldNavDirection, IconBgra, ShellHost, ThumbnailHostWindow,
+    VirtualDesktopClient, VirtualDesktopInfo, WindowInfo, configure_borderless_immersive,
+    enumerate_monitors, enumerate_windows, extract_window_icon, force_quit_window,
     hide_layered_overlay, query_window_and_client_sizes, show_and_focus_layered_overlay,
     switch_to_window,
 };
@@ -134,33 +135,42 @@ fn trash_icon() -> gpui::Div {
 }
 
 pub struct SwitcherView {
-    focus_handle: FocusHandle,
-    gpui_hwnd: HWND,
-    thumb_host: ThumbnailHostWindow,
+    pub(crate) focus_handle: FocusHandle,
+    pub(crate) gpui_hwnd: HWND,
+    pub(crate) thumb_host: ThumbnailHostWindow,
     vdm: Arc<VirtualDesktopClient>,
-    config: AppConfig,
-    visible: bool,
+    pub(crate) shell_host: Arc<Option<ShellHost>>,
+    pub(crate) config: AppConfig,
+    pub(crate) visible: bool,
     shown_at: Option<Instant>,
+    hold_active: bool,
+    hold_navigated: bool,
     prev_foreground_hwnd: isize,
     desktops: Vec<VirtualDesktopInfo>,
     all_windows: Vec<WindowInfo>,
     desktop_filter: Option<DesktopId>,
     groups: Vec<DesktopGroup>,
-    flat_hwnds: Vec<isize>,
+    pub(crate) flat_hwnds: Vec<isize>,
     selected_flat: usize,
     hovered_flat: Option<usize>,
-    armed_delete_desktop: Option<DesktopId>,
+    pub(crate) armed_delete_desktop: Option<DesktopId>,
+    pub(crate) settings_open: bool,
+    pub(crate) recording_hotkey_letter: bool,
+    pub(crate) recording_force_quit_key: bool,
+    pub(crate) settings_error: Option<SharedString>,
+    pub(crate) settings_scroll_y: f32,
+    pub(crate) autostart_enabled: bool,
     scroll_y: f32,
     viewport_clip: Rc<RefCell<Option<Bounds<Pixels>>>>,
-    viewport_width_px: Rc<Cell<f32>>,
-    viewport_height_px: Rc<Cell<f32>>,
+    pub(crate) viewport_width_px: Rc<Cell<f32>>,
+    pub(crate) viewport_height_px: Rc<Cell<f32>>,
     icon_cache: HashMap<String, Option<Arc<RenderImage>>>,
-    thumbs: Rc<RefCell<ThumbnailManager>>,
+    pub(crate) thumbs: Rc<RefCell<ThumbnailManager>>,
     last_open_ms: f64,
     last_enum_ms: f64,
     total_window_count: usize,
-    hotkey_warning: Option<SharedString>,
-    transient_toast: Option<(SharedString, Instant)>,
+    pub(crate) hotkey_warning: Option<SharedString>,
+    pub(crate) transient_toast: Option<(SharedString, Instant)>,
 }
 
 impl Focusable for SwitcherView {
@@ -174,6 +184,7 @@ impl SwitcherView {
         gpui_hwnd: HWND,
         thumb_host: ThumbnailHostWindow,
         vdm: Arc<VirtualDesktopClient>,
+        shell_host: Arc<Option<ShellHost>>,
         config: AppConfig,
         hotkey_warning: Option<String>,
         window: &mut Window,
@@ -188,9 +199,12 @@ impl SwitcherView {
             gpui_hwnd,
             thumb_host,
             vdm,
+            shell_host,
             config,
             visible: false,
             shown_at: None,
+            hold_active: false,
+            hold_navigated: false,
             prev_foreground_hwnd: 0,
             desktops: Vec::new(),
             all_windows: Vec::new(),
@@ -200,6 +214,12 @@ impl SwitcherView {
             selected_flat: 0,
             hovered_flat: None,
             armed_delete_desktop: None,
+            settings_open: false,
+            recording_hotkey_letter: false,
+            recording_force_quit_key: false,
+            settings_error: None,
+            settings_scroll_y: 0.0,
+            autostart_enabled: false,
             scroll_y: 0.0,
             viewport_clip: Rc::new(RefCell::new(None)),
             viewport_width_px: Rc::new(Cell::new(2560.0)),
@@ -254,11 +274,73 @@ impl SwitcherView {
         }
     }
 
-    pub fn toggle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn sync_visibility_to_host(&self) {
+        if let Some(ref host) = *self.shell_host {
+            host.set_overlay_visible(self.visible);
+        }
+    }
+
+    pub(crate) fn disarm_hold_mode(&mut self) {
+        self.hold_active = false;
+        self.hold_navigated = false;
+        if let Some(ref host) = *self.shell_host {
+            host.disarm_hold_mode();
+        }
+    }
+
+    pub fn toggle_with_hold(&mut self, hold_armed: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.visible {
             self.hide(cx);
         } else {
             self.show_and_refresh(window, cx);
+            self.hold_active = hold_armed;
+            self.hold_navigated = false;
+            cx.notify();
+        }
+    }
+
+    pub fn handle_hold_navigate(&mut self, dir: HoldNavDirection, cx: &mut Context<Self>) {
+        if !self.visible {
+            return;
+        }
+        self.armed_delete_desktop = None;
+        self.hovered_flat = None;
+        self.hold_active = true;
+        self.hold_navigated = true;
+
+        let nav_dir = match dir {
+            HoldNavDirection::Left => NavDirection::Left,
+            HoldNavDirection::Right => NavDirection::Right,
+            HoldNavDirection::Up => NavDirection::Up,
+            HoldNavDirection::Down => NavDirection::Down,
+        };
+        let (cols, _, _, _, _) = self.fixed_grid_geometry();
+        let sizes = self.group_sizes();
+        self.selected_flat = navigate(
+            &sizes,
+            cols,
+            self.selected_flat,
+            nav_dir,
+            self.config.cross_desktop_nav,
+        );
+        self.ensure_selected_visible();
+        cx.notify();
+    }
+
+    pub fn handle_hold_modifier_released(&mut self, commit: bool, cx: &mut Context<Self>) {
+        let should_jump = self.visible && commit && self.hold_navigated;
+        self.hold_active = false;
+        self.hold_navigated = false;
+        if should_jump {
+            if let Some(&hwnd) = self.flat_hwnds.get(self.selected_flat) {
+                self.activate_window(hwnd, cx);
+            } else if let Some(did) = self.desktop_filter {
+                self.switch_to_desktop_only(did, cx);
+            } else {
+                cx.notify();
+            }
+        } else {
+            cx.notify();
         }
     }
 
@@ -267,9 +349,16 @@ impl SwitcherView {
         hide_layered_overlay(self.gpui_hwnd, self.thumb_host.hwnd());
         self.visible = false;
         self.shown_at = None;
+        self.hold_active = false;
+        self.hold_navigated = false;
         self.hovered_flat = None;
         self.armed_delete_desktop = None;
+        self.settings_open = false;
+        self.recording_hotkey_letter = false;
+        self.recording_force_quit_key = false;
+        self.settings_error = None;
         self.transient_toast = None;
+        self.sync_visibility_to_host();
         cx.notify();
     }
 
@@ -278,6 +367,12 @@ impl SwitcherView {
         self.prev_foreground_hwnd = unsafe { GetForegroundWindow() }.0 as isize;
         self.hovered_flat = None;
         self.armed_delete_desktop = None;
+        self.settings_open = false;
+        self.recording_hotkey_letter = false;
+        self.recording_force_quit_key = false;
+        self.settings_error = None;
+        self.hold_active = false;
+        self.hold_navigated = false;
         self.scroll_y = 0.0;
         // Always open in full panorama ("全部") so all desktops' windows are visible at once
         self.desktop_filter = None;
@@ -286,6 +381,7 @@ impl SwitcherView {
 
         self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
         self.visible = true;
+        self.sync_visibility_to_host();
         self.shown_at = Some(Instant::now());
         window.set_background_appearance(WindowBackgroundAppearance::Transparent);
         self.thumb_host.configure(
@@ -494,6 +590,7 @@ impl SwitcherView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.disarm_hold_mode();
         if self.desktop_filter == new_filter {
             return;
         }
@@ -509,6 +606,7 @@ impl SwitcherView {
     }
 
     fn create_new_desktop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.disarm_hold_mode();
         match self.vdm.create_desktop() {
             Ok(new_id) => {
                 self.refresh_snapshot();
@@ -562,6 +660,7 @@ impl SwitcherView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.disarm_hold_mode();
         self.armed_delete_desktop = None;
         if self.desktops.len() <= 1 {
             self.transient_toast = Some((
@@ -764,7 +863,7 @@ impl SwitcherView {
         (y, selected_range)
     }
 
-    fn clamp_scroll(&mut self) {
+    pub(crate) fn clamp_scroll(&mut self) {
         let (cols, _, preview_h, _, _) = self.fixed_grid_geometry();
         let (total_h, _) = self.compute_layout_metrics(cols, preview_h);
         let view_h = self.viewport_height_px.get().max(100.0);
@@ -802,7 +901,10 @@ impl SwitcherView {
         hide_layered_overlay(self.gpui_hwnd, self.thumb_host.hwnd());
         self.visible = false;
         self.shown_at = None;
+        self.hold_active = false;
+        self.hold_navigated = false;
         self.hovered_flat = None;
+        self.sync_visibility_to_host();
 
         match switch_to_window(&self.vdm, target_hwnd, Some(self.gpui_hwnd.0 as isize)) {
             Ok(report) => {
@@ -837,7 +939,10 @@ impl SwitcherView {
         self.thumbs.borrow_mut().unregister_all();
         self.visible = false;
         self.shown_at = None;
+        self.hold_active = false;
+        self.hold_navigated = false;
         self.hovered_flat = None;
+        self.sync_visibility_to_host();
 
         if let Err(e) = self.vdm.switch_to_desktop(desktop_id) {
             append_log(&format!("DESKTOP SWITCH ERROR {}: {e:#}", desktop_id));
@@ -860,16 +965,120 @@ impl SwitcherView {
         cx.notify();
     }
 
+    fn force_quit_target_window(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let target_idx = self.hovered_flat.unwrap_or(self.selected_flat);
+        let Some(&target_hwnd) = self.flat_hwnds.get(target_idx) else {
+            return;
+        };
+
+        let (title, pid, proc_name) = self
+            .all_windows
+            .iter()
+            .find(|w| w.hwnd == target_hwnd)
+            .map(|w| (w.title.clone(), w.pid, w.process_name.clone()))
+            .unwrap_or_else(|| (String::new(), 0, String::new()));
+
+        let same_pid_count = if pid != 0 {
+            self.all_windows.iter().filter(|w| w.pid == pid).count()
+        } else {
+            1
+        };
+
+        // Cancel hold-to-jump so releasing the launch modifier afterwards does not jump to a neighbor window
+        self.disarm_hold_mode();
+        self.armed_delete_desktop = None;
+
+        match force_quit_window(target_hwnd, same_pid_count) {
+            Ok(report) => {
+                let display = if !title.trim().is_empty() {
+                    let short: String = title.chars().take(24).collect();
+                    short
+                } else if !report.process_name.is_empty() {
+                    report.process_name.clone()
+                } else {
+                    proc_name
+                };
+
+                self.hovered_flat = None;
+                self.refresh_snapshot();
+                if self.flat_hwnds.is_empty() {
+                    self.selected_flat = 0;
+                } else {
+                    self.selected_flat = target_idx.min(self.flat_hwnds.len() - 1);
+                }
+                self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
+
+                let toast = match report.outcome {
+                    ForceQuitOutcome::ProcessTerminated { .. } => {
+                        format!("已强制退出 {display}")
+                    }
+                    ForceQuitOutcome::WindowClosedSafely => {
+                        format!("已关闭 {display}")
+                    }
+                };
+                self.transient_toast = Some((SharedString::from(toast), Instant::now()));
+                append_log(&format!(
+                    "FORCE_QUIT hwnd=0x{:X} pid={} proc='{}' outcome={:?}",
+                    report.target_hwnd, report.pid, report.process_name, report.outcome
+                ));
+                self.clamp_scroll();
+                window.refresh();
+                cx.notify();
+            }
+            Err(e) => {
+                self.transient_toast = Some((
+                    SharedString::from(format!("强制退出失败：{e}")),
+                    Instant::now(),
+                ));
+                append_log(&format!("FORCE_QUIT ERROR hwnd=0x{:X}: {e:#}", target_hwnd));
+                cx.notify();
+            }
+        }
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if !self.visible {
             return;
         }
         let key = event.keystroke.key.as_str();
-        let shift = event.keystroke.modifiers.shift;
+        let mods = &event.keystroke.modifiers;
+        let shift = mods.shift;
+
+        // When Settings view is open, route keys exclusively to Settings / shortcut capture
+        if self.settings_open {
+            cx.stop_propagation();
+            if self.recording_hotkey_letter {
+                if key == "escape" {
+                    self.recording_hotkey_letter = false;
+                    cx.notify();
+                } else if key.len() == 1 && key.as_bytes()[0].is_ascii_alphabetic() {
+                    let letter = key.as_bytes()[0] as char;
+                    let primary = self.config.parsed_hotkey().primary;
+                    self.apply_hotkey_change(primary, letter, cx);
+                }
+            } else if self.recording_force_quit_key {
+                if key == "escape" {
+                    self.recording_force_quit_key = false;
+                    cx.notify();
+                } else if let Some(sc) = crate::config::LocalShortcut::from_keystroke(
+                    key,
+                    mods.control,
+                    mods.alt,
+                    mods.shift,
+                ) {
+                    self.apply_force_quit_key_change(sc, cx);
+                }
+            } else if key == "escape" {
+                self.close_settings(window, cx);
+            }
+            return;
+        }
+
         let (cols, _, _, _, _) = self.fixed_grid_geometry();
         let sizes = self.group_sizes();
 
         if key == "escape" {
+            cx.stop_propagation();
             if self.dismiss_armed_delete(cx) {
                 return;
             }
@@ -880,8 +1089,23 @@ impl SwitcherView {
             cx.notify();
         }
 
+        // Configurable force-quit shortcut on hovered/selected window
+        let held_primary = self.hold_active.then(|| self.config.parsed_hotkey().primary);
+        if self.config.parsed_force_quit_key().matches(
+            key,
+            mods.control,
+            mods.alt,
+            mods.shift,
+            held_primary,
+        ) {
+            cx.stop_propagation();
+            self.force_quit_target_window(window, cx);
+            return;
+        }
+
         match key {
             "enter" | "space" => {
+                cx.stop_propagation();
                 if let Some(&hwnd) = self.flat_hwnds.get(self.selected_flat) {
                     self.activate_window(hwnd, cx);
                 } else if let Some(did) = self.desktop_filter {
@@ -889,6 +1113,8 @@ impl SwitcherView {
                 }
             }
             "right" => {
+                cx.stop_propagation();
+                self.hovered_flat = None;
                 self.selected_flat = navigate(
                     &sizes,
                     cols,
@@ -900,6 +1126,8 @@ impl SwitcherView {
                 cx.notify();
             }
             "left" => {
+                cx.stop_propagation();
+                self.hovered_flat = None;
                 self.selected_flat = navigate(
                     &sizes,
                     cols,
@@ -911,6 +1139,8 @@ impl SwitcherView {
                 cx.notify();
             }
             "down" => {
+                cx.stop_propagation();
+                self.hovered_flat = None;
                 self.selected_flat = navigate(
                     &sizes,
                     cols,
@@ -922,6 +1152,8 @@ impl SwitcherView {
                 cx.notify();
             }
             "up" => {
+                cx.stop_propagation();
+                self.hovered_flat = None;
                 self.selected_flat = navigate(
                     &sizes,
                     cols,
@@ -933,6 +1165,7 @@ impl SwitcherView {
                 cx.notify();
             }
             "tab" => {
+                cx.stop_propagation();
                 let dir = if shift {
                     NavDirection::Left
                 } else {
@@ -956,12 +1189,13 @@ impl SwitcherView {
             }
             // Press L to live-cycle label placement: bottom_right -> bottom_left -> center -> below
             "l" => {
+                cx.stop_propagation();
                 self.config.label_position = self.config.label_position.next();
+                self.persist_config();
                 self.transient_toast = Some((
                     SharedString::from(format!(
-                        "标签位置：{}（config.toml: label_position = \"{}\"）",
-                        self.config.label_position.display_label(),
-                        self.config.label_position.as_config_str()
+                        "标签位置：{}（已自动保存）",
+                        self.config.label_position.display_label()
                     )),
                     Instant::now(),
                 ));
@@ -971,12 +1205,13 @@ impl SwitcherView {
             }
             // Press F to live-toggle fixed box fit mode: cover <-> contain
             "f" => {
+                cx.stop_propagation();
                 self.config.preview_fit = self.config.preview_fit.toggle();
+                self.persist_config();
                 self.transient_toast = Some((
                     SharedString::from(format!(
-                        "预览适配：{}（config.toml: preview_fit = \"{}\"）",
-                        self.config.preview_fit.display_label(),
-                        self.config.preview_fit.as_config_str()
+                        "预览适配：{}（已自动保存）",
+                        self.config.preview_fit.display_label()
                     )),
                     Instant::now(),
                 ));
@@ -985,32 +1220,36 @@ impl SwitcherView {
             }
             // Press - / = to live-tune Gaussian blur transparency
             "-" | "_" => {
+                cx.stop_propagation();
                 self.config.blur_opacity = (self.config.blur_opacity - 0.05).clamp(0.05, 0.85);
                 self.thumb_host.configure(
                     self.config.immersive,
                     self.config.background,
                     self.config.blur_opacity,
                 );
+                self.persist_config();
                 self.transient_toast = Some((
                     SharedString::from(format!(
-                        "毛玻璃暗度：{:.2}（越低越通透，config.toml: blur_opacity = {:.2}）",
-                        self.config.blur_opacity, self.config.blur_opacity
+                        "毛玻璃暗度：{:.0}%（已自动保存）",
+                        self.config.blur_opacity * 100.0
                     )),
                     Instant::now(),
                 ));
                 cx.notify();
             }
             "=" | "+" => {
+                cx.stop_propagation();
                 self.config.blur_opacity = (self.config.blur_opacity + 0.05).clamp(0.05, 0.85);
                 self.thumb_host.configure(
                     self.config.immersive,
                     self.config.background,
                     self.config.blur_opacity,
                 );
+                self.persist_config();
                 self.transient_toast = Some((
                     SharedString::from(format!(
-                        "毛玻璃暗度：{:.2}（越低越通透，config.toml: blur_opacity = {:.2}）",
-                        self.config.blur_opacity, self.config.blur_opacity
+                        "毛玻璃暗度：{:.0}%（已自动保存）",
+                        self.config.blur_opacity * 100.0
                     )),
                     Instant::now(),
                 ));
@@ -1721,16 +1960,32 @@ impl Render for SwitcherView {
             0.0
         };
 
-        let active_toast = self.transient_toast.as_ref().and_then(|(msg, at)| {
-            (at.elapsed() < Duration::from_secs(3)).then(|| msg.clone())
-        });
+        let active_toast = self
+            .transient_toast
+            .as_ref()
+            .and_then(|(msg, at)| (at.elapsed() < Duration::from_secs(3)).then(|| msg.clone()))
+            .or_else(|| {
+                (self.hold_active && self.hold_navigated).then(|| {
+                    let mod_name = self.config.parsed_hotkey().primary.display_name();
+                    SharedString::from(format!("松开 {mod_name} 立即跳转 · Esc 取消"))
+                })
+            });
 
-        div()
+        let root = div()
             .id("windeck-mission-control")
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
-            .on_mouse_down(
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(rgba(0x00000001))
+            .text_color(rgb(0xFFFFFF));
+
+        let root = if self.settings_open {
+            root.child(self.render_settings_view(cx))
+        } else {
+            root.on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, _, _, cx| {
                     this.dismiss_armed_delete(cx);
@@ -1742,11 +1997,6 @@ impl Render for SwitcherView {
                 }
                 this.hide(cx);
             }))
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(rgba(0x00000001))
-            .text_color(rgb(0xFFFFFF))
             // === TOP FLOATING APPLE SPACES BAR ===
             .child(
                 div()
@@ -1838,6 +2088,11 @@ impl Render for SwitcherView {
                         )
                     }),
             )
+            // === BOTTOM-RIGHT QUIET FLOATING SETTINGS ICON ===
+            .child(self.render_settings_trigger(cx))
+        };
+
+        root
             .when_some(active_toast, |el, msg| {
                 el.child(
                     div()
