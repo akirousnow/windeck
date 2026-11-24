@@ -1,9 +1,10 @@
 use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use windows::Win32::Foundation::{
@@ -14,13 +15,20 @@ use windows::Win32::Graphics::Gdi::{
     DeleteObject,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::RemoteDesktop::{
+    NOTIFY_FOR_THIS_SESSION, WTSRegisterSessionNotification, WTSUnRegisterSessionNotification,
+};
+use windows::Win32::System::SystemInformation::{GetTickCount, GetTickCount64};
+use windows::Win32::System::Threading::{
+    CreateMutexW, GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST,
+};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, HOT_KEY_MODIFIERS, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS,
-    KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, MAPVK_VK_TO_VSC, MOD_ALT, MOD_CONTROL,
-    MOD_NOREPEAT, MOD_WIN, MapVirtualKeyW, RegisterHotKey, SendInput, UnregisterHotKey,
-    VIRTUAL_KEY, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT,
-    VK_LWIN, VK_MENU, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_UP,
+    GetAsyncKeyState, GetLastInputInfo, HOT_KEY_MODIFIERS, INPUT, INPUT_0, INPUT_KEYBOARD,
+    KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, LASTINPUTINFO,
+    MAPVK_VK_TO_VSC, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_WIN, MapVirtualKeyW, RegisterHotKey,
+    SendInput, UnregisterHotKey, VIRTUAL_KEY, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LCONTROL,
+    VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU,
+    VK_RSHIFT, VK_RWIN, VK_UP,
 };
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
@@ -29,14 +37,17 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     ASFW_ANY, AllowSetForegroundWindow, AppendMenuW, CallNextHookEx, CreateIconIndirect,
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow,
-    DispatchMessageW, FindWindowExW, GWLP_USERDATA, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-    HHOOK, HICON, HWND_MESSAGE, ICONINFO, IMAGE_ICON, KBDLLHOOKSTRUCT, LLKHF_INJECTED,
-    LR_DEFAULTCOLOR, LoadImageW, MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG,
-    PostMessageW, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetWindowLongPtrW,
-    SetWindowsHookExW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD,
-    TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WINDOW_EX_STYLE,
-    WINDOW_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONUP,
-    WM_NCCREATE, WM_NCDESTROY, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WNDCLASSW,
+    DispatchMessageW, FindWindowExW, GWLP_USERDATA, GetCursorPos, GetForegroundWindow, GetMessageW,
+    GetWindowLongPtrW, HHOOK, HICON, HWND_MESSAGE, ICONINFO, IMAGE_ICON, KBDLLHOOKSTRUCT,
+    KillTimer, LLKHF_INJECTED, LR_DEFAULTCOLOR, LoadImageW, MF_CHECKED, MF_SEPARATOR, MF_STRING,
+    MF_UNCHECKED, MSG, PostMessageW, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
+    SetTimer, SetWindowLongPtrW, SetWindowsHookExW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_NONOTIFY,
+    TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
+    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
+    WM_LBUTTONUP, WM_NCCREATE, WM_NCDESTROY, WM_POWERBROADCAST, WM_RBUTTONUP, WM_SYSKEYDOWN,
+    WM_SYSKEYUP, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    WS_POPUP, WTS_CONSOLE_CONNECT, WTS_CONSOLE_DISCONNECT, WTS_REMOTE_CONNECT,
+    WTS_REMOTE_DISCONNECT, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
 };
 use windows_core::{HSTRING, PCWSTR, w};
 use windows_registry::CURRENT_USER;
@@ -51,6 +62,50 @@ const WM_DISARM_HOLD_HOOK: u32 = WM_APP + 6;
 const WM_SHOW_BALLOON: u32 = WM_APP + 7;
 const WM_SET_WIN_ARROW_PATCH: u32 = WM_APP + 8;
 const WM_WIN_ARROW_SWITCH: u32 = WM_APP + 9;
+const WM_WIN_ARROW_MASK: u32 = WM_APP + 10;
+const WM_EXPLORER_RESTARTED: u32 = WM_APP + 11;
+const WM_SYSTEM_RESUMED: u32 = WM_APP + 12;
+const WM_SESSION_LOCKED: u32 = WM_APP + 13;
+const WM_SESSION_UNLOCKED: u32 = WM_APP + 14;
+const WM_SYNC_WATCHDOG_TIMER: u32 = WM_APP + 15;
+
+const WM_KBD_SET_PATCH: u32 = WM_APP + 40;
+const WM_KBD_ARM_HOLD: u32 = WM_APP + 41;
+const WM_KBD_DISARM_HOLD: u32 = WM_APP + 42;
+const WM_KBD_RESET_MODS: u32 = WM_APP + 43;
+const WM_KBD_REFRESH_HOOK: u32 = WM_APP + 44;
+
+const TIMER_HOOK_WATCHDOG: usize = 1;
+const TIMER_MOD_RECONCILE: usize = 2;
+
+const WATCHDOG_INTERVAL_MS: u32 = 30_000;
+const WATCHDOG_STALE_ACTIVITY_MS: u64 = 25_000;
+const WATCHDOG_MIN_IDLE_MS: u32 = 2_000;
+const MOD_RECONCILE_INTERVAL_MS: u32 = 150;
+const STALE_MOD_RECONCILE_MS: u64 = 150;
+const SYNTHETIC_CTRL_GRACE_MS: u64 = 120;
+
+const PBT_APMRESUMESUSPEND_CODE: usize = 0x0007;
+const PBT_APMRESUMEAUTOMATIC_CODE: usize = 0x0012;
+
+const WINDECK_SYNTHETIC_EXTRA_INFO: usize = 0x5744_4B53; // "WDKS"
+// Unassigned virtual key (same convention as AutoHotkey `#MenuMaskKey`) that suppresses
+// Start Menu activation on bare Win keyup without triggering any app or shell shortcut.
+const VK_MENU_MASK: VIRTUAL_KEY = VIRTUAL_KEY(0xE8);
+
+const PHYS_MOD_LWIN: u8 = 1 << 0;
+const PHYS_MOD_RWIN: u8 = 1 << 1;
+const PHYS_MOD_LCTRL: u8 = 1 << 2;
+const PHYS_MOD_RCTRL: u8 = 1 << 3;
+const PHYS_MOD_LALT: u8 = 1 << 4;
+const PHYS_MOD_RALT: u8 = 1 << 5;
+const PHYS_MOD_LSHIFT: u8 = 1 << 6;
+const PHYS_MOD_RSHIFT: u8 = 1 << 7;
+
+const PHYS_MOD_WIN_MASK: u8 = PHYS_MOD_LWIN | PHYS_MOD_RWIN;
+const PHYS_MOD_CTRL_MASK: u8 = PHYS_MOD_LCTRL | PHYS_MOD_RCTRL;
+const PHYS_MOD_ALT_MASK: u8 = PHYS_MOD_LALT | PHYS_MOD_RALT;
+const PHYS_MOD_SHIFT_MASK: u8 = PHYS_MOD_LSHIFT | PHYS_MOD_RSHIFT;
 
 const MENU_CMD_TOGGLE: u32 = 1001;
 const MENU_CMD_RELOAD: u32 = 1002;
@@ -349,62 +404,8 @@ impl HotkeySpec {
     }
 }
 
-#[derive(Debug, Clone)]
-pub enum ShellEvent {
-    ToggleOverlay {
-        hotkey_triggered: bool,
-        hold_armed: bool,
-    },
-    ShowOverlay,
-    OpenSettings,
-    CheckUpdate,
-    OpenUpdateDialog,
-    HoldNavigate(HoldNavDirection),
-    HoldModifierReleased {
-        commit: bool,
-    },
-    ReloadConfig,
-    OpenConfigDir,
-    AutostartToggled(bool),
-    ExplorerRestarted,
-    Quit,
-}
-
-struct RebindRequest {
-    hotkey: HotkeySpec,
-    reply: mpsc::Sender<Result<()>>,
-}
-
-struct WinArrowPatchRequest {
-    enabled: bool,
-    reply: mpsc::Sender<Result<()>>,
-}
-
-struct BalloonRequest {
-    title: String,
-    body: String,
-}
-
-struct ShellHostStartup {
-    hwnd_raw: isize,
-    hotkey_registered: bool,
-    hotkey_error: Option<String>,
-    win_arrow_patch_error: Option<String>,
-}
-
-struct ShellHostState {
-    on_event: Box<dyn Fn(ShellEvent) + Send>,
-    tray_icon: HICON,
-    tooltip: String,
-    hotkey: HotkeySpec,
-    hotkey_label: String,
-    taskbar_created_msg: u32,
-    hotkey_registered: bool,
-    overlay_visible: Arc<AtomicBool>,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DesktopSwitchDir {
+pub enum DesktopSwitchDir {
     Left,
     Right,
 }
@@ -433,8 +434,196 @@ impl DesktopSwitchDir {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum ShellEvent {
+    ToggleOverlay {
+        hotkey_triggered: bool,
+        hold_armed: bool,
+    },
+    ShowOverlay,
+    OpenSettings,
+    CheckUpdate,
+    OpenUpdateDialog,
+    HoldNavigate(HoldNavDirection),
+    HoldModifierReleased {
+        commit: bool,
+    },
+    WinArrowComFallback(DesktopSwitchDir),
+    ReloadConfig,
+    OpenConfigDir,
+    AutostartToggled(bool),
+    ExplorerRestarted,
+    Quit,
+}
+
+struct RebindRequest {
+    hotkey: HotkeySpec,
+    reply: mpsc::Sender<Result<()>>,
+}
+
+struct WinArrowPatchRequest {
+    enabled: bool,
+    reply: mpsc::Sender<Result<()>>,
+}
+
+struct ArmHoldRequest {
+    primary: PrimaryModifier,
+    reply: mpsc::Sender<bool>,
+}
+
+struct BalloonRequest {
+    title: String,
+    body: String,
+}
+
+struct ShellHostStartup {
+    hwnd_raw: isize,
+    hotkey_registered: bool,
+    hotkey_error: Option<String>,
+    win_arrow_patch_error: Option<String>,
+}
+
+struct OverlayFocusState {
+    visible: AtomicBool,
+    gpui_hwnd: AtomicIsize,
+    host_hwnd: AtomicIsize,
+}
+
+impl OverlayFocusState {
+    fn new() -> Self {
+        Self {
+            visible: AtomicBool::new(false),
+            gpui_hwnd: AtomicIsize::new(0),
+            host_hwnd: AtomicIsize::new(0),
+        }
+    }
+
+    fn set_visible(&self, visible: bool) {
+        self.visible.store(visible, Ordering::Release);
+    }
+
+    fn is_visible(&self) -> bool {
+        self.visible.load(Ordering::Acquire)
+    }
+
+    fn register_hwnds(&self, gpui_hwnd: HWND, host_hwnd: HWND) {
+        self.gpui_hwnd.store(gpui_hwnd.0 as isize, Ordering::Release);
+        self.host_hwnd.store(host_hwnd.0 as isize, Ordering::Release);
+    }
+
+    fn is_overlay_foreground_with(&self, fg_raw: isize) -> bool {
+        if !self.is_visible() {
+            return false;
+        }
+        let gpui = self.gpui_hwnd.load(Ordering::Acquire);
+        let host = self.host_hwnd.load(Ordering::Acquire);
+        if gpui == 0 && host == 0 {
+            return true;
+        }
+        fg_raw != 0 && (fg_raw == gpui || fg_raw == host)
+    }
+
+    fn is_overlay_foreground(&self) -> bool {
+        if !self.is_visible() {
+            return false;
+        }
+        let fg = unsafe { GetForegroundWindow() }.0 as isize;
+        self.is_overlay_foreground_with(fg)
+    }
+}
+
+struct SharedHookSync {
+    overlay: Arc<OverlayFocusState>,
+    physical_mods: AtomicU8,
+    synthetic_ctrl_until_ms: AtomicU64,
+    last_hook_event_ms: AtomicU64,
+    patch_enabled: AtomicBool,
+}
+
+impl SharedHookSync {
+    fn new(overlay: Arc<OverlayFocusState>, patch_enabled: bool) -> Self {
+        Self {
+            overlay,
+            physical_mods: AtomicU8::new(0),
+            synthetic_ctrl_until_ms: AtomicU64::new(0),
+            last_hook_event_ms: AtomicU64::new(0),
+            patch_enabled: AtomicBool::new(patch_enabled),
+        }
+    }
+
+    fn in_synthetic_ctrl_window(&self, now_ms: u64) -> bool {
+        now_ms <= self.synthetic_ctrl_until_ms.load(Ordering::Acquire)
+    }
+}
+
+struct BroadcastWindowState {
+    shell_hwnd: HWND,
+    taskbar_created_msg: u32,
+    wts_registered: bool,
+}
+
+struct ShellHostState {
+    on_event: Box<dyn Fn(ShellEvent) + Send>,
+    tray_icon: HICON,
+    tooltip: String,
+    hotkey: HotkeySpec,
+    hotkey_label: String,
+    taskbar_created_msg: u32,
+    hotkey_registered: bool,
+    broadcast_hwnd: HWND,
+    watchdog_armed: bool,
+    hook_sync: Arc<SharedHookSync>,
+    kbd_worker: KbdHookWorker,
+}
+
+fn monotonic_ms() -> u64 {
+    unsafe { GetTickCount64() }
+}
+
+fn user_idle_ms() -> Option<u32> {
+    let mut lii = LASTINPUTINFO {
+        cbSize: std::mem::size_of::<LASTINPUTINFO>() as u32,
+        dwTime: 0,
+    };
+    if unsafe { GetLastInputInfo(&mut lii) }.as_bool() {
+        let now = unsafe { GetTickCount() };
+        Some(now.wrapping_sub(lii.dwTime))
+    } else {
+        None
+    }
+}
+
 fn is_shift_physically_held() -> bool {
     PrimaryModifier::is_vk_down(VK_LSHIFT.0) || PrimaryModifier::is_vk_down(VK_RSHIFT.0)
+}
+
+fn capture_async_mod_bits() -> u8 {
+    let mut bits = 0u8;
+    if PrimaryModifier::is_vk_down(VK_LWIN.0) {
+        bits |= PHYS_MOD_LWIN;
+    }
+    if PrimaryModifier::is_vk_down(VK_RWIN.0) {
+        bits |= PHYS_MOD_RWIN;
+    }
+    if PrimaryModifier::is_vk_down(VK_LCONTROL.0) {
+        bits |= PHYS_MOD_LCTRL;
+    }
+    if PrimaryModifier::is_vk_down(VK_RCONTROL.0) {
+        bits |= PHYS_MOD_RCTRL;
+    }
+    if PrimaryModifier::is_vk_down(VK_LMENU.0) {
+        bits |= PHYS_MOD_LALT;
+    }
+    if PrimaryModifier::is_vk_down(VK_RMENU.0) {
+        bits |= PHYS_MOD_RALT;
+    }
+    if PrimaryModifier::is_vk_down(VK_LSHIFT.0) {
+        bits |= PHYS_MOD_LSHIFT;
+    }
+    if PrimaryModifier::is_vk_down(VK_RSHIFT.0) {
+        bits |= PHYS_MOD_RSHIFT;
+    }
+    bits
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -446,12 +635,12 @@ struct ModifierSnapshot {
 }
 
 impl ModifierSnapshot {
-    fn capture() -> Self {
+    fn from_bits(bits: u8) -> Self {
         Self {
-            win: PrimaryModifier::Win.is_physically_held(),
-            ctrl: PrimaryModifier::Ctrl.is_physically_held(),
-            alt: PrimaryModifier::Alt.is_physically_held(),
-            shift: is_shift_physically_held(),
+            win: (bits & PHYS_MOD_WIN_MASK) != 0,
+            ctrl: (bits & PHYS_MOD_CTRL_MASK) != 0,
+            alt: (bits & PHYS_MOD_ALT_MASK) != 0,
+            shift: (bits & PHYS_MOD_SHIFT_MASK) != 0,
         }
     }
 
@@ -460,10 +649,110 @@ impl ModifierSnapshot {
     }
 }
 
+/// Tracks physical (non-injected) modifier keys in the exact FIFO order delivered by
+/// `WH_KEYBOARD_LL`, eliminating both the fast-release `GetAsyncKeyState(VK_LWIN)` race
+/// and synthetic `SendInput(VK_LCONTROL)` self-pollution while reconciling missed keyups
+/// after UAC / Secure Desktop / elevated-window focus switches.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PhysicalModifierTracker {
+    bits: u8,
+    mismatch_since: [Option<u64>; 8],
+}
+
+impl PhysicalModifierTracker {
+    fn index_for_vk(vk: u32) -> Option<usize> {
+        match vk {
+            x if x == VK_LWIN.0 as u32 => Some(0),
+            x if x == VK_RWIN.0 as u32 => Some(1),
+            x if x == VK_LCONTROL.0 as u32 => Some(2),
+            x if x == VK_RCONTROL.0 as u32 => Some(3),
+            x if x == VK_LMENU.0 as u32 => Some(4),
+            x if x == VK_RMENU.0 as u32 => Some(5),
+            x if x == VK_LSHIFT.0 as u32 => Some(6),
+            x if x == VK_RSHIFT.0 as u32 => Some(7),
+            _ => None,
+        }
+    }
+
+    fn bits(&self) -> u8 {
+        self.bits
+    }
+
+    fn any_held(&self) -> bool {
+        self.bits != 0
+    }
+
+    fn clear(&mut self) {
+        self.bits = 0;
+        self.mismatch_since = [None; 8];
+    }
+
+    fn seed_from_async(&mut self, async_bits: u8, ignore_lctrl_async: bool) {
+        self.bits = if ignore_lctrl_async {
+            async_bits & !PHYS_MOD_LCTRL
+        } else {
+            async_bits
+        };
+        self.mismatch_since = [None; 8];
+    }
+
+    fn on_non_injected_key(&mut self, vk: u32, is_keydown: bool, is_keyup: bool) -> bool {
+        let Some(idx) = Self::index_for_vk(vk) else {
+            return false;
+        };
+        let mask = 1u8 << idx;
+        if is_keydown {
+            self.bits |= mask;
+            self.mismatch_since[idx] = None;
+        } else if is_keyup {
+            self.bits &= !mask;
+            self.mismatch_since[idx] = None;
+        }
+        true
+    }
+
+    fn reconcile_with_async(&mut self, async_bits: u8, now_ms: u64) -> u8 {
+        for idx in 0..8 {
+            let mask = 1u8 << idx;
+            if (self.bits & mask) == 0 {
+                self.mismatch_since[idx] = None;
+                continue;
+            }
+            if (async_bits & mask) != 0 {
+                self.mismatch_since[idx] = None;
+            } else if let Some(since) = self.mismatch_since[idx] {
+                if now_ms.saturating_sub(since) >= STALE_MOD_RECONCILE_MS {
+                    self.bits &= !mask;
+                    self.mismatch_since[idx] = None;
+                }
+            } else {
+                self.mismatch_since[idx] = Some(now_ms);
+            }
+        }
+        self.bits
+    }
+
+    fn snapshot_for_arrow(
+        &mut self,
+        async_bits: u8,
+        now_ms: u64,
+        ignore_lctrl_async: bool,
+    ) -> ModifierSnapshot {
+        self.reconcile_with_async(async_bits, now_ms);
+        let filtered_async = if ignore_lctrl_async {
+            async_bits & !PHYS_MOD_LCTRL
+        } else {
+            async_bits
+        };
+        ModifierSnapshot::from_bits(self.bits | filtered_async)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WinArrowDecision {
     Pass,
     SwallowOnly,
+    SwallowAndMask,
     SwallowAndSwitch(DesktopSwitchDir),
 }
 
@@ -487,12 +776,16 @@ impl WinArrowPatchState {
         self.swallowed_right = false;
     }
 
+    fn any_swallowed(&self) -> bool {
+        self.swallowed_left || self.swallowed_right
+    }
+
     fn handle_key(
         &mut self,
         vk: u32,
         is_keydown: bool,
         is_keyup: bool,
-        overlay_visible: bool,
+        overlay_foreground: bool,
         mods: ModifierSnapshot,
     ) -> WinArrowDecision {
         let dir = if vk == VK_LEFT.0 as u32 {
@@ -522,7 +815,7 @@ impl WinArrowPatchState {
             return WinArrowDecision::Pass;
         }
 
-        if !self.enabled || overlay_visible {
+        if !self.enabled {
             *swallowed = false;
             return WinArrowDecision::Pass;
         }
@@ -530,7 +823,13 @@ impl WinArrowPatchState {
         if mods.is_pure_win_only() {
             if !*swallowed {
                 *swallowed = true;
-                WinArrowDecision::SwallowAndSwitch(dir)
+                if overlay_foreground {
+                    // Built-in Win+Arrow snap remains disabled even while WinDeck's own panel is
+                    // foreground; emit a harmless menu-mask key so releasing Win won't open Start.
+                    WinArrowDecision::SwallowAndMask
+                } else {
+                    WinArrowDecision::SwallowAndSwitch(dir)
+                }
             } else {
                 // Swallow OS key-repeat while held without spamming desktop switches.
                 WinArrowDecision::SwallowOnly
@@ -551,25 +850,22 @@ fn keybd_input(vk: VIRTUAL_KEY, flags: KEYBD_EVENT_FLAGS) -> INPUT {
                 wVk: vk,
                 wScan: scan,
                 dwFlags: flags,
+                dwExtraInfo: WINDECK_SYNTHETIC_EXTRA_INFO,
                 ..Default::default()
             },
         },
     }
 }
 
-fn build_native_desktop_switch_inputs(
-    dir: DesktopSwitchDir,
-    win_already_held: bool,
-    ctrl_already_held: bool,
-) -> Vec<INPUT> {
+/// Builds the atomic `Ctrl + Win + Left/Right` `SendInput` batch.
+/// Always wraps the arrow tap inside `VK_LCONTROL` down/up so a rapid follow-up switch can
+/// never emit a bare `Win + Arrow` sequence that would trigger Windows' built-in Snap.
+fn build_native_desktop_switch_inputs(dir: DesktopSwitchDir, win_already_held: bool) -> Vec<INPUT> {
     let arrow_vk = dir.arrow_vk();
-    let inject_ctrl = !ctrl_already_held;
     let inject_win = !win_already_held;
     let mut inputs = Vec::with_capacity(6);
 
-    if inject_ctrl {
-        inputs.push(keybd_input(VK_LCONTROL, KEYBD_EVENT_FLAGS(0)));
-    }
+    inputs.push(keybd_input(VK_LCONTROL, KEYBD_EVENT_FLAGS(0)));
     if inject_win {
         inputs.push(keybd_input(VK_LWIN, KEYEVENTF_EXTENDEDKEY));
     }
@@ -584,25 +880,55 @@ fn build_native_desktop_switch_inputs(
             KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP,
         ));
     }
-    if inject_ctrl {
-        inputs.push(keybd_input(VK_LCONTROL, KEYEVENTF_KEYUP));
-    }
+    inputs.push(keybd_input(VK_LCONTROL, KEYEVENTF_KEYUP));
     inputs
+}
+
+fn build_menu_mask_inputs() -> [INPUT; 2] {
+    [
+        keybd_input(VK_MENU_MASK, KEYBD_EVENT_FLAGS(0)),
+        keybd_input(VK_MENU_MASK, KEYEVENTF_KEYUP),
+    ]
+}
+
+fn send_menu_mask_key() {
+    let inputs = build_menu_mask_inputs();
+    unsafe {
+        let _ = SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+    }
 }
 
 /// Synthesizes Windows' native `Ctrl + Win + Left/Right` virtual desktop switch shortcut.
 /// Keeps a physically held `Win` key untouched so users can keep holding `Win` and tap
 /// arrows repeatedly across multiple desktops without triggering the Start Menu.
-fn send_native_desktop_switch(dir: DesktopSwitchDir) {
-    if PrimaryModifier::Alt.is_physically_held() || is_shift_physically_held() {
-        return;
+/// Returns `false` only if `SendInput` was blocked (e.g. transient UIPI elevation boundary).
+fn send_native_desktop_switch(dir: DesktopSwitchDir, sync: &SharedHookSync) -> bool {
+    let phys = sync.physical_mods.load(Ordering::Acquire);
+    if (phys & (PHYS_MOD_ALT_MASK | PHYS_MOD_SHIFT_MASK | PHYS_MOD_CTRL_MASK)) != 0
+        || PrimaryModifier::Alt.is_physically_held()
+        || is_shift_physically_held()
+    {
+        return true;
     }
+
+    // Check live Win key state directly (we only ever inject LWin on the fast-release path,
+    // and calls are serialized on this thread so no synthetic LWin is in flight here).
     let win_held = PrimaryModifier::Win.is_physically_held();
-    let ctrl_held = PrimaryModifier::Ctrl.is_physically_held();
-    let inputs = build_native_desktop_switch_inputs(dir, win_held, ctrl_held);
-    unsafe {
-        SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
-    }
+    let inputs = build_native_desktop_switch_inputs(dir, win_held);
+
+    let now_ms = monotonic_ms();
+    sync.synthetic_ctrl_until_ms
+        .store(now_ms.saturating_add(SYNTHETIC_CTRL_GRACE_MS), Ordering::Release);
+
+    let sent = unsafe { SendInput(&inputs, std::mem::size_of::<INPUT>() as i32) };
+
+    let done_ms = monotonic_ms();
+    sync.synthetic_ctrl_until_ms.store(
+        done_ms.saturating_add(SYNTHETIC_CTRL_GRACE_MS),
+        Ordering::Release,
+    );
+
+    sent as usize == inputs.len()
 }
 
 struct HoldHookContext {
@@ -613,14 +939,60 @@ struct HoldHookContext {
 #[derive(Default)]
 struct KeyboardHookState {
     hook: Option<HHOOK>,
+    kbd_hwnd: HWND,
     shell_hwnd: HWND,
-    overlay_visible: Option<Arc<AtomicBool>>,
+    sync: Option<Arc<SharedHookSync>>,
     hold: Option<HoldHookContext>,
+    modifiers: PhysicalModifierTracker,
+    reconcile_timer_armed: bool,
     win_arrow_patch: WinArrowPatchState,
 }
 
 thread_local! {
     static KEYBOARD_HOOK: RefCell<KeyboardHookState> = RefCell::new(KeyboardHookState::default());
+}
+
+fn update_reconcile_timer(state: &mut KeyboardHookState) {
+    if state.kbd_hwnd.is_invalid() {
+        state.reconcile_timer_armed = false;
+        return;
+    }
+    let want_timer = state.hook.is_some() && state.modifiers.any_held();
+    if want_timer && !state.reconcile_timer_armed {
+        unsafe {
+            let _ = SetTimer(
+                Some(state.kbd_hwnd),
+                TIMER_MOD_RECONCILE,
+                MOD_RECONCILE_INTERVAL_MS,
+                None,
+            );
+        }
+        state.reconcile_timer_armed = true;
+    } else if !want_timer && state.reconcile_timer_armed {
+        unsafe {
+            let _ = KillTimer(Some(state.kbd_hwnd), TIMER_MOD_RECONCILE);
+        }
+        state.reconcile_timer_armed = false;
+    }
+}
+
+fn publish_physical_mods(state: &KeyboardHookState) {
+    if let Some(ref sync) = state.sync {
+        sync.physical_mods
+            .store(state.modifiers.bits(), Ordering::Release);
+    }
+}
+
+fn seed_modifiers_from_os(state: &mut KeyboardHookState) {
+    let ignore_lctrl = state
+        .sync
+        .as_ref()
+        .is_some_and(|s| s.in_synthetic_ctrl_window(monotonic_ms()));
+    state
+        .modifiers
+        .seed_from_async(capture_async_mod_bits(), ignore_lctrl);
+    publish_physical_mods(state);
+    update_reconcile_timer(state);
 }
 
 fn sync_keyboard_hook(state: &mut KeyboardHookState) -> Result<()> {
@@ -630,6 +1002,11 @@ fn sync_keyboard_hook(state: &mut KeyboardHookState) -> Result<()> {
             unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_ll_proc), None, 0) }
                 .context("SetWindowsHookExW(WH_KEYBOARD_LL) failed")?;
         state.hook = Some(hook);
+        if let Some(ref sync) = state.sync {
+            sync.last_hook_event_ms
+                .store(monotonic_ms(), Ordering::Relaxed);
+        }
+        seed_modifiers_from_os(state);
     } else if !needed {
         if let Some(hook) = state.hook.take() {
             unsafe {
@@ -637,24 +1014,67 @@ fn sync_keyboard_hook(state: &mut KeyboardHookState) -> Result<()> {
             }
         }
         state.win_arrow_patch.reset_swallowed();
+        state.modifiers.clear();
+        publish_physical_mods(state);
+        update_reconcile_timer(state);
+    }
+    Ok(())
+}
+
+fn reinstall_keyboard_hook(state: &mut KeyboardHookState, reset_modifiers: bool) -> Result<()> {
+    if let Some(hook) = state.hook.take() {
+        unsafe {
+            let _ = UnhookWindowsHookEx(hook);
+        }
+    }
+    state.win_arrow_patch.reset_swallowed();
+    if reset_modifiers {
+        state.modifiers.clear();
+        publish_physical_mods(state);
+    }
+    let needed = state.hold.is_some() || state.win_arrow_patch.enabled;
+    if needed {
+        let hook =
+            match unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_ll_proc), None, 0) } {
+                Ok(h) => h,
+                Err(e) => {
+                    update_reconcile_timer(state);
+                    return Err(anyhow!("SetWindowsHookExW(WH_KEYBOARD_LL) failed: {e}"));
+                }
+            };
+        state.hook = Some(hook);
+        if let Some(ref sync) = state.sync {
+            sync.last_hook_event_ms
+                .store(monotonic_ms(), Ordering::Relaxed);
+        }
+        seed_modifiers_from_os(state);
+    } else {
+        update_reconcile_timer(state);
     }
     Ok(())
 }
 
 fn init_keyboard_hook_context(
+    kbd_hwnd: HWND,
     shell_hwnd: HWND,
-    overlay_visible: Arc<AtomicBool>,
+    sync: Arc<SharedHookSync>,
     win_arrow_patch_enabled: bool,
 ) -> Result<()> {
     KEYBOARD_HOOK.with(|slot| {
         let mut state = slot.borrow_mut();
+        state.kbd_hwnd = kbd_hwnd;
         state.shell_hwnd = shell_hwnd;
-        state.overlay_visible = Some(overlay_visible);
+        state.sync = Some(sync.clone());
         state.hold = None;
+        state.modifiers.clear();
         state.win_arrow_patch.set_enabled(win_arrow_patch_enabled);
         let res = sync_keyboard_hook(&mut state);
         if res.is_err() {
             state.win_arrow_patch.set_enabled(false);
+            sync.patch_enabled.store(false, Ordering::Release);
+        } else {
+            sync.patch_enabled
+                .store(win_arrow_patch_enabled, Ordering::Release);
         }
         res
     })
@@ -668,43 +1088,35 @@ fn set_win_arrow_patch_hook(enabled: bool) -> Result<()> {
         if let Err(e) = sync_keyboard_hook(&mut state) {
             state.win_arrow_patch.set_enabled(prev);
             let _ = sync_keyboard_hook(&mut state);
+            if let Some(ref sync) = state.sync {
+                sync.patch_enabled.store(prev, Ordering::Release);
+            }
             return Err(anyhow!("安装键盘钩子失败（{e}）"));
+        }
+        if let Some(ref sync) = state.sync {
+            sync.patch_enabled.store(enabled, Ordering::Release);
+        }
+        if !state.shell_hwnd.is_invalid() {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(state.shell_hwnd),
+                    WM_SYNC_WATCHDOG_TIMER,
+                    WPARAM(enabled as usize),
+                    LPARAM(0),
+                );
+            }
         }
         Ok(())
     })
 }
 
-fn disarm_hold_hook() {
-    KEYBOARD_HOOK.with(|slot| {
-        let mut state = slot.borrow_mut();
-        state.hold = None;
-        let _ = sync_keyboard_hook(&mut state);
-    });
-}
-
-fn teardown_keyboard_hook() {
-    KEYBOARD_HOOK.with(|slot| {
-        let mut state = slot.borrow_mut();
-        state.hold = None;
-        state.win_arrow_patch.set_enabled(false);
-        if let Some(hook) = state.hook.take() {
-            unsafe {
-                let _ = UnhookWindowsHookEx(hook);
-            }
-        }
-        state.overlay_visible = None;
-        state.shell_hwnd = HWND::default();
-    });
-}
-
-fn arm_hold_hook(shell_hwnd: HWND, primary: PrimaryModifier) -> bool {
+fn arm_hold_hook_local(primary: PrimaryModifier) -> bool {
     if !primary.is_physically_held() {
-        disarm_hold_hook();
+        disarm_hold_hook_local();
         return false;
     }
     KEYBOARD_HOOK.with(|slot| {
         let mut state = slot.borrow_mut();
-        state.shell_hwnd = shell_hwnd;
         state.hold = Some(HoldHookContext {
             primary,
             navigated: false,
@@ -717,6 +1129,361 @@ fn arm_hold_hook(shell_hwnd: HWND, primary: PrimaryModifier) -> bool {
     })
 }
 
+fn disarm_hold_hook_local() {
+    KEYBOARD_HOOK.with(|slot| {
+        let mut state = slot.borrow_mut();
+        state.hold = None;
+        let _ = sync_keyboard_hook(&mut state);
+    });
+}
+
+fn reset_hook_modifiers_local() {
+    KEYBOARD_HOOK.with(|slot| {
+        let mut state = slot.borrow_mut();
+        state.modifiers.clear();
+        state.win_arrow_patch.reset_swallowed();
+        publish_physical_mods(&state);
+        update_reconcile_timer(&mut state);
+    });
+}
+
+fn refresh_keyboard_hook_local(force: bool) {
+    KEYBOARD_HOOK.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let needed = state.hold.is_some() || state.win_arrow_patch.enabled;
+        if !needed {
+            return;
+        }
+        if !force {
+            if state.hold.is_some()
+                || state.modifiers.any_held()
+                || state.win_arrow_patch.any_swallowed()
+            {
+                return;
+            }
+            if let Some(ref sync) = state.sync {
+                let last = sync.last_hook_event_ms.load(Ordering::Relaxed);
+                let now = monotonic_ms();
+                if state.hook.is_some() && now.saturating_sub(last) < WATCHDOG_STALE_ACTIVITY_MS {
+                    return;
+                }
+            }
+        }
+        let _ = reinstall_keyboard_hook(&mut state, force);
+    });
+}
+
+fn reconcile_hook_modifiers_local() {
+    KEYBOARD_HOOK.with(|slot| {
+        let mut state = slot.borrow_mut();
+        if !state.modifiers.any_held() {
+            update_reconcile_timer(&mut state);
+            return;
+        }
+        state
+            .modifiers
+            .reconcile_with_async(capture_async_mod_bits(), monotonic_ms());
+        publish_physical_mods(&state);
+        update_reconcile_timer(&mut state);
+    });
+}
+
+fn teardown_keyboard_hook_local() {
+    KEYBOARD_HOOK.with(|slot| {
+        let mut state = slot.borrow_mut();
+        state.hold = None;
+        state.win_arrow_patch.set_enabled(false);
+        state.modifiers.clear();
+        if state.reconcile_timer_armed && !state.kbd_hwnd.is_invalid() {
+            unsafe {
+                let _ = KillTimer(Some(state.kbd_hwnd), TIMER_MOD_RECONCILE);
+            }
+            state.reconcile_timer_armed = false;
+        }
+        if let Some(hook) = state.hook.take() {
+            unsafe {
+                let _ = UnhookWindowsHookEx(hook);
+            }
+        }
+        if let Some(ref sync) = state.sync {
+            sync.physical_mods.store(0, Ordering::Release);
+            sync.patch_enabled.store(false, Ordering::Release);
+        }
+        state.sync = None;
+        state.kbd_hwnd = HWND::default();
+        state.shell_hwnd = HWND::default();
+    });
+}
+
+unsafe extern "system" fn kbd_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_KBD_SET_PATCH => {
+            let req_ptr = lparam.0 as *mut WinArrowPatchRequest;
+            if !req_ptr.is_null() {
+                let req = unsafe { Box::from_raw(req_ptr) };
+                let res = set_win_arrow_patch_hook(req.enabled);
+                let _ = req.reply.send(res);
+            }
+            return LRESULT(0);
+        }
+        WM_KBD_ARM_HOLD => {
+            let req_ptr = lparam.0 as *mut ArmHoldRequest;
+            if !req_ptr.is_null() {
+                let req = unsafe { Box::from_raw(req_ptr) };
+                let armed = arm_hold_hook_local(req.primary);
+                let _ = req.reply.send(armed);
+            }
+            return LRESULT(0);
+        }
+        WM_KBD_DISARM_HOLD => {
+            disarm_hold_hook_local();
+            return LRESULT(0);
+        }
+        WM_KBD_RESET_MODS => {
+            reset_hook_modifiers_local();
+            return LRESULT(0);
+        }
+        WM_KBD_REFRESH_HOOK => {
+            let force = wparam.0 != 0;
+            refresh_keyboard_hook_local(force);
+            return LRESULT(0);
+        }
+        WM_TIMER if wparam.0 == TIMER_MOD_RECONCILE => {
+            reconcile_hook_modifiers_local();
+            return LRESULT(0);
+        }
+        WM_CLOSE => {
+            teardown_keyboard_hook_local();
+            let _ = unsafe { DestroyWindow(hwnd) };
+            return LRESULT(0);
+        }
+        WM_DESTROY => {
+            teardown_keyboard_hook_local();
+            unsafe { windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0) };
+            return LRESULT(0);
+        }
+        WM_NCDESTROY => {
+            teardown_keyboard_hook_local();
+            return LRESULT(0);
+        }
+        _ => {}
+    }
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+/// Dedicated, high-priority, zero-blocking thread solely responsible for pumping
+/// `WH_KEYBOARD_LL` so tray RPCs, context menus, `SendInput`, or Explorer stalls can
+/// never push `keyboard_ll_proc` past Windows' `LowLevelHooksTimeout`.
+struct KbdHookWorker {
+    kbd_hwnd_raw: isize,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+struct KbdHookStartup {
+    kbd_hwnd_raw: isize,
+    patch_error: Option<String>,
+}
+
+impl KbdHookWorker {
+    fn start(
+        shell_hwnd: HWND,
+        sync: Arc<SharedHookSync>,
+        win_arrow_patch_enabled: bool,
+    ) -> Result<(Self, Option<String>)> {
+        let (ready_tx, ready_rx) = mpsc::channel::<Result<KbdHookStartup>>();
+        let shell_hwnd_raw = shell_hwnd.0 as isize;
+
+        let thread = thread::Builder::new()
+            .name("windeck-kbd-hook".to_string())
+            .spawn(move || {
+                unsafe {
+                    let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+                }
+                let init = (|| -> Result<(HWND, KbdHookStartup)> {
+                    let hinstance = unsafe { GetModuleHandleW(None) }?;
+                    let class_name = w!("WinDeckKbdHookClass");
+                    let wc = WNDCLASSW {
+                        lpfnWndProc: Some(kbd_wnd_proc),
+                        hInstance: hinstance.into(),
+                        lpszClassName: class_name,
+                        ..Default::default()
+                    };
+                    unsafe { RegisterClassW(&wc) };
+
+                    let kbd_hwnd = unsafe {
+                        CreateWindowExW(
+                            WINDOW_EX_STYLE(0),
+                            class_name,
+                            w!("WinDeckKbdHook"),
+                            WINDOW_STYLE(0),
+                            0,
+                            0,
+                            0,
+                            0,
+                            Some(HWND_MESSAGE),
+                            None,
+                            Some(hinstance.into()),
+                            None,
+                        )
+                    }
+                    .context("CreateWindowExW for WinDeckKbdHook")?;
+
+                    let shell_hwnd = HWND(shell_hwnd_raw as *mut c_void);
+                    let patch_error =
+                        init_keyboard_hook_context(kbd_hwnd, shell_hwnd, sync, win_arrow_patch_enabled)
+                            .err()
+                            .map(|e| format!("{e:#}"));
+
+                    Ok((
+                        kbd_hwnd,
+                        KbdHookStartup {
+                            kbd_hwnd_raw: kbd_hwnd.0 as isize,
+                            patch_error,
+                        },
+                    ))
+                })();
+
+                match init {
+                    Ok((_hwnd, startup)) => {
+                        let _ = ready_tx.send(Ok(startup));
+                    }
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                        return;
+                    }
+                }
+
+                let mut msg = MSG::default();
+                unsafe {
+                    while GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                        let _ = TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+                teardown_keyboard_hook_local();
+            })
+            .context("spawn windeck-kbd-hook thread")?;
+
+        let startup = ready_rx
+            .recv()
+            .context("wait for windeck-kbd-hook startup")??;
+        let patch_error = startup.patch_error;
+
+        Ok((
+            Self {
+                kbd_hwnd_raw: startup.kbd_hwnd_raw,
+                thread: Some(thread),
+            },
+            patch_error,
+        ))
+    }
+
+    fn kbd_hwnd(&self) -> Option<HWND> {
+        (self.kbd_hwnd_raw != 0).then_some(HWND(self.kbd_hwnd_raw as *mut c_void))
+    }
+
+    fn forward_patch_request(&self, req_ptr: *mut WinArrowPatchRequest) {
+        let Some(hwnd) = self.kbd_hwnd() else {
+            let req = unsafe { Box::from_raw(req_ptr) };
+            let _ = req.reply.send(Err(anyhow!("键盘钩子线程未运行")));
+            return;
+        };
+        if let Err(e) = unsafe {
+            PostMessageW(
+                Some(hwnd),
+                WM_KBD_SET_PATCH,
+                WPARAM(0),
+                LPARAM(req_ptr as isize),
+            )
+        } {
+            let req = unsafe { Box::from_raw(req_ptr) };
+            let _ = req
+                .reply
+                .send(Err(anyhow!("PostMessageW(WM_KBD_SET_PATCH) failed: {e}")));
+        }
+    }
+
+    fn arm_hold(&self, primary: PrimaryModifier) -> bool {
+        if !primary.is_physically_held() {
+            self.disarm_hold();
+            return false;
+        }
+        let Some(hwnd) = self.kbd_hwnd() else {
+            return false;
+        };
+        let (tx, rx) = mpsc::channel();
+        let req_ptr = Box::into_raw(Box::new(ArmHoldRequest { primary, reply: tx }));
+        if unsafe {
+            PostMessageW(
+                Some(hwnd),
+                WM_KBD_ARM_HOLD,
+                WPARAM(0),
+                LPARAM(req_ptr as isize),
+            )
+        }
+        .is_err()
+        {
+            unsafe {
+                drop(Box::from_raw(req_ptr));
+            }
+            return false;
+        }
+        rx.recv_timeout(Duration::from_millis(200)).unwrap_or(false)
+    }
+
+    fn disarm_hold(&self) {
+        if let Some(hwnd) = self.kbd_hwnd() {
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), WM_KBD_DISARM_HOLD, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+
+    fn reset_modifiers(&self) {
+        if let Some(hwnd) = self.kbd_hwnd() {
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), WM_KBD_RESET_MODS, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+
+    fn refresh_hook(&self, force: bool) {
+        if let Some(hwnd) = self.kbd_hwnd() {
+            unsafe {
+                let _ = PostMessageW(
+                    Some(hwnd),
+                    WM_KBD_REFRESH_HOOK,
+                    WPARAM(force as usize),
+                    LPARAM(0),
+                );
+            }
+        }
+    }
+
+    fn shutdown(&mut self) {
+        if let Some(hwnd) = self.kbd_hwnd() {
+            unsafe {
+                let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+            }
+            self.kbd_hwnd_raw = 0;
+        }
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for KbdHookWorker {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 unsafe extern "system" fn keyboard_ll_proc(
     n_code: i32,
     wparam: WPARAM,
@@ -727,15 +1494,7 @@ unsafe extern "system" fn keyboard_ll_proc(
     }
 
     let kb = unsafe { &*(lparam.0 as *const KBDLLHOOKSTRUCT) };
-    // Never react to synthetic SendInput events (including our own Ctrl+Win+Arrow injection).
-    if (kb.flags.0 & LLKHF_INJECTED.0) != 0 {
-        return unsafe { CallNextHookEx(None, n_code, wparam, lparam) };
-    }
-
-    let msg = wparam.0 as u32;
-    let vk = kb.vkCode;
-    let is_keydown = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
-    let is_keyup = msg == WM_KEYUP || msg == WM_SYSKEYUP;
+    let is_injected = (kb.flags.0 & LLKHF_INJECTED.0) != 0;
 
     enum Action {
         Pass,
@@ -743,7 +1502,32 @@ unsafe extern "system" fn keyboard_ll_proc(
     }
 
     let action = KEYBOARD_HOOK.with(|slot| {
-        let mut state = slot.borrow_mut();
+        let Ok(mut state) = slot.try_borrow_mut() else {
+            return Action::Pass;
+        };
+
+        let now_ms = monotonic_ms();
+        if let Some(ref sync) = state.sync {
+            sync.last_hook_event_ms.store(now_ms, Ordering::Relaxed);
+        }
+
+        // Never react to synthetic SendInput events (including our own Ctrl+Win+Arrow injection).
+        if is_injected {
+            return Action::Pass;
+        }
+
+        let msg = wparam.0 as u32;
+        let vk = kb.vkCode;
+        let is_keydown = msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN;
+        let is_keyup = msg == WM_KEYUP || msg == WM_SYSKEYUP;
+
+        // Always update physical modifier tracking FIRST so hold-mode transitions and rapid
+        // Win+Arrow taps share an exact FIFO view of real non-injected modifier keys.
+        if state.modifiers.on_non_injected_key(vk, is_keydown, is_keyup) {
+            publish_physical_mods(&state);
+            update_reconcile_timer(&mut state);
+        }
+
         let shell_hwnd = state.shell_hwnd;
 
         // Priority 1: Active hold-to-switch mode (takes precedence over Win+Arrow patch,
@@ -823,33 +1607,51 @@ unsafe extern "system" fn keyboard_ll_proc(
             return Action::Pass;
         }
 
-        // Priority 2: Global `Win + Left/Right -> switch virtual desktop` patch.
-        // Fast-path skip non-arrow keys with zero Win32 syscalls during normal typing.
+        // Priority 2: Global `Win + Left/Right` system patch.
+        // Stage 1 unconditionally disables (swallows) built-in Win+Left/Right window snapping;
+        // Stage 2 dispatches the native virtual desktop switch off the hook thread.
         if vk != VK_LEFT.0 as u32 && vk != VK_RIGHT.0 as u32 {
             return Action::Pass;
         }
 
-        let overlay_visible = state
-            .overlay_visible
-            .as_ref()
-            .is_some_and(|v| v.load(Ordering::Acquire));
-        let mods = if is_keydown && state.win_arrow_patch.enabled && !overlay_visible {
-            ModifierSnapshot::capture()
+        let (overlay_foreground, ignore_lctrl_async) = match state.sync.as_ref() {
+            Some(sync) => (
+                sync.overlay.is_overlay_foreground(),
+                sync.in_synthetic_ctrl_window(now_ms),
+            ),
+            None => (false, false),
+        };
+
+        let mods = if is_keydown && state.win_arrow_patch.enabled {
+            let snap = state.modifiers.snapshot_for_arrow(
+                capture_async_mod_bits(),
+                now_ms,
+                ignore_lctrl_async,
+            );
+            publish_physical_mods(&state);
+            update_reconcile_timer(&mut state);
+            snap
         } else {
-            ModifierSnapshot {
-                win: false,
-                ctrl: false,
-                alt: false,
-                shift: false,
-            }
+            ModifierSnapshot::from_bits(0)
         };
 
         match state
             .win_arrow_patch
-            .handle_key(vk, is_keydown, is_keyup, overlay_visible, mods)
+            .handle_key(vk, is_keydown, is_keyup, overlay_foreground, mods)
         {
             WinArrowDecision::Pass => Action::Pass,
             WinArrowDecision::SwallowOnly => Action::Swallow,
+            WinArrowDecision::SwallowAndMask => {
+                unsafe {
+                    let _ = PostMessageW(
+                        Some(shell_hwnd),
+                        WM_WIN_ARROW_MASK,
+                        WPARAM(0),
+                        LPARAM(0),
+                    );
+                }
+                Action::Swallow
+            }
             WinArrowDecision::SwallowAndSwitch(dir) => {
                 unsafe {
                     let _ = PostMessageW(
@@ -1096,7 +1898,23 @@ fn show_tray_menu(hwnd: HWND, hotkey_label: &str) -> Option<ShellEvent> {
     }
 }
 
-unsafe extern "system" fn shell_wnd_proc(
+fn sync_watchdog_timer(hwnd: HWND, state: &mut ShellHostState, enabled: bool) {
+    if enabled && !state.watchdog_armed {
+        unsafe {
+            let _ = SetTimer(Some(hwnd), TIMER_HOOK_WATCHDOG, WATCHDOG_INTERVAL_MS, None);
+        }
+        state.watchdog_armed = true;
+    } else if !enabled && state.watchdog_armed {
+        unsafe {
+            let _ = KillTimer(Some(hwnd), TIMER_HOOK_WATCHDOG);
+        }
+        state.watchdog_armed = false;
+    }
+}
+
+/// Hidden top-level (`WS_POPUP`) window that receives OS-wide broadcasts (`TaskbarCreated`,
+/// `WM_POWERBROADCAST`, `WM_WTSSESSION_CHANGE`) which Win32 never delivers to `HWND_MESSAGE`.
+unsafe extern "system" fn broadcast_wnd_proc(
     hwnd: HWND,
     msg: u32,
     wparam: WPARAM,
@@ -1111,21 +1929,142 @@ unsafe extern "system" fn shell_wnd_proc(
         return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     }
 
-    if msg == WM_WIN_ARROW_SWITCH {
-        if let Some(dir) = DesktopSwitchDir::from_wparam(wparam.0) {
-            send_native_desktop_switch(dir);
+    let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut BroadcastWindowState;
+    if !state_ptr.is_null() {
+        let state = unsafe { &mut *state_ptr };
+        let shell_hwnd = state.shell_hwnd;
+
+        if msg == state.taskbar_created_msg && state.taskbar_created_msg != 0 {
+            unsafe {
+                let _ = PostMessageW(Some(shell_hwnd), WM_EXPLORER_RESTARTED, WPARAM(0), LPARAM(0));
+            }
+            return LRESULT(0);
         }
-        return LRESULT(0);
+
+        match msg {
+            WM_POWERBROADCAST => {
+                if wparam.0 == PBT_APMRESUMEAUTOMATIC_CODE || wparam.0 == PBT_APMRESUMESUSPEND_CODE
+                {
+                    unsafe {
+                        let _ = PostMessageW(
+                            Some(shell_hwnd),
+                            WM_SYSTEM_RESUMED,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    }
+                }
+                return LRESULT(1);
+            }
+            WM_WTSSESSION_CHANGE => {
+                match wparam.0 as u32 {
+                    WTS_SESSION_LOCK | WTS_CONSOLE_DISCONNECT | WTS_REMOTE_DISCONNECT => unsafe {
+                        let _ = PostMessageW(
+                            Some(shell_hwnd),
+                            WM_SESSION_LOCKED,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    },
+                    WTS_SESSION_UNLOCK | WTS_CONSOLE_CONNECT | WTS_REMOTE_CONNECT => unsafe {
+                        let _ = PostMessageW(
+                            Some(shell_hwnd),
+                            WM_SESSION_UNLOCKED,
+                            WPARAM(0),
+                            LPARAM(0),
+                        );
+                    },
+                    _ => {}
+                }
+                return LRESULT(0);
+            }
+            WM_DESTROY => {
+                if state.wts_registered {
+                    unsafe {
+                        let _ = WTSUnRegisterSessionNotification(hwnd);
+                    }
+                    state.wts_registered = false;
+                }
+                return LRESULT(0);
+            }
+            WM_NCDESTROY => {
+                unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
+                unsafe {
+                    drop(Box::from_raw(state_ptr));
+                }
+                return LRESULT(0);
+            }
+            _ => {}
+        }
     }
 
-    if msg == WM_SET_WIN_ARROW_PATCH {
-        let req_ptr = lparam.0 as *mut WinArrowPatchRequest;
-        if !req_ptr.is_null() {
-            let req = unsafe { Box::from_raw(req_ptr) };
-            let res = set_win_arrow_patch_hook(req.enabled);
-            let _ = req.reply.send(res);
+    unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+}
+
+fn create_broadcast_window(
+    hinstance: windows::Win32::Foundation::HMODULE,
+    shell_hwnd: HWND,
+    taskbar_created_msg: u32,
+) -> Option<HWND> {
+    let class_name = w!("WinDeckShellBroadcastClass");
+    let wc = WNDCLASSW {
+        lpfnWndProc: Some(broadcast_wnd_proc),
+        hInstance: hinstance.into(),
+        lpszClassName: class_name,
+        ..Default::default()
+    };
+    unsafe { RegisterClassW(&wc) };
+
+    let state_ptr = Box::into_raw(Box::new(BroadcastWindowState {
+        shell_hwnd,
+        taskbar_created_msg,
+        wts_registered: false,
+    }));
+
+    let hwnd = match unsafe {
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            class_name,
+            w!("WinDeckShellBroadcast"),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            None,
+            None,
+            Some(hinstance.into()),
+            Some(state_ptr as *const c_void),
+        )
+    } {
+        Ok(h) => h,
+        Err(_) => {
+            unsafe {
+                drop(Box::from_raw(state_ptr));
+            }
+            return None;
         }
-        return LRESULT(0);
+    };
+
+    if unsafe { WTSRegisterSessionNotification(hwnd, NOTIFY_FOR_THIS_SESSION) }.is_ok() {
+        unsafe { (*state_ptr).wts_registered = true };
+    }
+    Some(hwnd)
+}
+
+unsafe extern "system" fn shell_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_NCCREATE {
+        let cs = lparam.0 as *const windows::Win32::UI::WindowsAndMessaging::CREATESTRUCTW;
+        if !cs.is_null() {
+            let ptr = unsafe { (*cs).lpCreateParams } as isize;
+            unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, ptr) };
+        }
+        return unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) };
     }
 
     let state_ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut ShellHostState;
@@ -1148,19 +2087,66 @@ unsafe extern "system" fn shell_wnd_proc(
 
         if msg == state.taskbar_created_msg && state.taskbar_created_msg != 0 {
             add_tray_icon(hwnd, state.tray_icon, &state.tooltip);
+            state.kbd_worker.refresh_hook(true);
             (state.on_event)(ShellEvent::ExplorerRestarted);
             return LRESULT(0);
         }
 
         match msg {
+            WM_WIN_ARROW_SWITCH => {
+                if let Some(dir) = DesktopSwitchDir::from_wparam(wparam.0)
+                    && !send_native_desktop_switch(dir, &state.hook_sync)
+                {
+                    (state.on_event)(ShellEvent::WinArrowComFallback(dir));
+                }
+                return LRESULT(0);
+            }
+            WM_WIN_ARROW_MASK => {
+                send_menu_mask_key();
+                return LRESULT(0);
+            }
+            WM_SET_WIN_ARROW_PATCH => {
+                let req_ptr = lparam.0 as *mut WinArrowPatchRequest;
+                if !req_ptr.is_null() {
+                    state.kbd_worker.forward_patch_request(req_ptr);
+                }
+                return LRESULT(0);
+            }
+            WM_SYNC_WATCHDOG_TIMER => {
+                sync_watchdog_timer(hwnd, state, wparam.0 != 0);
+                return LRESULT(0);
+            }
+            WM_EXPLORER_RESTARTED => {
+                add_tray_icon(hwnd, state.tray_icon, &state.tooltip);
+                state.kbd_worker.refresh_hook(true);
+                (state.on_event)(ShellEvent::ExplorerRestarted);
+                return LRESULT(0);
+            }
+            WM_SYSTEM_RESUMED | WM_SESSION_UNLOCKED => {
+                state.kbd_worker.refresh_hook(true);
+                return LRESULT(0);
+            }
+            WM_SESSION_LOCKED => {
+                state.kbd_worker.reset_modifiers();
+                return LRESULT(0);
+            }
+            WM_TIMER if wparam.0 == TIMER_HOOK_WATCHDOG => {
+                if state.hook_sync.patch_enabled.load(Ordering::Acquire)
+                    && state.hook_sync.physical_mods.load(Ordering::Acquire) == 0
+                    && user_idle_ms().is_some_and(|idle| idle >= WATCHDOG_MIN_IDLE_MS)
+                {
+                    state.kbd_worker.refresh_hook(false);
+                }
+                return LRESULT(0);
+            }
             WM_HOTKEY if wparam.0 as i32 == HOTKEY_ID => {
                 // Propagate WM_HOTKEY's foreground activation right to GPUI's UI thread.
                 let _ = unsafe { AllowSetForegroundWindow(ASFW_ANY) };
-                let opening = !state.overlay_visible.load(Ordering::Acquire);
+                let opening = !state.hook_sync.overlay.is_visible();
                 let hold_armed = if opening {
-                    arm_hold_hook(hwnd, state.hotkey.primary)
+                    state.kbd_worker.arm_hold(state.hotkey.primary)
                 } else {
-                    disarm_hold_hook();
+                    state.kbd_worker.disarm_hold();
                     false
                 };
                 (state.on_event)(ShellEvent::ToggleOverlay {
@@ -1184,21 +2170,21 @@ unsafe extern "system" fn shell_wnd_proc(
                 return LRESULT(0);
             }
             WM_DISARM_HOLD_HOOK => {
-                disarm_hold_hook();
+                state.kbd_worker.disarm_hold();
                 return LRESULT(0);
             }
             WM_TRAY_ICON => {
                 let mouse_msg = (lparam.0 & 0xFFFF) as u32;
                 if mouse_msg == WM_LBUTTONUP {
                     let _ = unsafe { AllowSetForegroundWindow(ASFW_ANY) };
-                    disarm_hold_hook();
+                    state.kbd_worker.disarm_hold();
                     (state.on_event)(ShellEvent::ToggleOverlay {
                         hotkey_triggered: false,
                         hold_armed: false,
                     });
                 } else if mouse_msg == NIN_BALLOONUSERCLICK {
                     let _ = unsafe { AllowSetForegroundWindow(ASFW_ANY) };
-                    disarm_hold_hook();
+                    state.kbd_worker.disarm_hold();
                     (state.on_event)(ShellEvent::OpenUpdateDialog);
                 }
                 return LRESULT(0);
@@ -1239,7 +2225,7 @@ unsafe extern "system" fn shell_wnd_proc(
                     return LRESULT(0);
                 }
                 let req = unsafe { Box::from_raw(req_ptr) };
-                disarm_hold_hook();
+                state.kbd_worker.disarm_hold();
 
                 if req.hotkey == state.hotkey && state.hotkey_registered {
                     let _ = req.reply.send(Ok(()));
@@ -1295,12 +2281,17 @@ unsafe extern "system" fn shell_wnd_proc(
             }
             WM_ACTIVATE_EXISTING => {
                 let _ = unsafe { AllowSetForegroundWindow(ASFW_ANY) };
-                disarm_hold_hook();
+                state.kbd_worker.disarm_hold();
                 (state.on_event)(ShellEvent::ShowOverlay);
                 return LRESULT(0);
             }
             WM_CLOSE => {
-                teardown_keyboard_hook();
+                sync_watchdog_timer(hwnd, state, false);
+                state.kbd_worker.shutdown();
+                if !state.broadcast_hwnd.is_invalid() {
+                    let _ = unsafe { DestroyWindow(state.broadcast_hwnd) };
+                    state.broadcast_hwnd = HWND::default();
+                }
                 if state.hotkey_registered {
                     let _ = unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_ID) };
                     state.hotkey_registered = false;
@@ -1310,14 +2301,23 @@ unsafe extern "system" fn shell_wnd_proc(
                 return LRESULT(0);
             }
             WM_DESTROY => {
-                teardown_keyboard_hook();
+                sync_watchdog_timer(hwnd, state, false);
+                state.kbd_worker.shutdown();
+                if !state.broadcast_hwnd.is_invalid() {
+                    let _ = unsafe { DestroyWindow(state.broadcast_hwnd) };
+                    state.broadcast_hwnd = HWND::default();
+                }
                 unsafe { windows::Win32::UI::WindowsAndMessaging::PostQuitMessage(0) };
                 return LRESULT(0);
             }
             WM_NCDESTROY => {
-                teardown_keyboard_hook();
                 unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
-                let boxed = unsafe { Box::from_raw(state_ptr) };
+                let mut boxed = unsafe { Box::from_raw(state_ptr) };
+                boxed.kbd_worker.shutdown();
+                if !boxed.broadcast_hwnd.is_invalid() {
+                    let _ = unsafe { DestroyWindow(boxed.broadcast_hwnd) };
+                    boxed.broadcast_hwnd = HWND::default();
+                }
                 if !boxed.tray_icon.is_invalid() {
                     let _ = unsafe { DestroyIcon(boxed.tray_icon) };
                 }
@@ -1331,13 +2331,14 @@ unsafe extern "system" fn shell_wnd_proc(
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
-/// Manages global hotkey + Windows system tray icon on a dedicated zero-CPU message thread.
+/// Manages global hotkey + Windows system tray icon on a dedicated zero-CPU message thread,
+/// paired with a separate high-priority `windeck-kbd-hook` thread for low-level keyboard interception.
 pub struct ShellHost {
     hwnd_raw: isize,
     hotkey_registered: bool,
     hotkey_error: Option<String>,
     win_arrow_patch_error: Option<String>,
-    overlay_visible: Arc<AtomicBool>,
+    overlay: Arc<OverlayFocusState>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
@@ -1352,9 +2353,8 @@ impl ShellHost {
         F: Fn(ShellEvent) + Send + 'static,
     {
         let (ready_tx, ready_rx) = mpsc::channel::<Result<ShellHostStartup>>();
-        let overlay_visible = Arc::new(AtomicBool::new(false));
-        let overlay_visible_for_thread = overlay_visible.clone();
-        let overlay_visible_for_hook = overlay_visible.clone();
+        let overlay = Arc::new(OverlayFocusState::new());
+        let hook_sync = Arc::new(SharedHookSync::new(overlay.clone(), win_arrow_switch_desktop));
 
         let thread = thread::Builder::new()
             .name("windeck-shell-host".to_string())
@@ -1374,19 +2374,8 @@ impl ShellHost {
                     let taskbar_created_msg =
                         unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) };
                     let tooltip = format!("WinDeck — 全局窗口切换器 ({hotkey_label})");
-                    let state = Box::new(ShellHostState {
-                        on_event: Box::new(on_event),
-                        tray_icon,
-                        tooltip: tooltip.clone(),
-                        hotkey,
-                        hotkey_label,
-                        taskbar_created_msg,
-                        hotkey_registered: false,
-                        overlay_visible: overlay_visible_for_thread,
-                    });
-                    let state_ptr = Box::into_raw(state);
 
-                    let hwnd = unsafe {
+                    let hwnd = match unsafe {
                         CreateWindowExW(
                             WINDOW_EX_STYLE(0),
                             class_name,
@@ -1399,17 +2388,48 @@ impl ShellHost {
                             Some(HWND_MESSAGE),
                             None,
                             Some(hinstance.into()),
-                            Some(state_ptr as *const c_void),
+                            None,
                         )
-                    };
-                    let hwnd = match hwnd {
+                    } {
                         Ok(h) => h,
                         Err(e) => {
-                            let boxed = unsafe { Box::from_raw(state_ptr) };
-                            let _ = unsafe { DestroyIcon(boxed.tray_icon) };
+                            let _ = unsafe { DestroyIcon(tray_icon) };
                             return Err(e.into());
                         }
                     };
+
+                    let (kbd_worker, patch_err) = match KbdHookWorker::start(
+                        hwnd,
+                        hook_sync.clone(),
+                        win_arrow_switch_desktop,
+                    ) {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            let _ = unsafe { DestroyWindow(hwnd) };
+                            let _ = unsafe { DestroyIcon(tray_icon) };
+                            return Err(e);
+                        }
+                    };
+
+                    let broadcast_hwnd =
+                        create_broadcast_window(hinstance, hwnd, taskbar_created_msg)
+                            .unwrap_or_default();
+
+                    let state = Box::new(ShellHostState {
+                        on_event: Box::new(on_event),
+                        tray_icon,
+                        tooltip: tooltip.clone(),
+                        hotkey,
+                        hotkey_label,
+                        taskbar_created_msg,
+                        hotkey_registered: false,
+                        broadcast_hwnd,
+                        watchdog_armed: false,
+                        hook_sync: hook_sync.clone(),
+                        kbd_worker,
+                    });
+                    let state_ptr = Box::into_raw(state);
+                    unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize) };
 
                     add_tray_icon(hwnd, tray_icon, &tooltip);
 
@@ -1428,13 +2448,11 @@ impl ShellHost {
                         Err(e) => (false, Some(format!("RegisterHotKey failed: {e}"))),
                     };
 
-                    let patch_err = init_keyboard_hook_context(
-                        hwnd,
-                        overlay_visible_for_hook,
-                        win_arrow_switch_desktop,
-                    )
-                    .err()
-                    .map(|e| format!("{e:#}"));
+                    if win_arrow_switch_desktop && patch_err.is_none() {
+                        unsafe {
+                            sync_watchdog_timer(hwnd, &mut *state_ptr, true);
+                        }
+                    }
 
                     Ok((
                         hwnd,
@@ -1476,7 +2494,7 @@ impl ShellHost {
             hotkey_registered: startup.hotkey_registered,
             hotkey_error: startup.hotkey_error,
             win_arrow_patch_error: startup.win_arrow_patch_error,
-            overlay_visible,
+            overlay,
             thread: Some(thread),
         })
     }
@@ -1493,10 +2511,17 @@ impl ShellHost {
         self.win_arrow_patch_error.as_deref()
     }
 
+    /// Registers WinDeck's two overlay HWNDs so the keyboard patch only treats the overlay
+    /// as blocking when WinDeck itself is actively foreground (keeping `Win + ←/→` working
+    /// when `hide_on_blur = false` leaves the panel open behind another app).
+    pub fn register_overlay_hwnds(&self, gpui_hwnd: HWND, host_hwnd: HWND) {
+        self.overlay.register_hwnds(gpui_hwnd, host_hwnd);
+    }
+
     /// Keeps `ShellHost` aware of overlay visibility and guarantees any temporary
     /// hold-modifier keyboard hook is immediately removed when hidden.
     pub fn set_overlay_visible(&self, visible: bool) {
-        self.overlay_visible.store(visible, Ordering::Release);
+        self.overlay.set_visible(visible);
         if !visible {
             self.disarm_hold_mode();
         }
@@ -1513,7 +2538,7 @@ impl ShellHost {
     }
 
     /// Enables or disables the system `Win + Left/Right -> switch virtual desktop` patch live
-    /// on the shell host thread, installing or uninstalling the unified `WH_KEYBOARD_LL` hook as needed.
+    /// on the dedicated `windeck-kbd-hook` thread, installing or uninstalling `WH_KEYBOARD_LL`.
     pub fn set_win_arrow_patch_enabled(&self, enabled: bool) -> Result<()> {
         if self.hwnd_raw == 0 {
             return Err(anyhow!("ShellHost is not running"));
@@ -1535,7 +2560,7 @@ impl ShellHost {
             }
             return Err(anyhow!("PostMessageW(WM_SET_WIN_ARROW_PATCH) failed: {e}"));
         }
-        rx.recv_timeout(std::time::Duration::from_millis(800))
+        rx.recv_timeout(Duration::from_millis(800))
             .map_err(|_| anyhow!("系统补丁更新超时"))?
     }
 
@@ -1588,7 +2613,7 @@ impl ShellHost {
             }
             return Err(anyhow!("PostMessageW(WM_REBIND_HOTKEY) failed: {e}"));
         }
-        rx.recv_timeout(std::time::Duration::from_millis(800))
+        rx.recv_timeout(Duration::from_millis(800))
             .map_err(|_| anyhow!("热键更新超时"))?
     }
 }
@@ -1634,14 +2659,87 @@ mod tests {
 
         assert!(HotkeySpec::parse("Q").is_err(), "missing modifier should fail");
         assert!(HotkeySpec::parse("Alt+").is_err(), "missing letter should fail");
-        assert!(HotkeySpec::parse("Shift+Q").is_err(), "shift is not a valid primary modifier");
-        assert!(HotkeySpec::parse("Ctrl+Alt+Q").is_err(), "multiple modifiers should fail");
-        assert!(HotkeySpec::parse("Alt+Space").is_err(), "non-letter secondary key should fail");
-        assert!(HotkeySpec::parse("Ctrl+1").is_err(), "digit secondary key should fail");
+        assert!(
+            HotkeySpec::parse("Shift+Q").is_err(),
+            "shift is not a valid primary modifier"
+        );
+        assert!(
+            HotkeySpec::parse("Ctrl+Alt+Q").is_err(),
+            "multiple modifiers should fail"
+        );
+        assert!(
+            HotkeySpec::parse("Alt+Space").is_err(),
+            "non-letter secondary key should fail"
+        );
+        assert!(
+            HotkeySpec::parse("Ctrl+1").is_err(),
+            "digit secondary key should fail"
+        );
     }
 
     #[test]
-    fn win_arrow_patch_handles_exclusive_win_repeats_rollover_and_overlay() {
+    fn physical_modifier_tracker_handles_fast_tap_race_and_stale_reconciliation() {
+        let mut tracker = PhysicalModifierTracker::default();
+
+        // Fast-tap race: Win DOWN arrived in FIFO stream, then Left DOWN arrives while hardware
+        // Win UP has already cleared GetAsyncKeyState (async_bits == 0) before Win UP hits our hook.
+        assert!(tracker.on_non_injected_key(VK_LWIN.0 as u32, true, false));
+        let fast_tap = tracker.snapshot_for_arrow(0, 1_000, false);
+        assert!(
+            fast_tap.is_pure_win_only(),
+            "FIFO tracked Win must survive transient async mismatch so fast Win+Arrow never leaks to Snap"
+        );
+
+        // Normal Win UP clears tracked Win immediately.
+        assert!(tracker.on_non_injected_key(VK_LWIN.0 as u32, false, true));
+        assert!(!tracker.any_held());
+        assert!(!tracker.snapshot_for_arrow(0, 1_005, false).win);
+
+        // Missed Win UP (e.g. UAC / Win+L Secure Desktop): reconciles cleanly after STALE_MOD_RECONCILE_MS.
+        assert!(tracker.on_non_injected_key(VK_LWIN.0 as u32, true, false));
+        assert!(tracker.snapshot_for_arrow(0, 2_000, false).win);
+        assert!(
+            tracker
+                .snapshot_for_arrow(0, 2_000 + STALE_MOD_RECONCILE_MS - 1, false)
+                .win
+        );
+        let after_stale = tracker.snapshot_for_arrow(0, 2_000 + STALE_MOD_RECONCILE_MS, false);
+        assert!(
+            !after_stale.win,
+            "stale Win after missed keyup must clear after reconciliation window"
+        );
+        assert!(!tracker.any_held());
+
+        // Missed Win DOWN (e.g. Win pressed while elevated window had focus): async fallback picks it up.
+        let missed_down = tracker.snapshot_for_arrow(PHYS_MOD_RWIN, 3_000, false);
+        assert!(missed_down.is_pure_win_only());
+    }
+
+    #[test]
+    fn physical_modifier_tracker_ignores_synthetic_lctrl_pollution_during_rapid_switches() {
+        let mut tracker = PhysicalModifierTracker::default();
+        tracker.on_non_injected_key(VK_LWIN.0 as u32, true, false);
+
+        // While our own SendInput(LCtrl+Arrow) is active, GetAsyncKeyState reports VK_LCONTROL down,
+        // but physical Ctrl was NOT pressed -> must stay pure Win so rapid taps never leak to Snap.
+        let rapid = tracker.snapshot_for_arrow(PHYS_MOD_LWIN | PHYS_MOD_LCTRL, 5_000, true);
+        assert!(
+            rapid.is_pure_win_only(),
+            "synthetic LCtrl must not pollute rapid follow-up Win+Arrow taps"
+        );
+
+        // Physical RCtrl is never injected by us, so async RCtrl is still respected immediately.
+        let rctrl = tracker.snapshot_for_arrow(PHYS_MOD_LWIN | PHYS_MOD_RCTRL, 5_010, true);
+        assert!(rctrl.ctrl && !rctrl.is_pure_win_only());
+
+        // Real physical LCtrl keydown (non-injected) overrides masking so native Ctrl+Win+Arrow passes through.
+        tracker.on_non_injected_key(VK_LCONTROL.0 as u32, true, false);
+        let real_ctrl = tracker.snapshot_for_arrow(PHYS_MOD_LWIN | PHYS_MOD_LCTRL, 5_020, true);
+        assert!(real_ctrl.ctrl && !real_ctrl.is_pure_win_only());
+    }
+
+    #[test]
+    fn win_arrow_patch_disables_builtin_snap_in_all_states_including_foreground_overlay() {
         let pure_win = ModifierSnapshot {
             win: true,
             ctrl: false,
@@ -1682,9 +2780,22 @@ mod tests {
 
         state.set_enabled(true);
 
-        // Suppressed when overlay is visible
+        // When overlay IS foreground: built-in Win+Arrow snap is STILL disabled (swallowed + masked),
+        // while bare arrow keys pass through normally for WinDeck card navigation.
         assert_eq!(
             state.handle_key(VK_RIGHT.0 as u32, true, false, true, pure_win),
+            WinArrowDecision::SwallowAndMask
+        );
+        assert_eq!(
+            state.handle_key(VK_RIGHT.0 as u32, true, false, true, pure_win),
+            WinArrowDecision::SwallowOnly
+        );
+        assert_eq!(
+            state.handle_key(VK_RIGHT.0 as u32, false, true, true, none),
+            WinArrowDecision::SwallowOnly
+        );
+        assert_eq!(
+            state.handle_key(VK_RIGHT.0 as u32, true, false, true, none),
             WinArrowDecision::Pass
         );
 
@@ -1747,88 +2858,277 @@ mod tests {
     }
 
     #[test]
-    fn native_desktop_switch_inputs_respect_held_modifiers() {
-        let extract = |inputs: &[INPUT]| -> Vec<(VIRTUAL_KEY, KEYBD_EVENT_FLAGS)> {
+    fn overlay_focus_state_only_suppresses_when_overlay_is_actually_foreground() {
+        let overlay = OverlayFocusState::new();
+        overlay.register_hwnds(HWND(0x1111 as *mut c_void), HWND(0x2222 as *mut c_void));
+
+        assert!(!overlay.is_overlay_foreground_with(0x1111));
+
+        // Regression for hide_on_blur = false: panel visible in background while another app is focused
+        overlay.set_visible(true);
+        assert!(!overlay.is_overlay_foreground_with(0x9999));
+        assert!(overlay.is_overlay_foreground_with(0x1111));
+        assert!(overlay.is_overlay_foreground_with(0x2222));
+
+        overlay.set_visible(false);
+        assert!(!overlay.is_overlay_foreground_with(0x1111));
+    }
+
+    #[test]
+    fn native_desktop_switch_inputs_always_inject_lctrl_and_tag_extra_info() {
+        let extract = |inputs: &[INPUT]| -> Vec<(VIRTUAL_KEY, KEYBD_EVENT_FLAGS, usize)> {
             inputs
                 .iter()
-                .map(|i| unsafe { (i.Anonymous.ki.wVk, i.Anonymous.ki.dwFlags) })
+                .map(|i| unsafe {
+                    (
+                        i.Anonymous.ki.wVk,
+                        i.Anonymous.ki.dwFlags,
+                        i.Anonymous.ki.dwExtraInfo,
+                    )
+                })
                 .collect()
         };
 
-        // Normal case: user physically holds Win -> inject only LCtrl + Arrow, keep Win held
-        let normal = build_native_desktop_switch_inputs(DesktopSwitchDir::Right, true, false);
+        // Normal case: user physically holds Win -> always inject LCtrl + Arrow, keep Win held
+        let normal = build_native_desktop_switch_inputs(DesktopSwitchDir::Right, true);
         assert_eq!(
             extract(&normal),
             vec![
-                (VK_LCONTROL, KEYBD_EVENT_FLAGS(0)),
-                (VK_RIGHT, KEYEVENTF_EXTENDEDKEY),
-                (VK_RIGHT, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP),
-                (VK_LCONTROL, KEYEVENTF_KEYUP),
+                (VK_LCONTROL, KEYBD_EVENT_FLAGS(0), WINDECK_SYNTHETIC_EXTRA_INFO),
+                (VK_RIGHT, KEYEVENTF_EXTENDEDKEY, WINDECK_SYNTHETIC_EXTRA_INFO),
+                (
+                    VK_RIGHT,
+                    KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP,
+                    WINDECK_SYNTHETIC_EXTRA_INFO,
+                ),
+                (VK_LCONTROL, KEYEVENTF_KEYUP, WINDECK_SYNTHETIC_EXTRA_INFO),
             ]
         );
 
         // Ultra-fast release race: user already released Win -> inject complete Ctrl+Win+Left
-        let full = build_native_desktop_switch_inputs(DesktopSwitchDir::Left, false, false);
+        let full = build_native_desktop_switch_inputs(DesktopSwitchDir::Left, false);
         assert_eq!(
             extract(&full),
             vec![
-                (VK_LCONTROL, KEYBD_EVENT_FLAGS(0)),
-                (VK_LWIN, KEYEVENTF_EXTENDEDKEY),
-                (VK_LEFT, KEYEVENTF_EXTENDEDKEY),
-                (VK_LEFT, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP),
-                (VK_LWIN, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP),
-                (VK_LCONTROL, KEYEVENTF_KEYUP),
+                (VK_LCONTROL, KEYBD_EVENT_FLAGS(0), WINDECK_SYNTHETIC_EXTRA_INFO),
+                (VK_LWIN, KEYEVENTF_EXTENDEDKEY, WINDECK_SYNTHETIC_EXTRA_INFO),
+                (VK_LEFT, KEYEVENTF_EXTENDEDKEY, WINDECK_SYNTHETIC_EXTRA_INFO),
+                (
+                    VK_LEFT,
+                    KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP,
+                    WINDECK_SYNTHETIC_EXTRA_INFO,
+                ),
+                (
+                    VK_LWIN,
+                    KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP,
+                    WINDECK_SYNTHETIC_EXTRA_INFO,
+                ),
+                (VK_LCONTROL, KEYEVENTF_KEYUP, WINDECK_SYNTHETIC_EXTRA_INFO),
             ]
         );
 
-        // Defensive: if Ctrl is already held, never emit a synthetic Ctrl KEYUP
-        let ctrl_held = build_native_desktop_switch_inputs(DesktopSwitchDir::Left, true, true);
+        let mask = build_menu_mask_inputs();
         assert_eq!(
-            extract(&ctrl_held),
+            extract(&mask),
             vec![
-                (VK_LEFT, KEYEVENTF_EXTENDEDKEY),
-                (VK_LEFT, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP),
+                (VK_MENU_MASK, KEYBD_EVENT_FLAGS(0), WINDECK_SYNTHETIC_EXTRA_INFO),
+                (VK_MENU_MASK, KEYEVENTF_KEYUP, WINDECK_SYNTHETIC_EXTRA_INFO),
             ]
         );
     }
 
     #[test]
-    fn unified_keyboard_hook_installs_and_unhooks_cleanly_on_win32() {
+    fn unified_keyboard_hook_installs_refreshes_and_unhooks_cleanly_on_win32() {
         let handle = thread::spawn(|| {
-            let overlay_visible = Arc::new(AtomicBool::new(false));
+            let overlay = Arc::new(OverlayFocusState::new());
+            let sync = Arc::new(SharedHookSync::new(overlay, false));
             // Starting disabled keeps zero WH_KEYBOARD_LL hooks installed
-            init_keyboard_hook_context(HWND::default(), overlay_visible, false).unwrap();
+            init_keyboard_hook_context(HWND::default(), HWND::default(), sync.clone(), false)
+                .unwrap();
             KEYBOARD_HOOK.with(|slot| {
                 let s = slot.borrow();
-                assert!(s.hook.is_none(), "hook should stay uninstalled while idle/disabled");
+                assert!(
+                    s.hook.is_none(),
+                    "hook should stay uninstalled while idle/disabled"
+                );
                 assert!(!s.win_arrow_patch.enabled);
             });
 
             // Enabling patch installs exactly one real Win32 WH_KEYBOARD_LL hook
             set_win_arrow_patch_hook(true).unwrap();
+            assert!(sync.patch_enabled.load(Ordering::Acquire));
             let hook_when_enabled = KEYBOARD_HOOK.with(|slot| {
                 let s = slot.borrow();
                 assert!(s.win_arrow_patch.enabled);
-                s.hook.expect("WH_KEYBOARD_LL hook should be installed when enabled")
+                s.hook
+                    .expect("WH_KEYBOARD_LL hook should be installed when enabled")
             });
 
             // Disarming hold mode while patch is enabled must keep the single hook alive
-            disarm_hold_hook();
+            disarm_hold_hook_local();
             KEYBOARD_HOOK.with(|slot| {
                 let s = slot.borrow();
                 assert_eq!(s.hook, Some(hook_when_enabled));
             });
 
-            // Disabling patch immediately unhooks WH_KEYBOARD_LL (back to zero idle hooks)
-            set_win_arrow_patch_hook(false).unwrap();
+            // Force refresh replaces the hook cleanly and resets any stale modifier state
+            KEYBOARD_HOOK.with(|slot| {
+                slot.borrow_mut()
+                    .modifiers
+                    .on_non_injected_key(VK_LWIN.0 as u32, true, false);
+            });
+            refresh_keyboard_hook_local(true);
             KEYBOARD_HOOK.with(|slot| {
                 let s = slot.borrow();
-                assert!(s.hook.is_none(), "hook should be uninstalled once disabled");
+                assert!(s.hook.is_some(), "hook should stay installed after refresh");
+                assert!(s.win_arrow_patch.enabled);
+            });
+
+            // Disabling patch immediately unhooks WH_KEYBOARD_LL (back to zero idle hooks)
+            set_win_arrow_patch_hook(false).unwrap();
+            assert!(!sync.patch_enabled.load(Ordering::Acquire));
+            KEYBOARD_HOOK.with(|slot| {
+                let s = slot.borrow();
+                assert!(
+                    s.hook.is_none(),
+                    "hook should be uninstalled once disabled"
+                );
                 assert!(!s.win_arrow_patch.enabled);
             });
 
-            teardown_keyboard_hook();
+            teardown_keyboard_hook_local();
         });
         handle.join().expect("hook lifecycle test thread panicked");
+    }
+
+    #[test]
+    fn dedicated_kbd_hook_worker_toggles_refreshes_and_shuts_down_cleanly() {
+        let overlay = Arc::new(OverlayFocusState::new());
+        let sync = Arc::new(SharedHookSync::new(overlay, false));
+        let (mut worker, startup_err) =
+            KbdHookWorker::start(HWND::default(), sync.clone(), false).unwrap();
+        assert!(startup_err.is_none());
+        assert!(!sync.patch_enabled.load(Ordering::Acquire));
+
+        let (tx, rx) = mpsc::channel();
+        worker.forward_patch_request(Box::into_raw(Box::new(WinArrowPatchRequest {
+            enabled: true,
+            reply: tx,
+        })));
+        rx.recv_timeout(Duration::from_millis(800))
+            .expect("enable reply")
+            .expect("enable hook succeeded");
+        assert!(sync.patch_enabled.load(Ordering::Acquire));
+
+        worker.refresh_hook(true);
+        worker.reset_modifiers();
+        worker.disarm_hold();
+
+        let (tx2, rx2) = mpsc::channel();
+        worker.forward_patch_request(Box::into_raw(Box::new(WinArrowPatchRequest {
+            enabled: false,
+            reply: tx2,
+        })));
+        rx2.recv_timeout(Duration::from_millis(800))
+            .expect("disable reply")
+            .expect("disable hook succeeded");
+        assert!(!sync.patch_enabled.load(Ordering::Acquire));
+
+        worker.shutdown();
+    }
+
+    #[test]
+    fn broadcast_window_forwards_power_wts_and_explorer_events() {
+        unsafe extern "system" fn sink_wnd_proc(
+            hwnd: HWND,
+            msg: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+
+        let handle = thread::spawn(|| {
+            let hinstance = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+            let sink_class = w!("WinDeckBroadcastTestSinkClass");
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(sink_wnd_proc),
+                hInstance: hinstance.into(),
+                lpszClassName: sink_class,
+                ..Default::default()
+            };
+            unsafe { RegisterClassW(&wc) };
+            let sink_hwnd = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    sink_class,
+                    w!("WinDeckBroadcastTestSink"),
+                    WINDOW_STYLE(0),
+                    0,
+                    0,
+                    0,
+                    0,
+                    Some(HWND_MESSAGE),
+                    None,
+                    Some(hinstance.into()),
+                    None,
+                )
+            }
+            .expect("create sink HWND");
+
+            let fake_taskbar_msg = WM_APP + 123;
+            let broadcast_hwnd = create_broadcast_window(hinstance, sink_hwnd, fake_taskbar_msg)
+                .expect("create broadcast window");
+
+            unsafe {
+                broadcast_wnd_proc(
+                    broadcast_hwnd,
+                    WM_POWERBROADCAST,
+                    WPARAM(PBT_APMRESUMEAUTOMATIC_CODE),
+                    LPARAM(0),
+                );
+                broadcast_wnd_proc(
+                    broadcast_hwnd,
+                    WM_WTSSESSION_CHANGE,
+                    WPARAM(WTS_SESSION_LOCK as usize),
+                    LPARAM(0),
+                );
+                broadcast_wnd_proc(
+                    broadcast_hwnd,
+                    WM_WTSSESSION_CHANGE,
+                    WPARAM(WTS_SESSION_UNLOCK as usize),
+                    LPARAM(0),
+                );
+                broadcast_wnd_proc(broadcast_hwnd, fake_taskbar_msg, WPARAM(0), LPARAM(0));
+            }
+
+            let mut received = Vec::new();
+            let mut msg = MSG::default();
+            for _ in 0..4 {
+                assert!(
+                    unsafe { GetMessageW(&mut msg, Some(sink_hwnd), WM_APP, WM_APP + 200) }
+                        .as_bool(),
+                    "expected forwarded broadcast message"
+                );
+                received.push(msg.message);
+            }
+            assert_eq!(
+                received,
+                vec![
+                    WM_SYSTEM_RESUMED,
+                    WM_SESSION_LOCKED,
+                    WM_SESSION_UNLOCKED,
+                    WM_EXPLORER_RESTARTED,
+                ]
+            );
+
+            unsafe {
+                let _ = DestroyWindow(broadcast_hwnd);
+                let _ = DestroyWindow(sink_hwnd);
+            }
+        });
+        handle
+            .join()
+            .expect("broadcast forwarding test thread panicked");
     }
 }

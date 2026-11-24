@@ -23,8 +23,8 @@ pub use process_metrics::{
 };
 pub use screen_capture::{CapturedBitmap, capture_screen_rect_bgra, capture_window_bgra};
 pub use shell_host::{
-    HoldNavDirection, HotkeySpec, PrimaryModifier, ShellEvent, ShellHost, SingleInstanceGuard,
-    is_autostart_enabled, notify_existing_instance, set_autostart_enabled,
+    DesktopSwitchDir, HoldNavDirection, HotkeySpec, PrimaryModifier, ShellEvent, ShellHost,
+    SingleInstanceGuard, is_autostart_enabled, notify_existing_instance, set_autostart_enabled,
 };
 pub use updater::{
     CURRENT_VERSION, GITHUB_OWNER, GITHUB_RELEASES_PAGE, GITHUB_REPO, ReleaseInfo,

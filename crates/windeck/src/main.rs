@@ -23,9 +23,10 @@ use gpui::{
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use win_platform::{
-    CURRENT_VERSION, ShellEvent, ShellHost, SingleInstanceGuard, ThumbnailHostWindow,
-    UpdateCheckResult, VirtualDesktopClient, check_latest_release, configure_borderless_immersive,
-    current_session_desktop_names, notify_existing_instance, wait_for_pid_and_cleanup_old_exe,
+    CURRENT_VERSION, DesktopSwitchDir, ShellEvent, ShellHost, SingleInstanceGuard,
+    ThumbnailHostWindow, UpdateCheckResult, VirtualDesktopClient, check_latest_release,
+    configure_borderless_immersive, current_session_desktop_names, notify_existing_instance,
+    wait_for_pid_and_cleanup_old_exe,
 };
 use windows::Win32::Foundation::HWND;
 
@@ -256,8 +257,12 @@ fn main() -> Result<()> {
                 configure_borderless_immersive(gpui_hwnd, initial_immersive);
                 let thumb_host = ThumbnailHostWindow::create(initial_immersive)
                     .expect("create bottom ThumbnailHostWindow");
+                if let Some(ref host) = *shell_for_loop {
+                    host.register_overlay_hwnds(gpui_hwnd, thumb_host.hwnd());
+                }
 
                 let shell_for_view = shell_for_loop.clone();
+                let vdm_for_events = vdm_clone.clone();
                 let view = cx.new(|cx| {
                     let v = SwitcherView::new(
                         gpui_hwnd,
@@ -387,6 +392,35 @@ fn main() -> Result<()> {
                                             v.handle_hold_modifier_released(commit, window, cx);
                                         });
                                     });
+                                }
+                                ShellEvent::WinArrowComFallback(dir) => {
+                                    let vdm_fallback = vdm_for_events.clone();
+                                    cx.background_executor()
+                                        .spawn(async move {
+                                            if let Ok(desktops) = vdm_fallback.get_desktops()
+                                                && let Some(cur_idx) =
+                                                    desktops.iter().position(|d| d.is_current)
+                                            {
+                                                let target_idx = match dir {
+                                                    DesktopSwitchDir::Left => {
+                                                        cur_idx.checked_sub(1)
+                                                    }
+                                                    DesktopSwitchDir::Right => {
+                                                        (cur_idx + 1 < desktops.len())
+                                                            .then_some(cur_idx + 1)
+                                                    }
+                                                };
+                                                if let Some(idx) = target_idx
+                                                    && let Err(e) = vdm_fallback
+                                                        .switch_to_desktop(desktops[idx].id)
+                                                {
+                                                    append_log(&format!(
+                                                        "WIN_ARROW_PATCH COM fallback failed: {e:#}"
+                                                    ));
+                                                }
+                                            }
+                                        })
+                                        .detach();
                                 }
                                 ShellEvent::AutostartToggled(enabled) => {
                                     append_log(&format!("AUTOSTART toggled -> enabled={enabled}"));
