@@ -104,6 +104,7 @@ impl SwitcherView {
             return;
         }
         self.disarm_hold_mode();
+        self.clear_all_animations(false);
         self.armed_delete_desktop = None;
         self.recording_hotkey_letter = false;
         self.recording_force_quit_key = false;

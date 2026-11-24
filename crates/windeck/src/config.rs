@@ -101,6 +101,39 @@ impl PreviewFit {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionEffect {
+    Off,
+    Subtle,
+    Smooth,
+    Spring,
+}
+
+impl TransitionEffect {
+    pub fn parse(val: &str) -> Option<Self> {
+        match val.to_ascii_lowercase().replace('-', "_").as_str() {
+            "off" | "none" | "false" | "disabled" => Some(Self::Off),
+            "subtle" | "light" | "fast" | "minimal" => Some(Self::Subtle),
+            "smooth" | "standard" | "default" | "normal" => Some(Self::Smooth),
+            "spring" | "dynamic" | "bouncy" => Some(Self::Spring),
+            _ => None,
+        }
+    }
+
+    pub fn as_config_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Subtle => "subtle",
+            Self::Smooth => "smooth",
+            Self::Spring => "spring",
+        }
+    }
+
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
 /// In-overlay shortcut used for actions like force-quitting the hovered/selected window.
 /// Supports single keys (`Delete`, `Backspace`, `X`, `F4`) or modifier combos (`Ctrl+W`, `Shift+Delete`, `Alt+F4`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -216,6 +249,10 @@ pub struct AppConfig {
     pub columns: ColumnsConfig,
     pub background: BackdropStyle,
     pub blur_opacity: f32,
+    pub transition_effect: TransitionEffect,
+    pub transition_tab: bool,
+    pub transition_selection: bool,
+    pub transition_switch: bool,
     pub monitor: OverlayMonitorPolicy,
     pub immersive: bool,
     pub label_position: LabelPosition,
@@ -235,6 +272,10 @@ impl Default for AppConfig {
             columns: ColumnsConfig::Auto,
             background: BackdropStyle::Blurred,
             blur_opacity: 0.28,
+            transition_effect: TransitionEffect::Smooth,
+            transition_tab: true,
+            transition_selection: true,
+            transition_switch: true,
             monitor: OverlayMonitorPolicy::Cursor,
             immersive: true,
             label_position: LabelPosition::BottomRight,
@@ -281,6 +322,17 @@ background = "blurred"
 
 # 毛玻璃背景暗色叠加浓度 (0.05 ~ 0.85，越小高斯模糊越通透；界面内按 - / = 键可实时微调)
 blur_opacity = 0.28
+
+# 转场特效风格: "off" (关闭) | "subtle" (轻盈) | "smooth" (流畅，默认) | "spring" (灵动)
+transition_effect = "smooth"
+
+# 转场特效分场景开关（仅当 transition_effect != "off" 时生效）:
+#   transition_tab       = 顶部虚拟桌面标签切换过渡（共有卡片滑移 + 交叉淡入淡出）
+#   transition_selection = 键盘 Tab / 方向键焦点框滑移与平滑滚动
+#   transition_switch    = 确认切窗口缩放飞向目标位置与双击切桌面平滑过渡
+transition_tab = true
+transition_selection = true
+transition_switch = true
 
 # 每行卡片列数: "auto" (按固定预览宽度与屏幕自动排满) 或正整数 (如 4)
 columns = "auto"
@@ -409,6 +461,26 @@ impl AppConfig {
                         cfg.blur_opacity = v.clamp(0.05, 0.90);
                     }
                 }
+                "transition_effect" => {
+                    if let Some(effect) = TransitionEffect::parse(val) {
+                        cfg.transition_effect = effect;
+                    }
+                }
+                "transition_tab" => {
+                    if let Ok(b) = val.parse::<bool>() {
+                        cfg.transition_tab = b;
+                    }
+                }
+                "transition_selection" => {
+                    if let Ok(b) = val.parse::<bool>() {
+                        cfg.transition_selection = b;
+                    }
+                }
+                "transition_switch" => {
+                    if let Ok(b) = val.parse::<bool>() {
+                        cfg.transition_switch = b;
+                    }
+                }
                 "monitor" => match val.to_ascii_lowercase().as_str() {
                     "cursor" => cfg.monitor = OverlayMonitorPolicy::Cursor,
                     "primary" => cfg.monitor = OverlayMonitorPolicy::Primary,
@@ -444,6 +516,18 @@ impl AppConfig {
     pub fn parsed_force_quit_key(&self) -> LocalShortcut {
         LocalShortcut::parse(&self.force_quit_key)
             .unwrap_or_else(|| LocalShortcut::parse("Delete").expect("default force_quit_key valid"))
+    }
+
+    pub fn tab_transition_enabled(&self) -> bool {
+        self.transition_effect.is_enabled() && self.transition_tab
+    }
+
+    pub fn selection_transition_enabled(&self) -> bool {
+        self.transition_effect.is_enabled() && self.transition_selection
+    }
+
+    pub fn switch_transition_enabled(&self) -> bool {
+        self.transition_effect.is_enabled() && self.transition_switch
     }
 
     pub fn to_toml(&self) -> String {
@@ -488,6 +572,12 @@ background = "{background}"
 # 毛玻璃背景暗色叠加浓度 (0.05 ~ 0.85，越小高斯模糊越通透；界面内按 - / = 键可实时微调)
 blur_opacity = {blur_opacity:.2}
 
+# 转场特效风格: "off" (关闭) | "subtle" (轻盈) | "smooth" (流畅) | "spring" (灵动)
+transition_effect = "{transition_effect}"
+transition_tab = {transition_tab}
+transition_selection = {transition_selection}
+transition_switch = {transition_switch}
+
 # 每行卡片列数: "auto" 或正整数 (如 4)
 columns = {columns}
 
@@ -512,6 +602,10 @@ auto_update = {auto_update}
             label_position = self.label_position.as_config_str(),
             background = background_str,
             blur_opacity = self.blur_opacity.clamp(0.05, 0.85),
+            transition_effect = self.transition_effect.as_config_str(),
+            transition_tab = self.transition_tab,
+            transition_selection = self.transition_selection,
+            transition_switch = self.transition_switch,
             columns = columns_str,
             monitor = monitor_str,
             cross_desktop_nav = self.cross_desktop_nav,
@@ -554,6 +648,10 @@ mod tests {
             preview_fit = "contain"
             label_position = "center"
             blur_opacity = 0.22
+            transition_effect = "spring"
+            transition_tab = false
+            transition_selection = true
+            transition_switch = false
             columns = 4
             background = "transparent"
             monitor = "primary"
@@ -569,6 +667,13 @@ mod tests {
         assert_eq!(cfg.preview_fit, PreviewFit::Contain);
         assert_eq!(cfg.label_position, LabelPosition::Center);
         assert!((cfg.blur_opacity - 0.22).abs() < 0.001);
+        assert_eq!(cfg.transition_effect, TransitionEffect::Spring);
+        assert!(!cfg.transition_tab);
+        assert!(cfg.transition_selection);
+        assert!(!cfg.transition_switch);
+        assert!(!cfg.tab_transition_enabled());
+        assert!(cfg.selection_transition_enabled());
+        assert!(!cfg.switch_transition_enabled());
         assert_eq!(cfg.columns, ColumnsConfig::Fixed(4));
         assert_eq!(cfg.background, BackdropStyle::Transparent);
         assert_eq!(cfg.monitor, OverlayMonitorPolicy::Primary);
@@ -591,7 +696,17 @@ mod tests {
         assert_eq!(round_tripped.preview_fit, cfg.preview_fit);
         assert_eq!(round_tripped.label_position, cfg.label_position);
         assert!((round_tripped.blur_opacity - cfg.blur_opacity).abs() < 0.005);
+        assert_eq!(round_tripped.transition_effect, cfg.transition_effect);
+        assert_eq!(round_tripped.transition_tab, cfg.transition_tab);
+        assert_eq!(round_tripped.transition_selection, cfg.transition_selection);
+        assert_eq!(round_tripped.transition_switch, cfg.transition_switch);
         assert_eq!(round_tripped.columns, cfg.columns);
+
+        let off_cfg = AppConfig::parse("transition_effect = \"off\"\ntransition_tab = true\n");
+        assert_eq!(off_cfg.transition_effect, TransitionEffect::Off);
+        assert!(!off_cfg.tab_transition_enabled());
+        assert!(!off_cfg.selection_transition_enabled());
+        assert!(!off_cfg.switch_transition_enabled());
         assert_eq!(round_tripped.background, cfg.background);
         assert_eq!(round_tripped.monitor, cfg.monitor);
         assert_eq!(round_tripped.cross_desktop_nav, cfg.cross_desktop_nav);

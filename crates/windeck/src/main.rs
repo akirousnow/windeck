@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod animation;
 mod config;
 mod nav;
 mod settings_panel;
@@ -98,6 +99,21 @@ fn run_cli_update_check(effective_version: &str, verify_etag: bool) -> Result<()
 }
 
 fn main() -> Result<()> {
+    std::panic::set_hook(Box::new(|info| {
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<non-string panic payload>".to_string()
+        };
+        append_log(&format!("PANIC at {loc}: {payload}"));
+    }));
+
     let args: Vec<String> = std::env::args().collect();
     let start_hidden = args.iter().any(|a| a == "--hidden");
     let bench_mode = args.iter().any(|a| a == "--bench");
@@ -343,16 +359,16 @@ fn main() -> Result<()> {
                                     });
                                 }
                                 ShellEvent::HoldNavigate(dir) => {
-                                    let _ = window_handle.update(cx, |_, _, cx| {
+                                    let _ = window_handle.update(cx, |_, window, cx| {
                                         view_for_events.update(cx, |v, cx| {
-                                            v.handle_hold_navigate(dir, cx);
+                                            v.handle_hold_navigate(dir, window, cx);
                                         });
                                     });
                                 }
                                 ShellEvent::HoldModifierReleased { commit } => {
-                                    let _ = window_handle.update(cx, |_, _, cx| {
+                                    let _ = window_handle.update(cx, |_, window, cx| {
                                         view_for_events.update(cx, |v, cx| {
-                                            v.handle_hold_modifier_released(commit, cx);
+                                            v.handle_hold_modifier_released(commit, window, cx);
                                         });
                                     });
                                 }

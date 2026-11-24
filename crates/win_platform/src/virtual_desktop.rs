@@ -811,6 +811,7 @@ impl ComSession {
                 }
             };
 
+            let mut reconnected = false;
             for desktop in &list {
                 if unsafe { desktop.get_id() }.ok() == Some(target_id) {
                     if let Some(ref internal) = self.internal {
@@ -818,6 +819,7 @@ impl ComSession {
                             Ok(()) => return Ok(()),
                             Err(e) if attempt == 0 && is_rpc_disconnect(&e) => {
                                 *self = ComSession::connect();
+                                reconnected = true;
                                 break;
                             }
                             Err(e) => return Err(anyhow!("SwitchDesktop failed: {e}")),
@@ -825,7 +827,7 @@ impl ComSession {
                     }
                 }
             }
-            if attempt == 0 {
+            if !reconnected {
                 return Err(anyhow!("Target desktop {} not found in COM list", target_id));
             }
         }

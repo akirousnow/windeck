@@ -12,8 +12,8 @@ use windows::Win32::System::Threading::{
     PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput,
-    VK_MENU,
+    GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
+    KEYEVENTF_KEYUP, SendInput, VK_MENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, GetForegroundWindow, GetWindowPlacement, GetWindowThreadProcessId,
@@ -43,7 +43,22 @@ pub struct SwitchReport {
     pub elapsed_ms: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ForegroundActivationResult {
+    pub was_minimized: bool,
+    pub had_restore_to_maximized_flag: bool,
+    pub used_alt_input_fallback: bool,
+    pub foreground_hwnd_after: isize,
+    pub foreground_matched: bool,
+    pub is_iconic_after: bool,
+    pub is_zoomed_after: bool,
+}
+
 fn send_synthetic_alt_tap() {
+    // Never inject a synthetic VK_MENU KEYUP while the user is physically holding Alt.
+    if (unsafe { GetAsyncKeyState(VK_MENU.0 as i32) } as u16 & 0x8000) != 0 {
+        return;
+    }
     let inputs = [
         INPUT {
             r#type: INPUT_KEYBOARD,
@@ -69,6 +84,81 @@ fn send_synthetic_alt_tap() {
     unsafe {
         SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
     }
+}
+
+/// Switches to `target_did` and polls until Explorer/DWM marks it current (up to `timeout`).
+/// Intended to run off the UI thread while an exit transition animates on top.
+pub fn switch_desktop_and_wait(
+    vdm: &VirtualDesktopClient,
+    target_did: DesktopId,
+    timeout: Duration,
+) -> Result<bool> {
+    vdm.switch_to_desktop(target_did)?;
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(list) = vdm.get_desktops() {
+            if list.iter().any(|d| d.is_current && d.id == target_did) {
+                return Ok(true);
+            }
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let matched = vdm
+        .get_desktops()
+        .ok()
+        .is_some_and(|list| list.iter().any(|d| d.is_current && d.id == target_did));
+    Ok(matched)
+}
+
+/// Non-blocking foreground activation (<1ms, zero sleep): restores minimized windows preserving
+/// `WPF_RESTORETOMAXIMIZED` and brings `target_raw` to foreground with safe Alt-tap fallback.
+pub fn activate_window_foreground(target_raw: isize) -> Result<ForegroundActivationResult> {
+    let target = HWND(target_raw as *mut c_void);
+    if target_raw == 0 || !unsafe { IsWindow(Some(target)) }.as_bool() {
+        return Err(anyhow!("Target HWND 0x{:X} is no longer valid", target_raw));
+    }
+
+    let mut placement = WINDOWPLACEMENT {
+        length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+    let _ = unsafe { GetWindowPlacement(target, &mut placement) };
+    let was_minimized = unsafe { IsIconic(target) }.as_bool();
+    let had_restore_to_maximized_flag = (placement.flags.0 & WPF_RESTORETOMAXIMIZED.0) != 0;
+
+    if was_minimized {
+        let cmd = if had_restore_to_maximized_flag {
+            SW_SHOWMAXIMIZED
+        } else {
+            SW_RESTORE
+        };
+        unsafe {
+            let _ = ShowWindow(target, cmd);
+        }
+    }
+
+    let mut fg_ok = unsafe { SetForegroundWindow(target) }.as_bool();
+    let mut used_alt_input_fallback = false;
+    if !fg_ok {
+        send_synthetic_alt_tap();
+        used_alt_input_fallback = true;
+        fg_ok = unsafe { SetForegroundWindow(target) }.as_bool();
+    }
+    let _ = fg_ok;
+
+    let fg_after = unsafe { GetForegroundWindow() }.0 as isize;
+    let is_iconic_after = unsafe { IsIconic(target) }.as_bool();
+    let is_zoomed_after = unsafe { IsZoomed(target) }.as_bool();
+
+    Ok(ForegroundActivationResult {
+        was_minimized,
+        had_restore_to_maximized_flag,
+        used_alt_input_fallback,
+        foreground_hwnd_after: fg_after,
+        foreground_matched: fg_after == target_raw,
+        is_iconic_after,
+        is_zoomed_after,
+    })
 }
 
 pub fn switch_to_window(
@@ -101,51 +191,14 @@ pub fn switch_to_window(
     if !lookup.is_pinned {
         if let Some(target_did) = target_desktop_id {
             if current_before != Some(target_did) {
-                vdm.switch_to_desktop(target_did)?;
+                let _ = switch_desktop_and_wait(vdm, target_did, Duration::from_millis(200))?;
                 desktop_switch_issued = true;
-                // Wait briefly for Explorer/DWM to uncloak target desktop windows.
-                let deadline = Instant::now() + Duration::from_millis(200);
-                while Instant::now() < deadline {
-                    if let Ok(list) = vdm.get_desktops() {
-                        if list.iter().any(|d| d.is_current && d.id == target_did) {
-                            break;
-                        }
-                    }
-                    thread::sleep(Duration::from_millis(10));
-                }
             }
         }
     }
 
-    // 3. Inspect placement and restore minimized window preserving maximized state.
-    let mut placement = WINDOWPLACEMENT {
-        length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
-        ..Default::default()
-    };
-    let _ = unsafe { GetWindowPlacement(target, &mut placement) };
-    let was_minimized = unsafe { IsIconic(target) }.as_bool();
-    let had_restore_to_maximized_flag = (placement.flags.0 & WPF_RESTORETOMAXIMIZED.0) != 0;
-
-    if was_minimized {
-        let cmd = if had_restore_to_maximized_flag {
-            SW_SHOWMAXIMIZED
-        } else {
-            SW_RESTORE
-        };
-        unsafe {
-            let _ = ShowWindow(target, cmd);
-        }
-    }
-
-    // 4. Bring window to foreground.
-    let mut fg_ok = unsafe { SetForegroundWindow(target) }.as_bool();
-    let mut used_alt_input_fallback = false;
-    if !fg_ok {
-        send_synthetic_alt_tap();
-        used_alt_input_fallback = true;
-        fg_ok = unsafe { SetForegroundWindow(target) }.as_bool();
-    }
-    let _ = fg_ok;
+    // 3 & 4. Restore minimized window (if needed) and bring window to foreground.
+    let fg_res = activate_window_foreground(target_raw)?;
 
     // Allow a brief window settle tick before asserting post-conditions.
     thread::sleep(Duration::from_millis(30));
@@ -173,9 +226,9 @@ pub fn switch_to_window(
         target_hwnd: target_raw,
         target_desktop_id,
         desktop_switch_issued,
-        was_minimized,
-        had_restore_to_maximized_flag,
-        used_alt_input_fallback,
+        was_minimized: fg_res.was_minimized,
+        had_restore_to_maximized_flag: fg_res.had_restore_to_maximized_flag,
+        used_alt_input_fallback: fg_res.used_alt_input_fallback,
         self_hidden_after,
         active_desktop_after,
         desktop_matched,
@@ -433,5 +486,10 @@ mod tests {
     fn force_quit_rejects_invalid_hwnd_and_self_pid() {
         assert!(force_quit_window(0, 1).is_err());
         assert!(terminate_pid(unsafe { GetCurrentProcessId() }).is_err());
+    }
+
+    #[test]
+    fn activate_window_foreground_rejects_invalid_hwnd() {
+        assert!(activate_window_foreground(0).is_err());
     }
 }

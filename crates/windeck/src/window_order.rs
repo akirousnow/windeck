@@ -230,6 +230,8 @@ mod tests {
             cloaked_flags: 0,
             monitor_index: Some(0),
             rect: RECT::default(),
+            visible_rect: RECT::default(),
+            normal_rect: RECT::default(),
         }
     }
 

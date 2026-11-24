@@ -6,7 +6,7 @@ use anyhow::Result;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Dwm::{
     DWM_CLOAKED_APP, DWM_CLOAKED_INHERITED, DWM_CLOAKED_SHELL, DWMWA_CLOAKED,
-    DwmGetWindowAttribute,
+    DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFOEXW,
@@ -59,6 +59,8 @@ pub struct WindowInfo {
     pub cloaked_flags: u32,
     pub monitor_index: Option<usize>,
     pub rect: RECT,
+    pub visible_rect: RECT,
+    pub normal_rect: RECT,
 }
 
 struct OwnedHandle(HANDLE);
@@ -159,6 +161,23 @@ fn get_cloaked_flags(hwnd: HWND) -> u32 {
         )
     };
     if hr.is_ok() { cloaked } else { 0 }
+}
+
+fn get_extended_frame_bounds(hwnd: HWND) -> Option<RECT> {
+    let mut ext = RECT::default();
+    let hr = unsafe {
+        DwmGetWindowAttribute(
+            hwnd,
+            DWMWA_EXTENDED_FRAME_BOUNDS,
+            &mut ext as *mut RECT as *mut c_void,
+            std::mem::size_of::<RECT>() as u32,
+        )
+    };
+    if hr.is_ok() && ext.right > ext.left && ext.bottom > ext.top {
+        Some(ext)
+    } else {
+        None
+    }
 }
 
 fn query_process_info(pid: u32) -> (String, String, Option<bool>) {
@@ -359,6 +378,22 @@ pub fn enumerate_windows(
         let hmon = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
         let monitor_index = monitors.iter().position(|m| m.handle == hmon.0 as isize);
 
+        let visible_rect = if !is_iconic {
+            get_extended_frame_bounds(hwnd).unwrap_or(rect)
+        } else {
+            rect
+        };
+        let (ws_off_x, ws_off_y) = monitor_index
+            .and_then(|idx| monitors.get(idx))
+            .map(|m| (m.work_area.left - m.bounds.left, m.work_area.top - m.bounds.top))
+            .unwrap_or((0, 0));
+        let normal_rect = RECT {
+            left: placement.rcNormalPosition.left + ws_off_x,
+            top: placement.rcNormalPosition.top + ws_off_y,
+            right: placement.rcNormalPosition.right + ws_off_x,
+            bottom: placement.rcNormalPosition.bottom + ws_off_y,
+        };
+
         // Determine desktop assignment
         let desktop_id = if lookup.is_pinned {
             current_desktop_id.or_else(|| lookup.effective_desktop_id())
@@ -391,6 +426,8 @@ pub fn enumerate_windows(
             cloaked_flags: cloaked,
             monitor_index,
             rect,
+            visible_rect,
+            normal_rect,
         });
     }
 

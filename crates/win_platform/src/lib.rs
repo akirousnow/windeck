@@ -34,5 +34,6 @@ pub use virtual_desktop::{
 pub use window_enum::{MonitorInfo, WindowInfo, enumerate_monitors, enumerate_windows};
 pub use window_icon::{IconBgra, extract_window_icon};
 pub use window_switch::{
-    ForceQuitOutcome, ForceQuitReport, SwitchReport, force_quit_window, switch_to_window,
+    ForceQuitOutcome, ForceQuitReport, ForegroundActivationResult, SwitchReport,
+    activate_window_foreground, force_quit_window, switch_desktop_and_wait, switch_to_window,
 };
