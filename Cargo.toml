@@ -7,7 +7,7 @@ members = [
 
 [workspace.package]
 edition = "2024"
-version = "0.2.5"
+version = "0.2.6"
 
 [profile.release]
 opt-level = 3
