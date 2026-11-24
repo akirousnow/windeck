@@ -5703,6 +5703,8 @@ impl SwitcherView {
                 w.is_pinned = false;
             }
         }
+        self.window_order
+            .move_to_front_of_desktop(hwnd, win.pid, target_did);
         self.window_order.sync(
             &self.all_windows,
             &self.desktops,

@@ -27,7 +27,7 @@ pub fn window_bucket(window: &WindowInfo, desktops: &[VirtualDesktopInfo]) -> Wi
 struct TrackedSlot {
     pid: u32,
     bucket: WindowBucket,
-    seq: u64,
+    seq: i64,
 }
 
 /// Maintains a stable per-bucket display order across Win32 Z-order changes.
@@ -36,11 +36,13 @@ struct TrackedSlot {
 /// so selecting a window moves it to the front on the next open. `StableWindowOrder` remembers
 /// each live window's slot sequence per bucket (pinned / virtual desktop / unassigned) so
 /// existing windows stay in the exact same arrangement across selections, while newly opened
-/// or moved-in windows append cleanly to the end of their destination bucket.
+/// or moved-in windows append cleanly to the end of their destination bucket (or prepend to
+/// slot 0 when moved via keyboard desktop shortcuts).
 #[derive(Debug, Default)]
 pub struct StableWindowOrder {
     slots: HashMap<isize, TrackedSlot>,
-    next_seq: u64,
+    next_seq: i64,
+    prev_seq: i64,
 }
 
 impl StableWindowOrder {
@@ -48,10 +50,32 @@ impl StableWindowOrder {
         Self::default()
     }
 
-    fn alloc_seq(&mut self) -> u64 {
+    fn alloc_seq(&mut self) -> i64 {
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
         seq
+    }
+
+    fn alloc_front_seq(&mut self) -> i64 {
+        self.prev_seq = self.prev_seq.saturating_sub(1);
+        self.prev_seq
+    }
+
+    /// Places `hwnd` at the very first slot (index 0) of `desktop_id` so it immediately leads
+    /// that desktop's grid and stays in front across subsequent `sync` refreshes.
+    pub fn move_to_front_of_desktop(&mut self, hwnd: isize, pid: u32, desktop_id: DesktopId) {
+        let bucket = WindowBucket::Desktop(desktop_id);
+        let existing_pid = self.slots.get(&hwnd).map_or(0, |s| s.pid);
+        let resolved_pid = if pid != 0 { pid } else { existing_pid };
+        let seq = self.alloc_front_seq();
+        self.slots.insert(
+            hwnd,
+            TrackedSlot {
+                pid: resolved_pid,
+                bucket,
+                seq,
+            },
+        );
     }
 
     /// Synchronizes remembered slots with the latest enumerated snapshot (in Win32 Z-order).
@@ -79,7 +103,7 @@ impl StableWindowOrder {
         });
 
         let mut seen_in_pass: HashSet<isize> = HashSet::with_capacity(windows.len());
-        let mut moved: Vec<(u64, isize, u32, WindowBucket)> = Vec::new();
+        let mut moved: Vec<(i64, isize, u32, WindowBucket)> = Vec::new();
         let mut added: Vec<(isize, u32, WindowBucket)> = Vec::new();
 
         for w in windows {
@@ -114,8 +138,8 @@ impl StableWindowOrder {
         }
     }
 
-    pub fn sort_key(&self, hwnd: isize) -> u64 {
-        self.slots.get(&hwnd).map_or(u64::MAX, |s| s.seq)
+    pub fn sort_key(&self, hwnd: isize) -> i64 {
+        self.slots.get(&hwnd).map_or(i64::MAX, |s| s.seq)
     }
 
     pub fn ordered(&self, windows: &[WindowInfo]) -> Vec<WindowInfo> {
@@ -381,6 +405,62 @@ mod tests {
         order.sync(&snap2, &desktops_d2_only, |_, _| true);
         // Existing Desktop 2 windows [30, 40] stay in front; migrated [10, 20] append in their prior order
         assert_eq!(hwnds(&order.ordered(&snap2)), vec![30, 40, 10, 20]);
+    }
+
+    #[test]
+    fn move_to_front_of_desktop_places_window_at_slot_zero_and_persists_across_syncs() {
+        let d1 = desktop_id(1);
+        let d2 = desktop_id(2);
+        let desktops = vec![make_desktop(0, d1, true), make_desktop(1, d2, false)];
+        let mut order = StableWindowOrder::new();
+
+        // Desktop 1: [10, 20], Desktop 2: [30, 40]
+        let snap1 = vec![
+            make_win(10, 100, Some((0, d1)), false),
+            make_win(20, 200, Some((0, d1)), false),
+            make_win(30, 300, Some((1, d2)), false),
+            make_win(40, 400, Some((1, d2)), false),
+        ];
+        order.sync(&snap1, &desktops, |_, _| true);
+
+        // Hotkey move: 10 moves from Desktop 1 -> front of Desktop 2
+        order.move_to_front_of_desktop(10, 100, d2);
+        let snap2 = vec![
+            make_win(20, 200, Some((0, d1)), false),
+            make_win(40, 400, Some((1, d2)), false),
+            make_win(30, 300, Some((1, d2)), false),
+            make_win(10, 100, Some((1, d2)), false),
+        ];
+        order.sync(&snap2, &desktops, |_, _| true);
+        let d2_order = |ord: &StableWindowOrder, snap: &[WindowInfo]| -> Vec<isize> {
+            ord.ordered(snap)
+                .into_iter()
+                .filter(|w| !w.is_pinned && w.desktop_id == Some(d2))
+                .map(|w| w.hwnd)
+                .collect()
+        };
+        assert_eq!(d2_order(&order, &snap2), vec![10, 30, 40]);
+
+        // Subsequent reopen with different Win32 Z-order still keeps 10 at Desktop 2 slot 0
+        let snap3 = vec![
+            make_win(30, 300, Some((1, d2)), false),
+            make_win(20, 200, Some((0, d1)), false),
+            make_win(40, 400, Some((1, d2)), false),
+            make_win(10, 100, Some((1, d2)), false),
+        ];
+        order.sync(&snap3, &desktops, |_, _| true);
+        assert_eq!(d2_order(&order, &snap3), vec![10, 30, 40]);
+
+        // Hotkey move a second window (20) to Desktop 2 -> 20 now takes slot 0 ahead of [10, 30, 40]
+        order.move_to_front_of_desktop(20, 200, d2);
+        let snap4 = vec![
+            make_win(40, 400, Some((1, d2)), false),
+            make_win(30, 300, Some((1, d2)), false),
+            make_win(10, 100, Some((1, d2)), false),
+            make_win(20, 200, Some((1, d2)), false),
+        ];
+        order.sync(&snap4, &desktops, |_, _| true);
+        assert_eq!(d2_order(&order, &snap4), vec![20, 10, 30, 40]);
     }
 
     #[test]
