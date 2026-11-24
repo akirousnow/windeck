@@ -2,7 +2,7 @@ use std::f32::consts::PI;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use gpui::{Bounds, Pixels, RenderImage, point, px, size};
+use gpui::{Bounds, Pixels, RenderImage, SharedString, point, px, size};
 use smallvec::SmallVec;
 use win_platform::{CapturedBitmap, DesktopId};
 
@@ -442,6 +442,9 @@ pub struct GenieTransferAnim {
     pub pill_pulse_space: Option<SpaceId>,
     pub is_virtual_space_transfer: bool,
     pub keep_source_slot_visible: bool,
+    /// When `true`, keeps the bottom "create new desktop" preview zone visibly anchored while
+    /// Stage 1 (`SuckIn`) swallows the dropped card in single-desktop filter mode.
+    pub hold_below_new_desktop_zone: bool,
 }
 
 impl GenieTransferAnim {
@@ -510,6 +513,117 @@ impl GenieTransferAnim {
             out.push(s);
         }
         out
+    }
+}
+
+/// Sampled per-frame visual values for the bottom "drop below to create desktop" portal zone.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BelowNewDesktopZoneSample {
+    /// Clipped outer section height multiplier (`0.0..=1.0`).
+    pub height_factor: f32,
+    /// Horizontal bloom scale (`0.78..=1.0`) giving a subtle funnel-mouth expansion/retraction feel.
+    pub width_scale: f32,
+    /// Vertical bloom scale (`0.90..=1.0`); never animates from `scale(0)`.
+    pub height_scale: f32,
+    /// Vertical slide offset in logical px (`-16.0..=0.0`), emerging down from the top portal seam.
+    pub slide_y: f32,
+    /// Card opacity (`0.0..=1.0`).
+    pub card_opacity: f32,
+    /// Header opacity (`0.0..=1.0`), clarifying briskly as the section opens.
+    pub header_opacity: f32,
+    /// Portal seam glow (`0.0..=1.0`), peaking mid-transition as the slot blooms out or retracts in.
+    pub portal_glow: f32,
+}
+
+/// Bidirectional, interruptible reveal/retract state for the bottom create-desktop drop zone.
+#[derive(Debug, Clone, Default)]
+pub struct BelowNewDesktopZoneAnim {
+    /// Continuous openness `0.0..=1.0` (`0.0` = closed, `1.0` = fully open).
+    pub open_t: f32,
+    pub last_tick: Option<Instant>,
+    /// Frozen desktop title (e.g. `"桌面 3"`) so the header never increments mid-`SuckIn` or
+    /// while retracting after desktop creation.
+    pub label: Option<SharedString>,
+}
+
+impl BelowNewDesktopZoneAnim {
+    const OPEN_DAMP_SPEED: f32 = 18.0;
+    const CLOSE_DAMP_SPEED: f32 = 24.0;
+    const SNAP_EPS: f32 = 0.004;
+
+    pub fn is_visible(&self) -> bool {
+        self.open_t > 0.001
+    }
+
+    pub fn reset_immediate(&mut self) {
+        self.open_t = 0.0;
+        self.last_tick = None;
+        self.label = None;
+    }
+
+    pub fn snap_open_with_label(&mut self, label: SharedString) {
+        self.open_t = 1.0;
+        self.last_tick = None;
+        self.label = Some(label);
+    }
+
+    /// Steps the animation toward `target_open` using frame-rate-independent asymmetric damping
+    /// (brisker exit than enter, seamless mid-flight interruption). Returns `true` if another frame
+    /// is needed.
+    pub fn advance(&mut self, target_open: bool, now: Instant, animate: bool) -> bool {
+        let target = if target_open { 1.0 } else { 0.0 };
+        if !animate {
+            self.open_t = target;
+            self.last_tick = None;
+            if !target_open {
+                self.label = None;
+            }
+            return false;
+        }
+        if (target - self.open_t).abs() < Self::SNAP_EPS {
+            self.open_t = target;
+            self.last_tick = None;
+            if !target_open {
+                self.label = None;
+            }
+            return false;
+        }
+        let dt = self
+            .last_tick
+            .map(|last| now.saturating_duration_since(last).as_secs_f32().clamp(0.0, 0.05))
+            .unwrap_or(1.0 / 60.0);
+        self.last_tick = Some(now);
+        let speed = if target_open {
+            Self::OPEN_DAMP_SPEED
+        } else {
+            Self::CLOSE_DAMP_SPEED
+        };
+        let alpha = 1.0 - (-speed * dt).exp();
+        self.open_t = (self.open_t + (target - self.open_t) * alpha).clamp(0.0, 1.0);
+        if (target - self.open_t).abs() < Self::SNAP_EPS {
+            self.open_t = target;
+            self.last_tick = None;
+            if !target_open {
+                self.label = None;
+            }
+            false
+        } else {
+            true
+        }
+    }
+
+    pub fn sample(&self) -> BelowNewDesktopZoneSample {
+        let t = self.open_t.clamp(0.0, 1.0);
+        let eased = ease_out_cubic(t);
+        BelowNewDesktopZoneSample {
+            height_factor: t,
+            width_scale: lerp_f32(0.78, 1.0, eased),
+            height_scale: lerp_f32(0.90, 1.0, eased),
+            slide_y: lerp_f32(-16.0, 0.0, eased),
+            card_opacity: smoothstep((t / 0.78).clamp(0.0, 1.0)),
+            header_opacity: smoothstep((t / 0.65).clamp(0.0, 1.0)),
+            portal_glow: (4.0 * t * (1.0 - t)).clamp(0.0, 1.0),
+        }
     }
 }
 
@@ -741,5 +855,73 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn below_new_desktop_zone_anim_opens_closes_asymmetrically_and_interrupts_cleanly() {
+        let mut anim = BelowNewDesktopZoneAnim::default();
+        assert!(!anim.is_visible());
+
+        // Start sample: non-zero scale (never scale(0)), zero opacity & portal glow
+        let s0 = anim.sample();
+        assert!(s0.width_scale >= 0.75 && s0.height_scale >= 0.85);
+        assert_eq!(s0.card_opacity, 0.0);
+        assert_eq!(s0.portal_glow, 0.0);
+
+        let mut now = Instant::now();
+        let dt = Duration::from_millis(16);
+
+        // Open for 3 frames -> monotonically rises and stays interruptible mid-flight
+        for _ in 0..3 {
+            now += dt;
+            assert!(anim.advance(true, now, true));
+        }
+        let mid_open = anim.open_t;
+        assert!(mid_open > 0.4 && mid_open < 0.9);
+        let s_mid = anim.sample();
+        assert!(s_mid.portal_glow > 0.35, "portal glow should peak mid-transition");
+
+        // Interrupt mid-flight back to closed: no jump, smoothly decreases from mid_open
+        now += dt;
+        anim.advance(false, now, true);
+        assert!(anim.open_t < mid_open && anim.open_t > 0.0);
+
+        // Compare full open vs full close frame counts: exit must be brisker than enter
+        let mut opener = BelowNewDesktopZoneAnim::default();
+        let mut t_open = Instant::now();
+        let mut open_frames = 0;
+        while opener.advance(true, t_open, true) && open_frames < 100 {
+            t_open += dt;
+            open_frames += 1;
+        }
+        assert_eq!(opener.open_t, 1.0);
+        let s1 = opener.sample();
+        assert_eq!(s1.width_scale, 1.0);
+        assert_eq!(s1.height_scale, 1.0);
+        assert_eq!(s1.slide_y, 0.0);
+        assert_eq!(s1.card_opacity, 1.0);
+        assert_eq!(s1.portal_glow, 0.0);
+
+        let mut closer = opener;
+        closer.label = Some(SharedString::from("桌面 3"));
+        let mut t_close = t_open;
+        let mut close_frames = 0;
+        while closer.advance(false, t_close, true) && close_frames < 100 {
+            t_close += dt;
+            close_frames += 1;
+        }
+        assert_eq!(closer.open_t, 0.0);
+        assert!(closer.label.is_none(), "label clears once fully retracted");
+        assert!(
+            close_frames < open_frames,
+            "exit ({close_frames} frames) should be faster than enter ({open_frames} frames)"
+        );
+
+        // Reduced-motion (`animate = false`) snaps immediately with zero extra frames
+        let mut instant = BelowNewDesktopZoneAnim::default();
+        assert!(!instant.advance(true, now, false));
+        assert_eq!(instant.open_t, 1.0);
+        assert!(!instant.advance(false, now, false));
+        assert_eq!(instant.open_t, 0.0);
     }
 }
