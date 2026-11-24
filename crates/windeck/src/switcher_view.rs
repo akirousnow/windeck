@@ -47,9 +47,9 @@ use crate::desktop_reorder::{
     reorder_vec_indices, resolve_horizontal_target_index, resolve_vertical_target_index,
 };
 use crate::genie::{
-    FunnelMouth, GENIE_CAPTURE_MAX_W, GENIE_STRIP_COUNT, GenieDirection, GeniePhase,
-    GenieTransferAnim, RectF, bitmap_to_full_render_image, bitmap_to_strip_render_image,
-    sample_genie_strips, synthesize_fallback_card_bitmap,
+    BelowNewDesktopZoneAnim, FunnelMouth, GENIE_CAPTURE_MAX_W, GENIE_STRIP_COUNT, GenieDirection,
+    GeniePhase, GenieTransferAnim, RectF, bitmap_to_full_render_image,
+    bitmap_to_strip_render_image, sample_genie_strips, synthesize_fallback_card_bitmap,
 };
 use crate::nav::{NavDirection, navigate};
 use crate::thumb_manager::ThumbnailManager;
@@ -74,6 +74,15 @@ const BELOW_LABEL_H: f32 = 26.0;
 const ROW_GAP: f32 = 22.0;
 const COL_GAP: f32 = 24.0;
 const EMPTY_GROUP_H: f32 = 38.0;
+const GROUP_HIT_PAD_X: f32 = 28.0;
+const GROUP_HIT_PAD_Y: f32 = 12.0;
+/// Matches the exact vertical boundary where a real subsequent desktop group's hit pad begins
+/// (`GROUP_TOP_GAP - GROUP_HIT_PAD_Y = 16.0`), preventing accidental triggers while dragging inside
+/// the last desktop yet opening naturally the moment the pointer crosses below it.
+const BELOW_DESKTOP_TRIGGER_GAP: f32 = GROUP_TOP_GAP - GROUP_HIT_PAD_Y;
+/// Extra scrollable reach below the last desktop during an active drag on a scrollable canvas
+/// so edge auto-scroll reveals a comfortable drop strip below the final desktop.
+const DRAG_BOTTOM_REACH_EXTRA: f32 = 28.0;
 const DRAG_THRESHOLD_PX: f32 = 6.0;
 const DRAG_CARD_SCALE: f32 = 0.78;
 
@@ -81,9 +90,57 @@ const DRAG_CARD_SCALE: f32 = 0.78;
 enum DropTarget {
     TopPill(DesktopId),
     CreateNewDesktop,
+    CreateNewDesktopBelow,
     DesktopGroup(DesktopId),
     VirtualSpacePill(SpaceId),
     CreateNewVirtualSpace,
+}
+
+fn is_below_existing_desktops(cursor_y: f32, last_group_bottom_y: f32) -> bool {
+    cursor_y > last_group_bottom_y + BELOW_DESKTOP_TRIGGER_GAP
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CanvasScrollLayout {
+    base_content_h: f32,
+    optical_top_pad: f32,
+    below_zone_h: f32,
+    extra_bottom_h: f32,
+    total_content_h: f32,
+    max_scroll: f32,
+    groups_bottom_content_y: f32,
+    selected_range: Option<(f32, f32)>,
+}
+
+fn compute_canvas_scroll_layout_pure(
+    base_content_h: f32,
+    view_h: f32,
+    below_zone_h: f32,
+    drag_reach_extra: f32,
+    selected_range: Option<(f32, f32)>,
+) -> CanvasScrollLayout {
+    let base_max_scroll = (base_content_h - view_h).max(0.0);
+    let optical_top_pad = SwitcherView::compute_optical_top_pad(base_max_scroll, base_content_h, view_h);
+    let effective_drag_reach = if base_max_scroll > 1.0 {
+        drag_reach_extra.max(0.0)
+    } else {
+        0.0
+    };
+    let clamped_below_h = below_zone_h.max(0.0);
+    let extra_bottom_h = clamped_below_h.max(effective_drag_reach);
+    let total_content_h = base_content_h + extra_bottom_h;
+    let max_scroll = (optical_top_pad + total_content_h - view_h).max(0.0);
+    let groups_bottom_content_y = (base_content_h - CONTENT_PAD_BOTTOM).max(CONTENT_PAD_TOP);
+    CanvasScrollLayout {
+        base_content_h,
+        optical_top_pad,
+        below_zone_h: clamped_below_h,
+        extra_bottom_h,
+        total_content_h,
+        max_scroll,
+        groups_bottom_content_y,
+        selected_range,
+    }
 }
 
 impl DropTarget {
@@ -688,6 +745,33 @@ fn large_plus_icon() -> gpui::Div {
         )
 }
 
+/// Crisp DPI-sharp geometric plus glyph for the bottom new-desktop preview header and slot.
+fn crisp_plus_icon(size_px: f32, stroke_px: f32, color: gpui::Rgba) -> gpui::Div {
+    div()
+        .relative()
+        .size(px(size_px))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .absolute()
+                .w(px(size_px))
+                .h(px(stroke_px))
+                .rounded_full()
+                .bg(color),
+        )
+        .child(
+            div()
+                .absolute()
+                .w(px(stroke_px))
+                .h(px(size_px))
+                .rounded_full()
+                .bg(color),
+        )
+}
+
 /// Crisp geometric 6-dot drag grip for reorderable desktop section headers.
 fn drag_grip_icon(active: bool) -> gpui::Div {
     let dot_color = if active {
@@ -794,6 +878,7 @@ pub struct SwitcherView {
     pill_settle_anim: Option<PillSettleAnim>,
     drag_scroll_last_tick: Option<Instant>,
     genie_anim: Option<GenieTransferAnim>,
+    below_new_desktop_anim: BelowNewDesktopZoneAnim,
     reflow_anim: Option<ReflowAnim>,
     pending_drop_images: Rc<RefCell<Vec<Arc<RenderImage>>>>,
     last_open_ms: f64,
@@ -1144,6 +1229,7 @@ impl SwitcherView {
             pill_settle_anim: None,
             drag_scroll_last_tick: None,
             genie_anim: None,
+            below_new_desktop_anim: BelowNewDesktopZoneAnim::default(),
             reflow_anim: None,
             pending_drop_images: Rc::new(RefCell::new(Vec::new())),
             last_open_ms: 0.0,
@@ -1203,6 +1289,7 @@ impl SwitcherView {
                 self.queue_drop_image(img);
             }
         }
+        self.below_new_desktop_anim.reset_immediate();
         self.reflow_anim = None;
     }
 
@@ -3236,10 +3323,32 @@ impl SwitcherView {
         }
     }
 
+    fn can_create_desktop_below(&self) -> bool {
+        !self.desktops.is_empty()
+            && !self.groups.is_empty()
+            && matches!(
+                self.view_filter,
+                ViewFilter::All | ViewFilter::NativeDesktop(_)
+            )
+    }
+
+    fn below_new_desktop_full_h(&self, preview_h: f32) -> f32 {
+        GROUP_TOP_GAP + GROUP_HEADER_H + preview_h + self.extra_item_h()
+    }
+
     fn compute_layout_metrics(
         &self,
         cols: usize,
         preview_h: f32,
+    ) -> (f32, Option<(f32, f32)>) {
+        self.compute_layout_metrics_for_flat(cols, preview_h, self.selected_flat)
+    }
+
+    fn compute_layout_metrics_for_flat(
+        &self,
+        cols: usize,
+        preview_h: f32,
+        target_flat: usize,
     ) -> (f32, Option<(f32, f32)>) {
         let cols = cols.max(1);
         let item_h = preview_h + self.extra_item_h();
@@ -3271,7 +3380,7 @@ impl SwitcherView {
                 let end = (start + cols).min(group.cards.len());
                 if start < end {
                     for card in &group.cards[start..end] {
-                        if card.flat_index == self.selected_flat {
+                        if card.flat_index == target_flat {
                             let top = if r == 0 { group_header_top } else { row_top };
                             selected_range = Some((top, row_bottom));
                         }
@@ -3286,6 +3395,57 @@ impl SwitcherView {
 
         y += CONTENT_PAD_BOTTOM;
         (y, selected_range)
+    }
+
+    fn compute_canvas_scroll_layout(
+        &self,
+        cols: usize,
+        preview_h: f32,
+        target_flat: usize,
+    ) -> CanvasScrollLayout {
+        let (base_content_h, selected_range) =
+            self.compute_layout_metrics_for_flat(cols, preview_h, target_flat);
+        let view_h = self.viewport_height_px.get().max(100.0);
+        let below_zone_h = if self.below_new_desktop_anim.is_visible() {
+            self.below_new_desktop_full_h(preview_h) * self.below_new_desktop_anim.open_t
+        } else {
+            0.0
+        };
+        let drag_reach_extra = if self.active_drag.is_some() && self.can_create_desktop_below() {
+            DRAG_BOTTOM_REACH_EXTRA
+        } else {
+            0.0
+        };
+        compute_canvas_scroll_layout_pure(
+            base_content_h,
+            view_h,
+            below_zone_h,
+            drag_reach_extra,
+            selected_range,
+        )
+    }
+
+    /// Computes exact full-size `thumb_pane` window bounds for the bottom create-new-desktop
+    /// preview slot at `scroll_y` (matching slot `(row=0, col=0)` of a real new desktop group).
+    fn resolve_below_new_desktop_slot_bounds(&self, scroll_y: f32) -> Bounds<Pixels> {
+        let (cols, preview_w, preview_h, _, grid_total_w) = self.fixed_grid_geometry();
+        let layout = self.compute_canvas_scroll_layout(cols, preview_h, self.selected_flat);
+        let vw = self.viewport_width_px.get().max(640.0);
+        let grid_left = ((vw - grid_total_w) * 0.5).max(CANVAS_PAD_X);
+        let vp_origin_y = self
+            .viewport_clip
+            .borrow()
+            .map(|b| f32::from(b.origin.y))
+            .unwrap_or(TOP_SPACES_BAR_H);
+        let ring_content_y =
+            layout.optical_top_pad + layout.groups_bottom_content_y + GROUP_TOP_GAP + GROUP_HEADER_H;
+        Bounds {
+            origin: point(
+                px(grid_left + TOTAL_RING_PAD),
+                px(vp_origin_y + ring_content_y - scroll_y + TOTAL_RING_PAD),
+            ),
+            size: size(px(preview_w), px(preview_h)),
+        }
     }
 
     fn compute_optical_top_pad(max_scroll: f32, total_content_h: f32, view_h: f32) -> f32 {
@@ -3420,11 +3580,9 @@ impl SwitcherView {
 
     pub(crate) fn clamp_scroll(&mut self) {
         let (cols, _, preview_h, _, _) = self.fixed_grid_geometry();
-        let (total_h, _) = self.compute_layout_metrics(cols, preview_h);
-        let view_h = self.viewport_height_px.get().max(100.0);
-        let max_scroll = (total_h - view_h).max(0.0);
-        self.scroll_target_y = self.scroll_target_y.clamp(0.0, max_scroll);
-        self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
+        let layout = self.compute_canvas_scroll_layout(cols, preview_h, self.selected_flat);
+        self.scroll_target_y = self.scroll_target_y.clamp(0.0, layout.max_scroll);
+        self.scroll_y = self.scroll_y.clamp(0.0, layout.max_scroll);
     }
 
     fn ensure_selected_visible_instant(&mut self) {
@@ -3434,17 +3592,23 @@ impl SwitcherView {
     }
 
     fn ensure_selected_visible(&mut self) {
-        let (cols, _, preview_h, _, _) = self.fixed_grid_geometry();
-        let (total_h, selected_range) = self.compute_layout_metrics(cols, preview_h);
-        let view_h = self.viewport_height_px.get().max(100.0);
-        let max_scroll = (total_h - view_h).max(0.0);
+        self.ensure_flat_index_visible(self.selected_flat);
+    }
 
-        if let Some((top, bottom)) = selected_range {
+    fn ensure_flat_index_visible(&mut self, flat_idx: usize) {
+        let (cols, _, preview_h, _, _) = self.fixed_grid_geometry();
+        let layout = self.compute_canvas_scroll_layout(cols, preview_h, flat_idx);
+        let view_h = self.viewport_height_px.get().max(100.0);
+        let max_scroll = layout.max_scroll;
+
+        if let Some((top, bottom)) = layout.selected_range {
+            let content_top = layout.optical_top_pad + top;
+            let content_bottom = layout.optical_top_pad + bottom;
             let margin = 14.0;
-            if top - margin < self.scroll_target_y {
-                self.scroll_target_y = (top - margin).max(0.0);
-            } else if bottom + margin > self.scroll_target_y + view_h {
-                self.scroll_target_y = (bottom + margin - view_h).min(max_scroll);
+            if content_top - margin < self.scroll_target_y {
+                self.scroll_target_y = (content_top - margin).max(0.0);
+            } else if content_bottom + margin > self.scroll_target_y + view_h {
+                self.scroll_target_y = (content_bottom + margin - view_h).min(max_scroll);
             }
         }
         self.scroll_target_y = self.scroll_target_y.clamp(0.0, max_scroll);
@@ -5081,9 +5245,28 @@ impl SwitcherView {
                     continue;
                 };
                 if let Some(&b) = groups_b.get(&did) {
-                    if bounds_contains_padded(b, pos, 28.0, 12.0) {
+                    if bounds_contains_padded(b, pos, GROUP_HIT_PAD_X, GROUP_HIT_PAD_Y) {
                         return can_target_desktop(did).then_some(DropTarget::DesktopGroup(did));
                     }
+                }
+            }
+
+            // 6. Empty canvas area below all existing desktops -> reveal bottom new-desktop zone.
+            if self.can_create_desktop_below() {
+                let (cols, _, preview_h, _, _) = self.fixed_grid_geometry();
+                let layout =
+                    self.compute_canvas_scroll_layout(cols, preview_h, self.selected_flat);
+                let vp_origin_y = self
+                    .viewport_clip
+                    .borrow()
+                    .map(|b| f32::from(b.origin.y))
+                    .unwrap_or(TOP_SPACES_BAR_H);
+                let last_group_bottom_win_y = vp_origin_y
+                    + layout.optical_top_pad
+                    + layout.groups_bottom_content_y
+                    - self.scroll_y;
+                if is_below_existing_desktops(f32::from(pos.y), last_group_bottom_win_y) {
+                    return Some(DropTarget::CreateNewDesktopBelow);
                 }
             }
         }
@@ -5584,6 +5767,7 @@ impl SwitcherView {
                 pill_pulse_space: None,
                 is_virtual_space_transfer: false,
                 keep_source_slot_visible: false,
+                hold_below_new_desktop_zone: false,
             });
         } else {
             self.queue_drop_image(drag.full_image);
@@ -5796,17 +5980,17 @@ impl SwitcherView {
             return;
         }
 
-        if let Some(mut drag) = self.active_drag.take() {
+        if let Some((drag_hwnd, src_did, is_pinned, prev_target)) = self
+            .active_drag
+            .as_ref()
+            .map(|d| (d.hwnd, d.source_desktop_id, d.is_pinned, d.target))
+        {
+            let final_target = self
+                .resolve_drop_target(event.position, drag_hwnd, src_did, is_pinned)
+                .or(prev_target);
+            let mut drag = self.active_drag.take().unwrap();
             self.drag_scroll_last_tick = None;
             drag.cursor_pos = event.position;
-            let final_target = self
-                .resolve_drop_target(
-                    event.position,
-                    drag.hwnd,
-                    drag.source_desktop_id,
-                    drag.is_pinned,
-                )
-                .or(drag.target);
             let preview_rect_snapshot = self.preview_box_bounds.borrow_mut().take();
 
             match final_target {
@@ -5955,6 +6139,7 @@ impl SwitcherView {
             pill_pulse_space: Some(space_id),
             is_virtual_space_transfer: true,
             keep_source_slot_visible: true,
+            hold_below_new_desktop_zone: false,
         });
         cx.notify();
     }
@@ -5976,24 +6161,26 @@ impl SwitcherView {
         // 1. Resolve (or create) target virtual desktop.
         let (target_did, created_new) = match target {
             DropTarget::TopPill(did) | DropTarget::DesktopGroup(did) => (did, false),
-            DropTarget::CreateNewDesktop => match self.vdm.create_desktop() {
-                Ok(new_id) => {
-                    if let Ok(fresh_desktops) = self.vdm.get_desktops() {
-                        self.desktops = fresh_desktops;
+            DropTarget::CreateNewDesktop | DropTarget::CreateNewDesktopBelow => {
+                match self.vdm.create_desktop() {
+                    Ok(new_id) => {
+                        if let Ok(fresh_desktops) = self.vdm.get_desktops() {
+                            self.desktops = fresh_desktops;
+                        }
+                        (new_id, true)
                     }
-                    (new_id, true)
+                    Err(e) => {
+                        self.transient_toast = Some((
+                            SharedString::from(format!("新建桌面失败：{e}")),
+                            Instant::now(),
+                        ));
+                        append_log(&format!("DRAG CREATE_DESKTOP ERROR: {e:#}"));
+                        self.active_drag = Some(drag);
+                        self.cancel_active_drag(cx);
+                        return;
+                    }
                 }
-                Err(e) => {
-                    self.transient_toast = Some((
-                        SharedString::from(format!("新建桌面失败：{e}")),
-                        Instant::now(),
-                    ));
-                    append_log(&format!("DRAG CREATE_DESKTOP ERROR: {e:#}"));
-                    self.active_drag = Some(drag);
-                    self.cancel_active_drag(cx);
-                    return;
-                }
-            },
+            }
             DropTarget::VirtualSpacePill(_) | DropTarget::CreateNewVirtualSpace => {
                 self.commit_drop_to_virtual_space(drag, target, window, cx);
                 return;
@@ -6002,6 +6189,11 @@ impl SwitcherView {
 
         // 2. Move the real Windows HWND to the destination virtual desktop via COM.
         if let Err(e) = self.vdm.move_window_to_desktop(drag.hwnd, target_did) {
+            if created_new {
+                self.below_new_desktop_anim.reset_immediate();
+                self.rebuild_visible_groups(false);
+                self.clamp_scroll();
+            }
             self.transient_toast = Some((
                 SharedString::from(format!("移动窗口失败：{e}")),
                 Instant::now(),
@@ -6034,12 +6226,17 @@ impl SwitcherView {
             is_window_alive_with_pid,
         );
 
+        let is_below_create = target == DropTarget::CreateNewDesktopBelow;
+        let target_label = target_desktop_idx
+            .map(|idx| self.desktop_display_name(idx))
+            .unwrap_or_else(|| format!("桌面 {}", self.desktops.len().max(1)));
         let auto_switch_filter = drag.was_current_tab
             && matches!(self.view_filter, ViewFilter::NativeDesktop(fid) if fid != target_did);
 
         let animate = self.config.transition_effect.is_enabled();
 
         if !animate {
+            self.below_new_desktop_anim.reset_immediate();
             if auto_switch_filter {
                 self.view_filter = ViewFilter::NativeDesktop(target_did);
                 self.scroll_y = 0.0;
@@ -6052,10 +6249,24 @@ impl SwitcherView {
                     self.selected_flat = idx;
                     self.ensure_selected_visible();
                 }
-            } else if let Some(prev_hwnd) = prev_selected_hwnd {
-                if let Some(idx) = self.flat_hwnds.iter().position(|&h| h == prev_hwnd) {
+            } else {
+                if let Some(prev_hwnd) = prev_selected_hwnd
+                    && let Some(idx) = self.flat_hwnds.iter().position(|&h| h == prev_hwnd)
+                {
                     self.selected_flat = idx;
                 }
+                if is_below_create
+                    && self.view_filter == ViewFilter::All
+                    && let Some(new_idx) = self.flat_hwnds.iter().position(|&h| h == drag.hwnd)
+                {
+                    self.ensure_flat_index_visible(new_idx);
+                }
+            }
+            if is_below_create && self.view_filter != ViewFilter::All && !auto_switch_filter {
+                self.transient_toast = Some((
+                    SharedString::from(format!("已新建「{target_label}」并移入")),
+                    Instant::now(),
+                ));
             }
             self.queue_drop_image(drag.full_image);
             self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
@@ -6065,18 +6276,38 @@ impl SwitcherView {
             return;
         }
 
+        // In All-desktop view, the newly created desktop group immediately takes over the exact slot
+        // of the bottom preview zone, so clear the transient preview zone before rebuilding groups.
+        // In single-desktop filter mode, keep the bottom preview zone visibly anchored while Stage 1
+        // (`SuckIn`) swallows the card into its portal rim.
+        let hold_below_new_desktop_zone = is_below_create && self.view_filter != ViewFilter::All;
+        if hold_below_new_desktop_zone {
+            self.below_new_desktop_anim
+                .snap_open_with_label(SharedString::from(target_label.clone()));
+        } else {
+            self.below_new_desktop_anim.reset_immediate();
+        }
+
         // Rebuild current view right away (in single-desktop mode, dragged card disappears from
         // source desktop while remaining siblings FLIP-reflow smoothly; auto-switch runs right
-        // after Stage 1 Suck-In finishes so you watch it suck into the pill, then switch & suck out!).
+        // after Stage 1 Suck-In finishes so you watch it suck into the portal, then switch & suck out!).
         self.rebuild_visible_groups(false);
         if drag.was_current_tab && !auto_switch_filter {
             if let Some(idx) = self.flat_hwnds.iter().position(|&h| h == drag.hwnd) {
                 self.selected_flat = idx;
                 self.ensure_selected_visible();
             }
-        } else if let Some(prev_hwnd) = prev_selected_hwnd {
-            if let Some(idx) = self.flat_hwnds.iter().position(|&h| h == prev_hwnd) {
+        } else {
+            if let Some(prev_hwnd) = prev_selected_hwnd
+                && let Some(idx) = self.flat_hwnds.iter().position(|&h| h == prev_hwnd)
+            {
                 self.selected_flat = idx;
+            }
+            if is_below_create
+                && self.view_filter == ViewFilter::All
+                && let Some(new_idx) = self.flat_hwnds.iter().position(|&h| h == drag.hwnd)
+            {
+                self.ensure_flat_index_visible(new_idx);
             }
         }
         self.clamp_scroll();
@@ -6137,12 +6368,20 @@ impl SwitcherView {
                     .unwrap_or(release_rect);
                 FunnelMouth::for_group_preview_box(release_rect, anchor_box)
             }
+            DropTarget::CreateNewDesktopBelow => {
+                // In All-desktop view, `dest_slot_now` is the exact newly created desktop slot.
+                // In single-desktop filter view, recompute the live post-reflow bottom preview slot
+                // so Suck-In meets the visible bottom preview rim even if the source desktop shrank a row.
+                let anchor_box = dest_slot_now
+                    .unwrap_or_else(|| self.resolve_below_new_desktop_slot_bounds(self.scroll_target_y));
+                FunnelMouth::for_group_preview_box(release_rect, RectF::from_bounds(anchor_box))
+            }
             DropTarget::VirtualSpacePill(_) | DropTarget::CreateNewVirtualSpace => unreachable!(),
         };
 
         let dest_visible_in_all_view = if self.view_filter == ViewFilter::All {
-            if drag.was_current_tab {
-                true
+            if drag.was_current_tab || is_below_create {
+                dest_slot_now.is_some()
             } else if let Some(db) = dest_slot_now {
                 self.viewport_clip.borrow().is_none_or(|vp| {
                     let vp_top = f32::from(vp.origin.y) - 40.0;
@@ -6159,6 +6398,12 @@ impl SwitcherView {
         };
 
         let play_suck_out = auto_switch_filter || dest_visible_in_all_view;
+        if is_below_create && !play_suck_out {
+            self.transient_toast = Some((
+                SharedString::from(format!("已新建「{target_label}」并移入")),
+                Instant::now(),
+            ));
+        }
         let suck_in_duration = if !play_suck_out {
             Duration::from_millis(290)
         } else if suck_out_from_pill {
@@ -6203,6 +6448,7 @@ impl SwitcherView {
             pill_pulse_space: None,
             is_virtual_space_transfer: false,
             keep_source_slot_visible: false,
+            hold_below_new_desktop_zone,
         });
         cx.notify();
     }
@@ -6211,6 +6457,9 @@ impl SwitcherView {
         let Some(anim) = self.genie_anim.take() else {
             return;
         };
+        if anim.hold_below_new_desktop_zone {
+            self.below_new_desktop_anim.reset_immediate();
+        }
         if matches!(anim.phase, GeniePhase::SuckIn { .. }) && anim.auto_switch_filter {
             if let Some(target_did) = anim.target_desktop_id {
                 self.view_filter = ViewFilter::NativeDesktop(target_did);
@@ -6579,6 +6828,7 @@ impl SwitcherView {
             pill_pulse_space: None,
             is_virtual_space_transfer: false,
             keep_source_slot_visible: in_virtual_space,
+            hold_below_new_desktop_zone: false,
         });
         cx.notify();
     }
@@ -6600,6 +6850,10 @@ impl SwitcherView {
             GeniePhase::SuckIn { mouth, .. } => {
                 if anim.auto_switch_filter {
                     if let Some(target_did) = anim.target_desktop_id {
+                        if anim.hold_below_new_desktop_zone {
+                            self.below_new_desktop_anim.reset_immediate();
+                            anim.hold_below_new_desktop_zone = false;
+                        }
                         self.view_filter = ViewFilter::NativeDesktop(target_did);
                         self.scroll_y = 0.0;
                         self.scroll_target_y = 0.0;
@@ -6848,14 +7102,47 @@ impl Render for SwitcherView {
         // Advance pixel-level Genie funnel transfer (Suck-In -> optional filter switch -> Suck-Out -> done).
         self.advance_genie_phase(now);
 
+        // Advance bidirectional "suck-out / suck-in" bottom create-desktop drop zone.
+        let is_dragging_below_new_desktop = self
+            .active_drag
+            .as_ref()
+            .is_some_and(|d| d.target == Some(DropTarget::CreateNewDesktopBelow));
+        let below_zone_target_open = is_dragging_below_new_desktop
+            || self.genie_anim.as_ref().is_some_and(|g| {
+                g.hold_below_new_desktop_zone && matches!(g.phase, GeniePhase::SuckIn { .. })
+            });
+        if is_dragging_below_new_desktop {
+            self.below_new_desktop_anim.label = Some(SharedString::from(format!(
+                "桌面 {}",
+                self.desktops.len() + 1
+            )));
+        }
+        let mut below_zone_animating = self.below_new_desktop_anim.advance(
+            below_zone_target_open,
+            now,
+            self.config.transition_effect.is_enabled(),
+        );
+
         let (cols, preview_w, preview_h, tile_outer_w, grid_total_w) = self.fixed_grid_geometry();
         let item_total_h = preview_h + self.extra_item_h();
         let label_pos = self.config.label_position;
         let preview_fit = self.config.preview_fit;
 
-        let (total_content_h, _) = self.compute_layout_metrics(cols, preview_h);
+        let canvas_layout =
+            self.compute_canvas_scroll_layout(cols, preview_h, self.selected_flat);
+        let total_content_h = canvas_layout.total_content_h;
         let view_h = self.viewport_height_px.get().max(100.0);
-        let max_scroll = (total_content_h - view_h).max(0.0);
+        let max_scroll = canvas_layout.max_scroll;
+        let extra_bottom_pad =
+            (canvas_layout.extra_bottom_h - canvas_layout.below_zone_h).max(0.0);
+
+        // When the bottom create-desktop zone expands past the viewport bottom, smoothly bring it into view.
+        if below_zone_target_open && max_scroll > self.scroll_target_y + 0.5 {
+            self.scroll_target_y = max_scroll;
+            if self.config.selection_transition_enabled() {
+                self.scroll_last_tick.get_or_insert(now);
+            }
+        }
 
         // Edge auto-scroll while dragging a window card or desktop group near the top/bottom of a scrollable canvas.
         let mut drag_auto_scrolling = false;
@@ -6902,6 +7189,22 @@ impl Render for SwitcherView {
         }
 
         if drag_auto_scrolling {
+            if let Some((pos, drag_hwnd, src_did, is_pinned)) = self
+                .active_drag
+                .as_ref()
+                .map(|d| (d.cursor_pos, d.hwnd, d.source_desktop_id, d.is_pinned))
+            {
+                let new_target = self.resolve_drop_target(pos, drag_hwnd, src_did, is_pinned);
+                if let Some(ref mut d) = self.active_drag
+                    && d.target != new_target
+                {
+                    d.target = new_target;
+                    self.preview_box_bounds.borrow_mut().take();
+                    if new_target == Some(DropTarget::CreateNewDesktopBelow) {
+                        below_zone_animating = true;
+                    }
+                }
+            }
             if let Some((source, from_index, slots, cursor_pos)) = self
                 .active_desktop_reorder
                 .as_ref()
@@ -6953,6 +7256,22 @@ impl Render for SwitcherView {
         let scroll_y = self.scroll_y;
 
         if scroll_animating {
+            if let Some((pos, drag_hwnd, src_did, is_pinned)) = self
+                .active_drag
+                .as_ref()
+                .map(|d| (d.cursor_pos, d.hwnd, d.source_desktop_id, d.is_pinned))
+            {
+                let new_target = self.resolve_drop_target(pos, drag_hwnd, src_did, is_pinned);
+                if let Some(ref mut d) = self.active_drag
+                    && d.target != new_target
+                {
+                    d.target = new_target;
+                    self.preview_box_bounds.borrow_mut().take();
+                    if new_target == Some(DropTarget::CreateNewDesktopBelow) {
+                        below_zone_animating = true;
+                    }
+                }
+            }
             if let Some((source, from_index, slots, cursor_pos)) = self
                 .active_desktop_reorder
                 .as_ref()
@@ -6967,7 +7286,7 @@ impl Render for SwitcherView {
             }
         }
 
-        let optical_top_pad = Self::compute_optical_top_pad(max_scroll, total_content_h, view_h);
+        let optical_top_pad = canvas_layout.optical_top_pad;
         let vp_origin_y = self
             .viewport_clip
             .borrow()
@@ -7278,6 +7597,7 @@ impl Render for SwitcherView {
             && (self.tab_anim.is_some()
                 || self.selection_anim.is_some()
                 || self.genie_anim.is_some()
+                || below_zone_animating
                 || self.reflow_anim.is_some()
                 || self.pill_settle_anim.is_some()
                 || reorder_pills_animating
@@ -7552,6 +7872,8 @@ impl Render for SwitcherView {
 
         // Subtle hairline divider + minimalist [ + ] create-desktop button
         let is_drag_over_add = active_drag_target == Some(DropTarget::CreateNewDesktop);
+        let is_drag_over_below_add =
+            active_drag_target == Some(DropTarget::CreateNewDesktopBelow);
         let add_bounds_for_pill = add_pill_bounds_rc.clone();
         space_pills.push(
             div()
@@ -7572,11 +7894,17 @@ impl Render for SwitcherView {
                 .justify_center()
                 .bg(if is_drag_over_add {
                     rgba(0x0A84FF7A)
+                } else if is_drag_over_below_add {
+                    rgba(0x0A84FF38)
                 } else {
                     rgba(0xFFFFFF10)
                 })
-                .when(is_drag_over_add, |el| {
-                    el.border_1().border_color(rgba(0x64D2FFEE))
+                .when(is_drag_over_add || is_drag_over_below_add, |el| {
+                    el.border_1().border_color(if is_drag_over_add {
+                        rgba(0x64D2FFEE)
+                    } else {
+                        rgba(0x0A84FF88)
+                    })
                 })
                 .when(!is_any_drag_active, |el| {
                     el.cursor_pointer().hover(|s| s.bg(rgba(0xFFFFFF28)))
@@ -7603,8 +7931,8 @@ impl Render for SwitcherView {
                     div()
                         .text_sm()
                         .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(if is_drag_over_add {
-                            rgb(0xFFFFFF).into()
+                        .text_color(if is_drag_over_add || is_drag_over_below_add {
+                            rgb(0xFFFFFF)
                         } else {
                             rgba(0xFFFFFFE8)
                         })
@@ -8839,6 +9167,199 @@ impl Render for SwitcherView {
             group_elements.push(section);
         }
 
+        // === BOTTOM "DROP BELOW TO CREATE NEW DESKTOP" PORTAL ZONE ===
+        let below_new_desktop_el = self.below_new_desktop_anim.is_visible().then(|| {
+            let sample = self.below_new_desktop_anim.sample();
+            let full_h = self.below_new_desktop_full_h(preview_h);
+            let clipped_h = (full_h * sample.height_factor).max(0.0);
+            let zone_label = self
+                .below_new_desktop_anim
+                .label
+                .clone()
+                .unwrap_or_else(|| SharedString::from(format!("桌面 {}", self.desktops.len() + 1)));
+            let is_holding_suck_in = self.genie_anim.as_ref().is_some_and(|g| {
+                g.hold_below_new_desktop_zone && matches!(g.phase, GeniePhase::SuckIn { .. })
+            });
+
+            let cur_pw = (preview_w * sample.width_scale).max(40.0);
+            let cur_ph = (preview_h * sample.height_scale).max(28.0);
+            let preview_bounds_for_below = preview_box_bounds_rc.clone();
+            let capture_bounds = sample.height_factor >= 0.99;
+
+            let mut preview_pane = div()
+                .relative()
+                .w(px(cur_pw))
+                .h(px(cur_ph))
+                .rounded(px(4.0))
+                .flex()
+                .items_center()
+                .justify_center();
+
+            if !is_holding_suck_in {
+                if let Some(r_img) = active_drag_icon.clone() {
+                    preview_pane = preview_pane.child(
+                        div()
+                            .relative()
+                            .size(px(38.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .opacity(0.55)
+                                    .child(img(r_img).size(px(34.0)).rounded(px(8.0))),
+                            )
+                            .child(
+                                div()
+                                    .absolute()
+                                    .bottom(px(0.0))
+                                    .right(px(0.0))
+                                    .size(px(15.0))
+                                    .rounded_full()
+                                    .bg(rgba(0x0A84FFE0))
+                                    .border_1()
+                                    .border_color(rgba(0x64D2FFEE))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(crisp_plus_icon(7.0, 1.5, rgba(0xFFFFFFFF))),
+                            ),
+                    );
+                } else {
+                    preview_pane =
+                        preview_pane.child(crisp_plus_icon(20.0, 2.0, rgba(0x93C5FDCC)));
+                }
+            }
+
+            if capture_bounds {
+                preview_pane = preview_pane.child(
+                    canvas(
+                        move |bounds, _, _| {
+                            *preview_bounds_for_below.borrow_mut() = Some(bounds);
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .inset_0()
+                    .size_full(),
+                );
+            }
+
+            let mut preview_slot = div()
+                .w(px(tile_outer_w))
+                .flex_shrink_0()
+                .h(px(item_total_h))
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .relative()
+                        .top(px(sample.slide_y))
+                        .opacity(sample.card_opacity * chrome_opacity)
+                        .w(px(cur_pw + TOTAL_RING_PAD * 2.0))
+                        .h(px(cur_ph + TOTAL_RING_PAD * 2.0))
+                        .rounded(px(12.0))
+                        .border(px(OUTER_GLOW_PAD))
+                        .border_color(rgba(0x0A84FF28))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .w(px(cur_pw + (MID_GLOW_PAD + INNER_RING_PAD) * 2.0))
+                                .h(px(cur_ph + (MID_GLOW_PAD + INNER_RING_PAD) * 2.0))
+                                .rounded(px(9.0))
+                                .border(px(MID_GLOW_PAD))
+                                .border_color(rgba(0x0A84FF4D))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .relative()
+                                        .w(px(cur_pw + INNER_RING_PAD * 2.0))
+                                        .h(px(cur_ph + INNER_RING_PAD * 2.0))
+                                        .rounded(px(6.0))
+                                        .border(px(INNER_RING_PAD))
+                                        .border_color(rgba(0x64D2FFCC))
+                                        .bg(rgba(0x0A84FF1C))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(preview_pane),
+                                ),
+                        ),
+                );
+            if label_pos == LabelPosition::Below {
+                preview_slot =
+                    preview_slot.child(div().mt(px(BELOW_LABEL_GAP)).h(px(BELOW_LABEL_H)));
+            }
+
+            let glow_w =
+                (preview_w * 0.28).clamp(52.0, 120.0) * (0.65 + 0.35 * sample.portal_glow);
+            let glow_x = tile_outer_w * 0.5 - (glow_w + 16.0) * 0.5;
+            let glow_y = GROUP_TOP_GAP + GROUP_HEADER_H - 4.0;
+            let halo_a = (sample.portal_glow * 115.0).round().clamp(0.0, 255.0) as u32;
+            let core_a = (sample.portal_glow * 225.0).round().clamp(0.0, 255.0) as u32;
+
+            div()
+                .id("below-new-desktop-zone")
+                .relative()
+                .w_full()
+                .flex_shrink_0()
+                .h(px(clipped_h))
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .mt(px(GROUP_TOP_GAP))
+                        .h(px(GROUP_HEADER_H))
+                        .flex_shrink_0()
+                        .px(px(TOTAL_RING_PAD))
+                        .relative()
+                        .top(px(sample.slide_y * 0.4))
+                        .opacity(sample.header_opacity * chrome_opacity)
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(crisp_plus_icon(9.0, 1.5, rgba(0x64D2FFFF)))
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(rgba(0xFFFFFFDC))
+                                .child(zone_label),
+                        ),
+                )
+                .child(preview_slot)
+                .when(sample.portal_glow > 0.02, |el| {
+                    el.child(
+                        div()
+                            .absolute()
+                            .left(px(glow_x))
+                            .top(px(glow_y))
+                            .w(px(glow_w + 16.0))
+                            .h(px(12.0))
+                            .rounded_full()
+                            .bg(rgba(0x0A84FF00 | halo_a))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .w(px(glow_w))
+                                    .h(px(4.0))
+                                    .rounded_full()
+                                    .bg(rgba(0x64D2FF00 | core_a)),
+                            ),
+                    )
+                })
+        });
+
         let show_scrollbar = max_scroll > 1.0;
         let thumb_ratio = (view_h / total_content_h.max(1.0)).clamp(0.10, 1.0);
         let thumb_h = (view_h * thumb_ratio).max(32.0);
@@ -9216,13 +9737,14 @@ impl Render for SwitcherView {
                             .items_center()
                             .px(px(CANVAS_PAD_X))
                             .pt(px(CONTENT_PAD_TOP))
-                            .pb(px(CONTENT_PAD_BOTTOM))
+                            .pb(px(CONTENT_PAD_BOTTOM + extra_bottom_pad))
                             .child(
                                 div()
                                     .w(px(grid_total_w))
                                     .flex()
                                     .flex_col()
-                                    .children(group_elements),
+                                    .children(group_elements)
+                                    .when_some(below_new_desktop_el, |el, zone| el.child(zone)),
                             ),
                     )
                     // Desktop group drag insertion indicator rail
@@ -10321,6 +10843,76 @@ mod tests {
         assert_eq!(
             resolve_desktop_move_target(MoveDesktopAction::Next, None, true, 3, 2, false),
             ResolvedDesktopMove::MoveToExisting { target_idx: 2 }
+        );
+    }
+
+    #[test]
+    fn below_existing_desktops_trigger_and_canvas_scroll_layout_keep_groups_stable() {
+        // Trigger boundary sits cleanly past the last group's 12px hit pad (at +16px = GROUP_TOP_GAP - GROUP_HIT_PAD_Y)
+        let last_bottom = 520.0;
+        assert!(!is_below_existing_desktops(last_bottom + GROUP_HIT_PAD_Y, last_bottom));
+        assert!(!is_below_existing_desktops(
+            last_bottom + BELOW_DESKTOP_TRIGGER_GAP,
+            last_bottom
+        ));
+        assert!(is_below_existing_desktops(
+            last_bottom + BELOW_DESKTOP_TRIGGER_GAP + 0.5,
+            last_bottom
+        ));
+
+        // Short canvas: expanding bottom zone NEVER changes optical_top_pad (zero jump of existing groups)
+        let view_h = 900.0;
+        let base_h = 620.0;
+        let closed = compute_canvas_scroll_layout_pure(base_h, view_h, 0.0, DRAG_BOTTOM_REACH_EXTRA, None);
+        assert_eq!(closed.max_scroll, 0.0);
+        assert_eq!(closed.extra_bottom_h, 0.0, "non-scrollable canvas must not add drag reach");
+        assert!(closed.optical_top_pad > 70.0);
+
+        let expanded = compute_canvas_scroll_layout_pure(
+            base_h,
+            view_h,
+            300.0,
+            DRAG_BOTTOM_REACH_EXTRA,
+            None,
+        );
+        assert_eq!(
+            expanded.optical_top_pad, closed.optical_top_pad,
+            "optical_top_pad must stay locked while bottom create-desktop zone expands"
+        );
+        assert!(
+            expanded.max_scroll > 0.0,
+            "expanding past viewport bottom opens max_scroll so bottom zone glides into view"
+        );
+        assert!(
+            (expanded.max_scroll - (closed.optical_top_pad + base_h + 300.0 - view_h)).abs() < 1e-3
+        );
+
+        // Tall scrollable canvas: drag_reach_extra gives bottom breathing room without double-counting once zone opens
+        let tall_base_h = 1400.0;
+        let tall_idle = compute_canvas_scroll_layout_pure(tall_base_h, view_h, 0.0, 0.0, None);
+        assert_eq!(tall_idle.optical_top_pad, 0.0);
+        assert_eq!(tall_idle.max_scroll, 500.0);
+
+        let tall_dragging = compute_canvas_scroll_layout_pure(
+            tall_base_h,
+            view_h,
+            0.0,
+            DRAG_BOTTOM_REACH_EXTRA,
+            None,
+        );
+        assert_eq!(tall_dragging.max_scroll, 500.0 + DRAG_BOTTOM_REACH_EXTRA);
+
+        let tall_expanded = compute_canvas_scroll_layout_pure(
+            tall_base_h,
+            view_h,
+            300.0,
+            DRAG_BOTTOM_REACH_EXTRA,
+            None,
+        );
+        assert_eq!(
+            tall_expanded.max_scroll,
+            800.0,
+            "expanded bottom zone replaces drag_reach_extra via max() with zero double-padding"
         );
     }
 }
