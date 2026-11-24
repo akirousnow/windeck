@@ -39,6 +39,12 @@ use crate::animation::{
 use crate::config::{
     AppConfig, LabelPosition, MoveDesktopAction, MoveDesktopModifier, PreviewFit, append_log,
 };
+use crate::desktop_reorder::{
+    ActiveDesktopReorder, CAPSULE_PILL_GAP, DesktopPressAction, DesktopReorderSource,
+    FloatingDesktopBadge, GroupSlotLayout, PILL_SETTLE_DURATION_MS, PendingDesktopReorder,
+    PillSettleAnim, PillSlotSnapshot, ReorderPillKey, compute_insertion_line_content_y,
+    reorder_vec_indices, resolve_horizontal_target_index, resolve_vertical_target_index,
+};
 use crate::genie::{
     FunnelMouth, GENIE_CAPTURE_MAX_W, GENIE_STRIP_COUNT, GenieDirection, GeniePhase,
     GenieTransferAnim, RectF, bitmap_to_full_render_image, bitmap_to_strip_render_image,
@@ -681,6 +687,34 @@ fn large_plus_icon() -> gpui::Div {
         )
 }
 
+/// Crisp geometric 6-dot drag grip for reorderable desktop section headers.
+fn drag_grip_icon(active: bool) -> gpui::Div {
+    let dot_color = if active {
+        rgba(0x64D2FFEE)
+    } else {
+        rgba(0xFFFFFF4D)
+    };
+    let dot = move || div().size(px(2.0)).rounded_full().bg(dot_color);
+    let row = move || {
+        div()
+            .flex()
+            .flex_row()
+            .gap(px(2.5))
+            .child(dot())
+            .child(dot())
+    };
+    div()
+        .flex_shrink_0()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(2.0))
+        .child(row())
+        .child(row())
+        .child(row())
+}
+
 pub struct SwitcherView {
     pub(crate) focus_handle: FocusHandle,
     pub(crate) gpui_hwnd: HWND,
@@ -752,6 +786,9 @@ pub struct SwitcherView {
     exit_anim: Option<ExitTransition>,
     pending_drag: Option<PendingDrag>,
     active_drag: Option<ActiveDrag>,
+    pending_desktop_reorder: Option<PendingDesktopReorder>,
+    active_desktop_reorder: Option<ActiveDesktopReorder>,
+    pill_settle_anim: Option<PillSettleAnim>,
     drag_scroll_last_tick: Option<Instant>,
     genie_anim: Option<GenieTransferAnim>,
     reflow_anim: Option<ReflowAnim>,
@@ -1097,6 +1134,9 @@ impl SwitcherView {
             exit_anim: None,
             pending_drag: None,
             active_drag: None,
+            pending_desktop_reorder: None,
+            active_desktop_reorder: None,
+            pill_settle_anim: None,
             drag_scroll_last_tick: None,
             genie_anim: None,
             reflow_anim: None,
@@ -1145,6 +1185,9 @@ impl SwitcherView {
 
     pub(crate) fn clear_drag_and_genie(&mut self) {
         self.pending_drag = None;
+        self.pending_desktop_reorder = None;
+        self.active_desktop_reorder = None;
+        self.pill_settle_anim = None;
         self.drag_scroll_last_tick = None;
         self.preview_box_bounds.borrow_mut().take();
         if let Some(drag) = self.active_drag.take() {
@@ -1181,6 +1224,7 @@ impl SwitcherView {
             || self.is_downloading_update()
             || self.exit_anim.is_some()
             || self.active_drag.is_some()
+            || self.active_desktop_reorder.is_some()
         {
             return;
         }
@@ -3251,6 +3295,52 @@ impl SwitcherView {
         map
     }
 
+    /// Computes deterministic content-space `(top, bottom)` ranges for every native desktop group
+    /// currently visible in `ViewFilter::All`, sharing exact geometry with `compute_layout_metrics`.
+    fn compute_native_group_layouts(&self) -> Vec<GroupSlotLayout> {
+        if self.view_filter != ViewFilter::All {
+            return Vec::new();
+        }
+        let (cols, _, preview_h, _, _) = self.fixed_grid_geometry();
+        let cols = cols.max(1);
+        let (total_h, _) = self.compute_layout_metrics(cols, preview_h);
+        let view_h = self.viewport_height_px.get().max(100.0);
+        let max_scroll = (total_h - view_h).max(0.0);
+        let optical_top_pad = Self::compute_optical_top_pad(max_scroll, total_h, view_h);
+        let item_h = preview_h + self.extra_item_h();
+        let preview_did = self.preview_desktop_id();
+
+        let mut out = Vec::with_capacity(self.desktops.len());
+        let mut y = CONTENT_PAD_TOP;
+        for (g_idx, group) in self.groups.iter().enumerate() {
+            if g_idx > 0 {
+                y += GROUP_TOP_GAP;
+            }
+            let group_top = optical_top_pad + y;
+            y += GROUP_HEADER_H;
+
+            let has_preview = group.desktop_id.is_some() && group.desktop_id == preview_did;
+            let has_add_tile = group.virtual_space_id.is_some();
+            let total_slots =
+                group.cards.len() + usize::from(has_preview) + usize::from(has_add_tile);
+            if total_slots == 0 {
+                y += EMPTY_GROUP_H;
+            } else {
+                let rows = total_slots.div_ceil(cols);
+                y += (rows as f32) * item_h + (rows.saturating_sub(1) as f32) * ROW_GAP;
+            }
+            let group_bottom = optical_top_pad + y;
+
+            if group.desktop_id.is_some() {
+                out.push(GroupSlotLayout {
+                    content_top: group_top,
+                    content_bottom: group_bottom,
+                });
+            }
+        }
+        out
+    }
+
     pub(crate) fn clamp_scroll(&mut self) {
         let (cols, _, preview_h, _, _) = self.fixed_grid_geometry();
         let (total_h, _) = self.compute_layout_metrics(cols, preview_h);
@@ -4393,6 +4483,10 @@ impl SwitcherView {
 
         if key == "escape" {
             cx.stop_propagation();
+            if self.active_desktop_reorder.is_some() || self.pending_desktop_reorder.is_some() {
+                self.cancel_desktop_reorder(cx);
+                return;
+            }
             if self.active_drag.is_some() || self.pending_drag.is_some() {
                 self.cancel_active_drag(cx);
                 return;
@@ -4403,7 +4497,7 @@ impl SwitcherView {
             self.hide(cx);
             return;
         }
-        if self.active_drag.is_some() {
+        if self.active_drag.is_some() || self.active_desktop_reorder.is_some() {
             return;
         }
         if self.armed_delete.take().is_some() || self.context_menu.take().is_some() {
@@ -4870,6 +4964,407 @@ impl SwitcherView {
         None
     }
 
+    fn snapshot_pill_slots(&self, is_native: bool) -> Vec<PillSlotSnapshot> {
+        if is_native {
+            let bounds_map = self.pill_bounds.borrow();
+            let mut out = Vec::with_capacity(self.desktops.len());
+            for d in &self.desktops {
+                let Some(&b) = bounds_map.get(&d.id) else {
+                    return Vec::new();
+                };
+                out.push(PillSlotSnapshot {
+                    key: ReorderPillKey::Native(d.id),
+                    left: f32::from(b.origin.x),
+                    width: f32::from(b.size.width),
+                });
+            }
+            out
+        } else {
+            let bounds_map = self.vspace_pill_bounds.borrow();
+            let spaces = self.virtual_spaces.spaces();
+            let mut out = Vec::with_capacity(spaces.len());
+            for s in spaces {
+                let Some(&b) = bounds_map.get(&s.id) else {
+                    return Vec::new();
+                };
+                out.push(PillSlotSnapshot {
+                    key: ReorderPillKey::VirtualSpace(s.id),
+                    left: f32::from(b.origin.x),
+                    width: f32::from(b.size.width),
+                });
+            }
+            out
+        }
+    }
+
+    fn build_floating_desktop_badge(
+        &self,
+        source: DesktopReorderSource,
+    ) -> Option<FloatingDesktopBadge> {
+        match source {
+            DesktopReorderSource::NativeTopPill(did)
+            | DesktopReorderSource::NativeContentGroup(did) => {
+                let (d_idx, d_info) = self
+                    .desktops
+                    .iter()
+                    .enumerate()
+                    .find(|(_, d)| d.id == did)?;
+                let label = d_info
+                    .custom_name
+                    .clone()
+                    .unwrap_or_else(|| format!("桌面 {}", d_idx + 1));
+                let mut app_icons = Vec::new();
+                let mut total_windows = 0usize;
+                if source.is_content_group() {
+                    if let Some(group) = self.groups.iter().find(|g| g.desktop_id == Some(did)) {
+                        total_windows = group.cards.len();
+                        for card in &group.cards {
+                            if app_icons.len() >= 5 {
+                                break;
+                            }
+                            if let Some(ref icon) = card.icon {
+                                app_icons.push(icon.clone());
+                            }
+                        }
+                    }
+                }
+                Some(FloatingDesktopBadge {
+                    label: SharedString::from(label),
+                    is_current: d_info.is_current,
+                    live_count: 0,
+                    app_icons,
+                    total_windows,
+                })
+            }
+            DesktopReorderSource::VirtualSpaceTopPill(sid) => {
+                let space = self.virtual_spaces.get(sid)?;
+                let live_count = self.virtual_spaces.live_count(sid, &self.all_windows);
+                Some(FloatingDesktopBadge {
+                    label: SharedString::from(space.name.clone()),
+                    is_current: false,
+                    live_count,
+                    app_icons: Vec::new(),
+                    total_windows: live_count,
+                })
+            }
+        }
+    }
+
+    fn resolve_desktop_reorder_target(
+        &self,
+        source: DesktopReorderSource,
+        from_index: usize,
+        rest_pill_slots: &[PillSlotSnapshot],
+        cursor_pos: Point<Pixels>,
+    ) -> usize {
+        if source.is_top_pill() {
+            return resolve_horizontal_target_index(
+                rest_pill_slots,
+                from_index,
+                f32::from(cursor_pos.x),
+            );
+        }
+        // Content desktop group drag: allow dragging smoothly either vertically across desktop
+        // sections OR up directly onto the top capsule bar for quick long-distance reordering.
+        if f32::from(cursor_pos.y) <= TOP_SPACES_BAR_H + 10.0 && !rest_pill_slots.is_empty() {
+            return resolve_horizontal_target_index(
+                rest_pill_slots,
+                from_index,
+                f32::from(cursor_pos.x),
+            );
+        }
+        let vp_origin_y = self
+            .viewport_clip
+            .borrow()
+            .map(|b| f32::from(b.origin.y))
+            .unwrap_or(TOP_SPACES_BAR_H);
+        let cursor_content_y = f32::from(cursor_pos.y) - vp_origin_y + self.scroll_y;
+        let groups = self.compute_native_group_layouts();
+        if groups.is_empty() {
+            return from_index;
+        }
+        resolve_vertical_target_index(&groups, from_index, cursor_content_y)
+    }
+
+    fn begin_desktop_reorder_press(
+        &mut self,
+        action: DesktopPressAction,
+        press_pos: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.exit_anim.is_some()
+            || self.settings_open
+            || self.update_dialog_open
+            || self.add_picker.is_some()
+            || self.active_drag.is_some()
+            || self.active_desktop_reorder.is_some()
+        {
+            return;
+        }
+        if self.genie_anim.is_some() {
+            self.clear_drag_and_genie();
+        }
+        self.pending_drag = None;
+        self.disarm_hold_mode();
+
+        let source = action.reorder_source();
+        let from_index = match source {
+            DesktopReorderSource::NativeTopPill(did)
+            | DesktopReorderSource::NativeContentGroup(did) => {
+                match self.desktops.iter().position(|d| d.id == did) {
+                    Some(idx) => idx,
+                    None => return,
+                }
+            }
+            DesktopReorderSource::VirtualSpaceTopPill(sid) => {
+                match self.virtual_spaces.index_of(sid) {
+                    Some(idx) => idx,
+                    None => return,
+                }
+            }
+        };
+
+        let popups_open = self.armed_delete.is_some()
+            || self.context_menu.is_some()
+            || self.renaming_space.is_some();
+        let can_drag = !popups_open
+            && match source {
+                DesktopReorderSource::NativeTopPill(_) => self.desktops.len() >= 2,
+                DesktopReorderSource::NativeContentGroup(_) => {
+                    self.view_filter == ViewFilter::All && self.desktops.len() >= 2
+                }
+                DesktopReorderSource::VirtualSpaceTopPill(_) => {
+                    self.virtual_spaces.spaces().len() >= 2
+                }
+            };
+
+        let origin_bounds = match source {
+            DesktopReorderSource::NativeTopPill(did) => {
+                self.pill_bounds.borrow().get(&did).copied()
+            }
+            DesktopReorderSource::VirtualSpaceTopPill(sid) => {
+                self.vspace_pill_bounds.borrow().get(&sid).copied()
+            }
+            DesktopReorderSource::NativeContentGroup(did) => {
+                self.group_bounds.borrow().get(&did).copied()
+            }
+        }
+        .unwrap_or_else(|| Bounds {
+            origin: point(press_pos.x - px(32.0), press_pos.y - px(12.0)),
+            size: size(px(64.0), px(24.0)),
+        });
+
+        let grab_offset = point(
+            press_pos.x - origin_bounds.origin.x,
+            press_pos.y - origin_bounds.origin.y,
+        );
+
+        self.pending_desktop_reorder = Some(PendingDesktopReorder {
+            action,
+            source,
+            from_index,
+            can_drag,
+            press_pos,
+            origin_bounds,
+            grab_offset,
+        });
+        cx.notify();
+    }
+
+    fn cancel_desktop_reorder(&mut self, cx: &mut Context<Self>) {
+        self.pending_desktop_reorder = None;
+        self.drag_scroll_last_tick = None;
+        if let Some(reorder) = self.active_desktop_reorder.take() {
+            if self.config.transition_effect.is_enabled() {
+                let profile = TransitionProfile::from_effect(self.config.transition_effect);
+                self.pill_settle_anim = reorder.build_settle_anim(
+                    false,
+                    Duration::from_millis(PILL_SETTLE_DURATION_MS),
+                    profile.use_spring,
+                );
+            }
+            cx.notify();
+        }
+    }
+
+    fn handle_desktop_press_click(
+        &mut self,
+        action: DesktopPressAction,
+        click_count: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match action {
+            DesktopPressAction::NativePill(did) => {
+                if self.armed_delete == Some(ArmedDelete::NativeDesktop(did)) {
+                    self.remove_desktop_by_id(did, window, cx);
+                } else if self.dismiss_space_popups(true, cx) {
+                    // Clicking any other pill dismisses open popups / armed delete first
+                } else if click_count >= 2 {
+                    self.switch_to_desktop_only(did, window, cx);
+                } else {
+                    self.set_view_filter(ViewFilter::NativeDesktop(did), window, cx);
+                }
+            }
+            DesktopPressAction::VirtualSpacePill(sid) => {
+                if self.armed_delete == Some(ArmedDelete::VirtualSpace(sid)) {
+                    self.remove_virtual_space_by_id(sid, window, cx);
+                } else if self.dismiss_space_popups(true, cx) {
+                    // Dismiss open popup / rename / armed trash first
+                } else if click_count >= 2 {
+                    self.start_renaming_space(sid, window, cx);
+                } else {
+                    self.set_view_filter(ViewFilter::VirtualSpace(sid), window, cx);
+                }
+            }
+            DesktopPressAction::GroupHeader(did) | DesktopPressAction::GroupEmptyBar(did) => {
+                if self.dismiss_space_popups(true, cx) {
+                    return;
+                }
+                self.switch_to_desktop_only(did, window, cx);
+            }
+            DesktopPressAction::GroupBackground(_) => {
+                if self.dismiss_space_popups(true, cx) {
+                    return;
+                }
+                self.hide(cx);
+            }
+        }
+    }
+
+    fn commit_desktop_reorder(
+        &mut self,
+        reorder: ActiveDesktopReorder,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let animate = self.config.transition_effect.is_enabled();
+        let profile = TransitionProfile::from_effect(self.config.transition_effect);
+
+        if reorder.target_index == reorder.from_index {
+            if animate {
+                self.pill_settle_anim = reorder.build_settle_anim(
+                    false,
+                    Duration::from_millis(PILL_SETTLE_DURATION_MS),
+                    profile.use_spring,
+                );
+            }
+            cx.notify();
+            return;
+        }
+
+        match reorder.source {
+            DesktopReorderSource::VirtualSpaceTopPill(sid) => {
+                let changed = self.virtual_spaces.move_space(sid, reorder.target_index);
+                if changed {
+                    self.persist_virtual_spaces();
+                    append_log(&format!(
+                        "REORDER_VSPACE space={} from={} to={}",
+                        sid.0, reorder.from_index, reorder.target_index
+                    ));
+                }
+                if animate {
+                    self.pill_settle_anim = reorder.build_settle_anim(
+                        changed,
+                        Duration::from_millis(PILL_SETTLE_DURATION_MS),
+                        profile.use_spring,
+                    );
+                }
+                cx.notify();
+            }
+            DesktopReorderSource::NativeTopPill(did)
+            | DesktopReorderSource::NativeContentGroup(did) => {
+                // Guard against Explorer transient focus wobble during virtual desktop COM mutation.
+                self.shown_at = Some(Instant::now());
+                let prev_thumb_bounds = self.snapshot_current_thumb_bounds();
+                let prev_selected_hwnd = self.flat_hwnds.get(self.selected_flat).copied();
+
+                if let Err(e) = self.vdm.move_desktop(did, reorder.target_index) {
+                    self.transient_toast = Some((
+                        SharedString::from(format!("调整桌面顺序失败：{e}")),
+                        Instant::now(),
+                    ));
+                    append_log(&format!(
+                        "REORDER_DESKTOP ERROR id={} from={} to={}: {e:#}",
+                        did, reorder.from_index, reorder.target_index
+                    ));
+                    if animate {
+                        self.pill_settle_anim = reorder.build_settle_anim(
+                            false,
+                            Duration::from_millis(PILL_SETTLE_DURATION_MS),
+                            profile.use_spring,
+                        );
+                    }
+                    cx.notify();
+                    return;
+                }
+
+                // Refresh authoritative desktop order from COM; fall back to deterministic local reorder if needed.
+                let refreshed = self.vdm.get_desktops().ok().filter(|list| {
+                    list.len() == self.desktops.len() && list.iter().any(|d| d.id == did)
+                });
+                if let Some(fresh_desktops) = refreshed {
+                    self.desktops = fresh_desktops;
+                } else {
+                    reorder_vec_indices(&mut self.desktops, reorder.from_index, reorder.target_index);
+                    for (idx, d) in self.desktops.iter_mut().enumerate() {
+                        d.index = idx;
+                        d.display_name = d
+                            .custom_name
+                            .clone()
+                            .unwrap_or_else(|| format!("Desktop {}", idx + 1));
+                    }
+                }
+
+                // Re-sync cached desktop_index on every window so grouping & StableWindowOrder follow the moved desktop.
+                for w in &mut self.all_windows {
+                    w.desktop_index = w
+                        .desktop_id
+                        .and_then(|wdid| self.desktops.iter().position(|d| d.id == wdid));
+                }
+                self.window_order.sync(
+                    &self.all_windows,
+                    &self.desktops,
+                    is_window_alive_with_pid,
+                );
+
+                self.tab_anim = None;
+                self.selection_anim = None;
+                self.rebuild_visible_groups(false);
+                if let Some(prev_hwnd) = prev_selected_hwnd {
+                    if let Some(idx) = self.flat_hwnds.iter().position(|&h| h == prev_hwnd) {
+                        self.selected_flat = idx;
+                    }
+                }
+                self.clamp_scroll();
+                self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
+
+                if animate {
+                    self.pill_settle_anim = reorder.build_settle_anim(
+                        true,
+                        Duration::from_millis(PILL_SETTLE_DURATION_MS),
+                        profile.use_spring,
+                    );
+                    if self.view_filter == ViewFilter::All && !prev_thumb_bounds.is_empty() {
+                        self.reflow_anim = Some(ReflowAnim {
+                            started_at: Instant::now(),
+                            duration: Duration::from_millis(220),
+                            use_spring: profile.use_spring,
+                            from_bounds: prev_thumb_bounds,
+                        });
+                    }
+                }
+
+                append_log(&format!(
+                    "REORDER_DESKTOP id={} via={:?} from={} to={}",
+                    did, reorder.source, reorder.from_index, reorder.target_index
+                ));
+                window.refresh();
+                cx.notify();
+            }
+        }
+    }
+
     fn begin_card_press(
         &mut self,
         card_flat_index: usize,
@@ -4885,9 +5380,11 @@ impl SwitcherView {
             || self.settings_open
             || self.update_dialog_open
             || self.add_picker.is_some()
+            || self.active_desktop_reorder.is_some()
         {
             return;
         }
+        self.pending_desktop_reorder = None;
         // Finish any in-flight Genie animation cleanly before starting a new interaction.
         if self.genie_anim.is_some() {
             self.clear_drag_and_genie();
@@ -4983,13 +5480,80 @@ impl SwitcherView {
         }
 
         // If the left button is no longer held while tracking a drag (e.g. OS swallowed mouse-up),
-        // cancel cleanly so the card never gets stuck floating.
+        // cancel cleanly so neither a card nor a desktop tab ever gets stuck floating.
         if event.pressed_button != Some(MouseButton::Left) {
             if self.active_drag.is_some() {
                 self.cancel_active_drag(cx);
             } else {
                 self.pending_drag = None;
             }
+            if self.active_desktop_reorder.is_some() {
+                self.cancel_desktop_reorder(cx);
+            } else {
+                self.pending_desktop_reorder = None;
+            }
+            return;
+        }
+
+        if let Some((source, from_index, slots)) = self
+            .active_desktop_reorder
+            .as_ref()
+            .map(|r| (r.source, r.from_index, r.rest_pill_slots.clone()))
+        {
+            let new_target =
+                self.resolve_desktop_reorder_target(source, from_index, &slots, event.position);
+            if let Some(ref mut reorder) = self.active_desktop_reorder {
+                reorder.cursor_pos = event.position;
+                reorder.target_index = new_target;
+            }
+            cx.notify();
+            return;
+        }
+
+        if let Some(ref pending) = self.pending_desktop_reorder {
+            if !pending.can_drag {
+                return;
+            }
+            let dx = f32::from(event.position.x - pending.press_pos.x);
+            let dy = f32::from(event.position.y - pending.press_pos.y);
+            if dx.hypot(dy) < DRAG_THRESHOLD_PX {
+                return;
+            }
+            let pending = self.pending_desktop_reorder.take().unwrap();
+            let rest_pill_slots = self.snapshot_pill_slots(pending.source.is_native());
+            if pending.source.is_top_pill() && rest_pill_slots.len() < 2 {
+                return;
+            }
+            let Some(badge) = self.build_floating_desktop_badge(pending.source) else {
+                return;
+            };
+            self.clear_space_popups();
+            self.hovered_flat = None;
+            self.tab_anim = None;
+            self.selection_anim = None;
+            self.pill_settle_anim = None;
+
+            let target_index = self.resolve_desktop_reorder_target(
+                pending.source,
+                pending.from_index,
+                &rest_pill_slots,
+                event.position,
+            );
+            let pill_visual_dx = vec![0.0; rest_pill_slots.len()];
+            self.active_desktop_reorder = Some(ActiveDesktopReorder {
+                source: pending.source,
+                from_index: pending.from_index,
+                target_index,
+                origin_bounds: pending.origin_bounds,
+                grab_offset: pending.grab_offset,
+                cursor_pos: event.position,
+                badge,
+                rest_pill_slots,
+                pill_gap: CAPSULE_PILL_GAP,
+                pill_visual_dx,
+                last_anim_tick: None,
+            });
+            cx.notify();
             return;
         }
 
@@ -5065,6 +5629,28 @@ impl SwitcherView {
         if event.button != MouseButton::Left {
             return;
         }
+        if self.pending_desktop_reorder.is_some() || self.active_desktop_reorder.is_some() {
+            cx.stop_propagation();
+            if let Some(pending) = self.pending_desktop_reorder.take() {
+                if self.exit_anim.is_some() {
+                    return;
+                }
+                self.handle_desktop_press_click(pending.action, event.click_count, window, cx);
+                return;
+            }
+            if let Some(mut reorder) = self.active_desktop_reorder.take() {
+                self.drag_scroll_last_tick = None;
+                reorder.cursor_pos = event.position;
+                reorder.target_index = self.resolve_desktop_reorder_target(
+                    reorder.source,
+                    reorder.from_index,
+                    &reorder.rest_pill_slots,
+                    event.position,
+                );
+                self.commit_desktop_reorder(reorder, window, cx);
+                return;
+            }
+        }
         if self.pending_drag.is_none() && self.active_drag.is_none() {
             return;
         }
@@ -5118,6 +5704,9 @@ impl SwitcherView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.active_desktop_reorder.is_some() || self.pending_desktop_reorder.is_some() {
+            self.cancel_desktop_reorder(cx);
+        }
         if self.active_drag.is_some() || self.pending_drag.is_some() {
             self.cancel_active_drag(cx);
         }
@@ -5535,6 +6124,8 @@ impl SwitcherView {
         // smoothly advance the same window across multiple desktops without dropping keypresses.
         self.flush_genie_anim_now();
         self.selection_anim = None;
+        self.pending_desktop_reorder = None;
+        self.pill_settle_anim = None;
 
         let Some(&hwnd) = self.flat_hwnds.get(self.selected_flat) else {
             return;
@@ -6004,6 +6595,18 @@ impl SwitcherView {
                 d.target = new_target;
             }
         }
+        if let Some((source, from_index, slots, cursor_pos)) = self
+            .active_desktop_reorder
+            .as_ref()
+            .filter(|r| r.source.is_content_group())
+            .map(|r| (r.source, r.from_index, r.rest_pill_slots.clone(), r.cursor_pos))
+        {
+            let new_target =
+                self.resolve_desktop_reorder_target(source, from_index, &slots, cursor_pos);
+            if let Some(ref mut reorder) = self.active_desktop_reorder {
+                reorder.target_index = new_target;
+            }
+        }
         cx.notify();
     }
 
@@ -6106,6 +6709,15 @@ impl Render for SwitcherView {
             self.reflow_anim = None;
         }
 
+        // Complete post-drop capsule pill settle once elapsed.
+        if self
+            .pill_settle_anim
+            .as_ref()
+            .is_some_and(|ps| ps.is_finished(now))
+        {
+            self.pill_settle_anim = None;
+        }
+
         // Advance pixel-level Genie funnel transfer (Suck-In -> optional filter switch -> Suck-Out -> done).
         self.advance_genie_phase(now);
 
@@ -6118,9 +6730,17 @@ impl Render for SwitcherView {
         let view_h = self.viewport_height_px.get().max(100.0);
         let max_scroll = (total_content_h - view_h).max(0.0);
 
-        // Edge auto-scroll while dragging near the top or bottom of a scrollable canvas.
+        // Edge auto-scroll while dragging a window card or desktop group near the top/bottom of a scrollable canvas.
         let mut drag_auto_scrolling = false;
-        if let Some(ref drag) = self.active_drag {
+        let edge_scroll_cursor_y = if let Some(ref drag) = self.active_drag {
+            Some(f32::from(drag.cursor_pos.y))
+        } else if let Some(ref reorder) = self.active_desktop_reorder {
+            let cy = f32::from(reorder.cursor_pos.y);
+            (reorder.source.is_content_group() && cy > TOP_SPACES_BAR_H + 10.0).then_some(cy)
+        } else {
+            None
+        };
+        if let Some(cy) = edge_scroll_cursor_y {
             if max_scroll > 1.0 && !self.settings_open && !self.update_dialog_open {
                 let vp_top = self
                     .viewport_clip
@@ -6128,7 +6748,6 @@ impl Render for SwitcherView {
                     .map(|b| f32::from(b.origin.y))
                     .unwrap_or(TOP_SPACES_BAR_H);
                 let vp_bot = vp_top + view_h;
-                let cy = f32::from(drag.cursor_pos.y);
                 let scroll_dir = if cy > vp_bot - 56.0 && self.scroll_target_y < max_scroll - 0.5 {
                     ((cy - (vp_bot - 56.0)) / 56.0).clamp(0.15, 1.0)
                 } else if cy >= vp_top && cy < vp_top + 42.0 && self.scroll_target_y > 0.5 {
@@ -6154,6 +6773,28 @@ impl Render for SwitcherView {
         } else {
             self.drag_scroll_last_tick = None;
         }
+
+        if drag_auto_scrolling {
+            if let Some((source, from_index, slots, cursor_pos)) = self
+                .active_desktop_reorder
+                .as_ref()
+                .filter(|r| r.source.is_content_group())
+                .map(|r| (r.source, r.from_index, r.rest_pill_slots.clone(), r.cursor_pos))
+            {
+                let new_target =
+                    self.resolve_desktop_reorder_target(source, from_index, &slots, cursor_pos);
+                if let Some(ref mut reorder) = self.active_desktop_reorder {
+                    reorder.target_index = new_target;
+                }
+            }
+        }
+
+        // Advance smooth sibling pill shifts during an active desktop / virtual space reorder drag.
+        let reorder_pills_animating = if let Some(ref mut reorder) = self.active_desktop_reorder {
+            reorder.advance_pill_offsets(now, self.config.transition_effect.is_enabled())
+        } else {
+            false
+        };
 
         self.scroll_target_y = self.scroll_target_y.clamp(0.0, max_scroll);
         if self.scroll_y > max_scroll {
@@ -6183,6 +6824,21 @@ impl Render for SwitcherView {
             false
         };
         let scroll_y = self.scroll_y;
+
+        if scroll_animating {
+            if let Some((source, from_index, slots, cursor_pos)) = self
+                .active_desktop_reorder
+                .as_ref()
+                .filter(|r| r.source.is_content_group())
+                .map(|r| (r.source, r.from_index, r.rest_pill_slots.clone(), r.cursor_pos))
+            {
+                let new_target =
+                    self.resolve_desktop_reorder_target(source, from_index, &slots, cursor_pos);
+                if let Some(ref mut reorder) = self.active_desktop_reorder {
+                    reorder.target_index = new_target;
+                }
+            }
+        }
 
         let optical_top_pad = Self::compute_optical_top_pad(max_scroll, total_content_h, view_h);
         let vp_origin_y = self
@@ -6496,12 +7152,24 @@ impl Render for SwitcherView {
                 || self.selection_anim.is_some()
                 || self.genie_anim.is_some()
                 || self.reflow_anim.is_some()
+                || self.pill_settle_anim.is_some()
+                || reorder_pills_animating
                 || drag_auto_scrolling
                 || exit_still_running
                 || scroll_animating);
         if any_anim_active {
             Self::schedule_next_frame(window, cx);
         }
+
+        let active_reorder_source = self.active_desktop_reorder.as_ref().map(|r| r.source);
+        let is_reordering_native = active_reorder_source.is_some_and(DesktopReorderSource::is_native);
+        let is_reordering_vspace =
+            matches!(active_reorder_source, Some(DesktopReorderSource::VirtualSpaceTopPill(_)));
+        let active_reorder_content_did = match active_reorder_source {
+            Some(DesktopReorderSource::NativeContentGroup(did)) => Some(did),
+            _ => None,
+        };
+        let is_any_drag_active = self.active_drag.is_some() || self.active_desktop_reorder.is_some();
 
         // === TOP FLOATING DUAL-CAPSULE SPACES BAR ===
         // Left capsule: Windows native virtual desktops ([ 全部 ] [ 桌面 1 ] ... | [ + ])
@@ -6583,10 +7251,30 @@ impl Render for SwitcherView {
                 .clone()
                 .unwrap_or_else(|| format!("桌面 {}", d_idx + 1));
 
+            let pill_key = ReorderPillKey::Native(did);
+            let pill_dx = if let Some(ref reorder) = self.active_desktop_reorder {
+                if reorder.source.is_native() {
+                    reorder.visual_dx_for_key(pill_key)
+                } else {
+                    0.0
+                }
+            } else if let Some(ref settle) = self.pill_settle_anim {
+                settle.dx_for(pill_key, now)
+            } else {
+                0.0
+            };
+            let is_lifted_pill =
+                active_reorder_source == Some(DesktopReorderSource::NativeTopPill(did));
+            let is_synced_group_pill =
+                active_reorder_source == Some(DesktopReorderSource::NativeContentGroup(did));
+            let applied_pill_dx = if is_lifted_pill { 0.0 } else { pill_dx };
+
             let pill_bounds_for_pill = pill_bounds_rc.clone();
             let pill = div()
                 .id(("space-pill", d_idx))
                 .relative()
+                .when(applied_pill_dx.abs() >= 0.05, |el| el.left(px(applied_pill_dx)))
+                .when(is_lifted_pill, |el| el.opacity(0.0))
                 .h(px(24.0))
                 .min_w(px(58.0))
                 .px(px(14.0))
@@ -6600,13 +7288,28 @@ impl Render for SwitcherView {
                 .child(
                     canvas(
                         move |bounds, _, _| {
-                            pill_bounds_for_pill.borrow_mut().insert(did, bounds);
+                            let rest_bounds = Bounds {
+                                origin: point(bounds.origin.x - px(applied_pill_dx), bounds.origin.y),
+                                size: bounds.size,
+                            };
+                            pill_bounds_for_pill.borrow_mut().insert(did, rest_bounds);
                         },
                         |_, _, _, _| {},
                     )
                     .absolute()
                     .inset_0()
                     .size_full(),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.begin_desktop_reorder_press(
+                            DesktopPressAction::NativePill(did),
+                            event.position,
+                            cx,
+                        );
+                    }),
                 )
                 .on_mouse_down(
                     MouseButton::Right,
@@ -6629,19 +7332,7 @@ impl Render for SwitcherView {
                         }
                         cx.notify();
                     }),
-                )
-                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                    cx.stop_propagation();
-                    if this.armed_delete == Some(ArmedDelete::NativeDesktop(did)) {
-                        this.remove_desktop_by_id(did, window, cx);
-                    } else if this.dismiss_space_popups(true, cx) {
-                        // Clicking any other pill cancels popups / armed trash
-                    } else if event.click_count() >= 2 {
-                        this.switch_to_desktop_only(did, window, cx);
-                    } else {
-                        this.set_view_filter(ViewFilter::NativeDesktop(did), window, cx);
-                    }
-                }));
+                );
 
             let pill = if is_armed_delete {
                 pill.bg(rgba(0xFF453AD8))
@@ -6650,7 +7341,7 @@ impl Render for SwitcherView {
                     .hover(|s| s.bg(rgba(0xFF453AF5)).border_color(rgba(0xFFFFFF66)))
                     .child(trash_icon())
             } else {
-                let bg_color = if is_drag_over_pill {
+                let bg_color = if is_drag_over_pill || is_synced_group_pill {
                     rgba(0x0A84FF6E)
                 } else if pill_pulse > 0.02 {
                     let a = ((0x2E as f32) + pill_pulse * 92.0).round().clamp(0.0, 255.0) as u32;
@@ -6664,19 +7355,25 @@ impl Render for SwitcherView {
                 };
                 let pill = pill
                     .bg(bg_color)
-                    .when(is_drag_over_pill || pill_pulse > 0.02 || is_drag_over_group, |el| {
-                        let border_col = if is_drag_over_pill {
-                            rgba(0x64D2FFEE)
-                        } else if pill_pulse > 0.02 {
-                            let a = (pill_pulse * 235.0).round().clamp(30.0, 255.0) as u32;
-                            rgba(0x64D2FF00 | a)
-                        } else {
-                            rgba(0x0A84FF88)
-                        };
-                        el.border_1().border_color(border_col)
-                    })
+                    .when(
+                        is_drag_over_pill
+                            || is_synced_group_pill
+                            || pill_pulse > 0.02
+                            || is_drag_over_group,
+                        |el| {
+                            let border_col = if is_drag_over_pill || is_synced_group_pill {
+                                rgba(0x64D2FFEE)
+                            } else if pill_pulse > 0.02 {
+                                let a = (pill_pulse * 235.0).round().clamp(30.0, 255.0) as u32;
+                                rgba(0x64D2FF00 | a)
+                            } else {
+                                rgba(0x0A84FF88)
+                            };
+                            el.border_1().border_color(border_col)
+                        },
+                    )
                     .hover(|s| {
-                        s.bg(if is_drag_over_pill {
+                        s.bg(if is_drag_over_pill || is_synced_group_pill {
                             rgba(0x0A84FF78)
                         } else if is_filtered {
                             rgba(0xFFFFFF38)
@@ -6690,18 +7387,31 @@ impl Render for SwitcherView {
                     .child(
                         div()
                             .text_xs()
-                            .font_weight(if is_filtered || is_cur || is_drag_over_pill || pill_pulse > 0.1 {
-                                gpui::FontWeight::SEMIBOLD
-                            } else {
-                                gpui::FontWeight::MEDIUM
-                            })
-                            .text_color(if is_filtered || is_drag_over_pill || pill_pulse > 0.1 {
-                                rgba(0xFFFFFFFA)
-                            } else if is_cur {
-                                rgba(0xFFFFFFDC)
-                            } else {
-                                rgba(0xFFFFFF99)
-                            })
+                            .font_weight(
+                                if is_filtered
+                                    || is_cur
+                                    || is_drag_over_pill
+                                    || is_synced_group_pill
+                                    || pill_pulse > 0.1
+                                {
+                                    gpui::FontWeight::SEMIBOLD
+                                } else {
+                                    gpui::FontWeight::MEDIUM
+                                },
+                            )
+                            .text_color(
+                                if is_filtered
+                                    || is_drag_over_pill
+                                    || is_synced_group_pill
+                                    || pill_pulse > 0.1
+                                {
+                                    rgba(0xFFFFFFFA)
+                                } else if is_cur {
+                                    rgba(0xFFFFFFDC)
+                                } else {
+                                    rgba(0xFFFFFF99)
+                                },
+                            )
                             .child(label),
                     );
                 pill
@@ -6877,6 +7587,22 @@ impl Render for SwitcherView {
                 continue;
             }
 
+            let vspace_key = ReorderPillKey::VirtualSpace(sid);
+            let vspace_dx = if let Some(ref reorder) = self.active_desktop_reorder {
+                if matches!(reorder.source, DesktopReorderSource::VirtualSpaceTopPill(_)) {
+                    reorder.visual_dx_for_key(vspace_key)
+                } else {
+                    0.0
+                }
+            } else if let Some(ref settle) = self.pill_settle_anim {
+                settle.dx_for(vspace_key, now)
+            } else {
+                0.0
+            };
+            let is_lifted_vspace =
+                active_reorder_source == Some(DesktopReorderSource::VirtualSpaceTopPill(sid));
+            let applied_vspace_dx = if is_lifted_vspace { 0.0 } else { vspace_dx };
+
             let is_drag_over_vspace = active_drag_target == Some(DropTarget::VirtualSpacePill(sid));
             let vspace_pulse = self
                 .genie_anim
@@ -6888,6 +7614,10 @@ impl Render for SwitcherView {
             let pill = div()
                 .id(("vspace-pill", s_idx))
                 .relative()
+                .when(applied_vspace_dx.abs() >= 0.05, |el| {
+                    el.left(px(applied_vspace_dx))
+                })
+                .when(is_lifted_vspace, |el| el.opacity(0.0))
                 .h(px(24.0))
                 .min_w(px(54.0))
                 .max_w(px(176.0))
@@ -6902,13 +7632,31 @@ impl Render for SwitcherView {
                 .child(
                     canvas(
                         move |bounds, _, _| {
-                            vspace_bounds_for_pill.borrow_mut().insert(sid, bounds);
+                            let rest_bounds = Bounds {
+                                origin: point(
+                                    bounds.origin.x - px(applied_vspace_dx),
+                                    bounds.origin.y,
+                                ),
+                                size: bounds.size,
+                            };
+                            vspace_bounds_for_pill.borrow_mut().insert(sid, rest_bounds);
                         },
                         |_, _, _, _| {},
                     )
                     .absolute()
                     .inset_0()
                     .size_full(),
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                        cx.stop_propagation();
+                        this.begin_desktop_reorder_press(
+                            DesktopPressAction::VirtualSpacePill(sid),
+                            event.position,
+                            cx,
+                        );
+                    }),
                 )
                 .on_mouse_down(
                     MouseButton::Right,
@@ -6925,19 +7673,7 @@ impl Render for SwitcherView {
                         }
                         cx.notify();
                     }),
-                )
-                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
-                    cx.stop_propagation();
-                    if this.armed_delete == Some(ArmedDelete::VirtualSpace(sid)) {
-                        this.remove_virtual_space_by_id(sid, window, cx);
-                    } else if this.dismiss_space_popups(true, cx) {
-                        // Dismiss open popup / rename / armed trash first
-                    } else if event.click_count() >= 2 {
-                        this.start_renaming_space(sid, window, cx);
-                    } else {
-                        this.set_view_filter(ViewFilter::VirtualSpace(sid), window, cx);
-                    }
-                }));
+                );
 
             let pill = if is_armed_delete {
                 pill.bg(rgba(0xFF453AD8))
@@ -7086,11 +7822,21 @@ impl Render for SwitcherView {
 
         // === FIXED-SIZE UNIFORM MISSION CONTROL GROUPS ===
         let show_group_labels = self.groups.len() > 1;
+        let can_reorder_content_groups =
+            self.view_filter == ViewFilter::All && self.desktops.len() >= 2;
         let mut group_elements = Vec::with_capacity(self.groups.len());
 
         for (g_idx, group) in self.groups.iter().enumerate() {
             let desktop_id = group.desktop_id;
             let group_vspace_id = group.virtual_space_id;
+            let can_reorder_group = can_reorder_content_groups && desktop_id.is_some();
+            let is_dragged_group =
+                desktop_id.is_some() && active_reorder_content_did == desktop_id;
+            let group_chrome_opacity = if is_dragged_group {
+                chrome_opacity * 0.42
+            } else {
+                chrome_opacity
+            };
 
             let header = div()
                 .id(("desktop-label", g_idx))
@@ -7098,21 +7844,38 @@ impl Render for SwitcherView {
                 .flex()
                 .flex_row()
                 .items_center()
+                .gap(px(6.0))
                 .px(px(TOTAL_RING_PAD))
+                .when(can_reorder_group, |el| el.rounded(px(6.0)))
                 .when_some(desktop_id, |el, did| {
                     el.cursor_pointer()
-                        .hover(|s| s.opacity(1.0))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            cx.stop_propagation();
-                            if this.dismiss_space_popups(true, cx) {
-                                return;
+                        .hover(move |s| {
+                            if can_reorder_group {
+                                s.bg(rgba(0xFFFFFF0D))
+                            } else {
+                                s.opacity(1.0)
                             }
-                            this.switch_to_desktop_only(did, window, cx);
-                        }))
+                        })
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                cx.stop_propagation();
+                                this.begin_desktop_reorder_press(
+                                    DesktopPressAction::GroupHeader(did),
+                                    event.position,
+                                    cx,
+                                );
+                            }),
+                        )
                 })
-                .when(chrome_opacity < 0.999, |el| el.opacity(chrome_opacity))
+                .when(group_chrome_opacity < 0.999, |el| {
+                    el.opacity(group_chrome_opacity)
+                })
                 .when(show_group_labels, |el| {
-                    el.child(
+                    el.when(can_reorder_group, |inner| {
+                        inner.child(drag_grip_icon(is_dragged_group))
+                    })
+                    .child(
                         div()
                             .text_xs()
                             .font_weight(gpui::FontWeight::MEDIUM)
@@ -7133,11 +7896,28 @@ impl Render for SwitcherView {
             let group_bounds_for_section = group_bounds_rc.clone();
 
             let mut section = div()
+                .id(("desktop-section", g_idx))
                 .relative()
                 .w_full()
                 .flex()
                 .flex_col()
                 .when(g_idx > 0, |el| el.mt(px(GROUP_TOP_GAP)))
+                .when(is_dragged_group, |el| {
+                    el.rounded(px(12.0)).bg(rgba(0x0A84FF0E))
+                })
+                .when_some(desktop_id.filter(|_| can_reorder_group), |el, did| {
+                    el.on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.begin_desktop_reorder_press(
+                                DesktopPressAction::GroupBackground(did),
+                                event.position,
+                                cx,
+                            );
+                        }),
+                    )
+                })
                 .when_some(desktop_id, |el, did| {
                     el.child(
                         canvas(
@@ -7250,15 +8030,21 @@ impl Render for SwitcherView {
                         .when_some(desktop_id, |el, did| {
                             el.cursor_pointer()
                                 .hover(|s| s.bg(rgba(0xFFFFFF1A)).text_color(rgba(0xFFFFFFD0)))
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    if this.dismiss_space_popups(true, cx) {
-                                        return;
-                                    }
-                                    this.switch_to_desktop_only(did, window, cx);
-                                }))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.begin_desktop_reorder_press(
+                                            DesktopPressAction::GroupEmptyBar(did),
+                                            event.position,
+                                            cx,
+                                        );
+                                    }),
+                                )
                         })
-                        .when(chrome_opacity < 0.999, |el| el.opacity(chrome_opacity))
+                        .when(group_chrome_opacity < 0.999, |el| {
+                            el.opacity(group_chrome_opacity)
+                        })
                         .child(if matches!(self.view_filter, ViewFilter::NativeDesktop(_)) {
                             "空白桌面 · 点击或按 Enter 切换到此桌面"
                         } else {
@@ -7304,7 +8090,10 @@ impl Render for SwitcherView {
                                 .justify_center()
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     cx.stop_propagation();
-                                    if this.exit_anim.is_some() || this.active_drag.is_some() {
+                                    if this.exit_anim.is_some()
+                                        || this.active_drag.is_some()
+                                        || this.active_desktop_reorder.is_some()
+                                    {
                                         return;
                                     }
                                     if this.dismiss_space_popups(true, cx) {
@@ -7326,7 +8115,7 @@ impl Render for SwitcherView {
                         let card_flat_index = card.flat_index;
                         let is_selected = card_flat_index == selected_flat;
                         let is_hovered =
-                            hovered_flat == Some(card_flat_index) && active_drag_hwnd.is_none();
+                            hovered_flat == Some(card_flat_index) && !is_any_drag_active;
                         let target_hwnd = card.info.hwnd;
                         let is_being_dragged = active_drag_hwnd == Some(target_hwnd);
                         let is_genie_target = genie_hwnd == Some(target_hwnd);
@@ -7454,6 +8243,8 @@ impl Render for SwitcherView {
                                     } else {
                                         (0.0, 0.0, 1.0, 255u8, false)
                                     }
+                                } else if is_dragged_group {
+                                    (0.0, 0.0, 0.42, 96u8, false)
                                 } else {
                                     (0.0, 0.0, 1.0, 255u8, false)
                                 }
@@ -7781,7 +8572,10 @@ impl Render for SwitcherView {
                             .justify_center()
                             .cursor_pointer()
                             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                                if this.exit_anim.is_some() || this.active_drag.is_some() {
+                                if this.exit_anim.is_some()
+                                    || this.active_drag.is_some()
+                                    || this.active_desktop_reorder.is_some()
+                                {
                                     return;
                                 }
                                 if *hovered {
@@ -7813,6 +8607,7 @@ impl Render for SwitcherView {
                                     cx.stop_propagation();
                                     if this.exit_anim.is_some()
                                         || this.active_drag.is_some()
+                                        || this.active_desktop_reorder.is_some()
                                         || this.add_picker.is_some()
                                     {
                                         return;
@@ -7943,6 +8738,74 @@ impl Render for SwitcherView {
             self.active_drag
                 .as_ref()
                 .map(|d| (d.floating_rect(), d.full_image.clone(), d.target));
+
+        let desktop_reorder_insertion_y: Option<f32> = self
+            .active_desktop_reorder
+            .as_ref()
+            .filter(|r| r.source.is_content_group() && r.target_index != r.from_index)
+            .and_then(|r| {
+                let groups = self.compute_native_group_layouts();
+                compute_insertion_line_content_y(
+                    &groups,
+                    r.from_index,
+                    r.target_index,
+                    GROUP_TOP_GAP,
+                )
+            });
+        let grid_left_logical = ((viewport_w_logical - grid_total_w) * 0.5).max(CANVAS_PAD_X);
+
+        enum DesktopReorderOverlayPayload {
+            TopNativePill {
+                left: f32,
+                top: f32,
+                width: f32,
+                height: f32,
+                badge: FloatingDesktopBadge,
+            },
+            TopVirtualSpacePill {
+                left: f32,
+                top: f32,
+                width: f32,
+                height: f32,
+                badge: FloatingDesktopBadge,
+            },
+            ContentGroupChip {
+                cursor_x: f32,
+                cursor_y: f32,
+                badge: FloatingDesktopBadge,
+            },
+        }
+
+        let desktop_reorder_overlay: Option<DesktopReorderOverlayPayload> =
+            self.active_desktop_reorder.as_ref().and_then(|r| match r.source {
+                DesktopReorderSource::NativeTopPill(_) => {
+                    let (left, top, width, height) = r.floating_pill_rect()?;
+                    Some(DesktopReorderOverlayPayload::TopNativePill {
+                        left,
+                        top,
+                        width,
+                        height,
+                        badge: r.badge.clone(),
+                    })
+                }
+                DesktopReorderSource::VirtualSpaceTopPill(_) => {
+                    let (left, top, width, height) = r.floating_pill_rect()?;
+                    Some(DesktopReorderOverlayPayload::TopVirtualSpacePill {
+                        left,
+                        top,
+                        width,
+                        height,
+                        badge: r.badge.clone(),
+                    })
+                }
+                DesktopReorderSource::NativeContentGroup(_) => {
+                    Some(DesktopReorderOverlayPayload::ContentGroupChip {
+                        cursor_x: f32::from(r.cursor_pos.x),
+                        cursor_y: f32::from(r.cursor_pos.y),
+                        badge: r.badge.clone(),
+                    })
+                }
+            });
 
         enum GenieOverlayPayload {
             Strips {
@@ -8080,7 +8943,10 @@ impl Render for SwitcherView {
                 }),
             )
             .on_click(cx.listener(|this, _, _, cx| {
-                if this.active_drag.is_some() || this.exit_anim.is_some() {
+                if this.active_drag.is_some()
+                    || this.active_desktop_reorder.is_some()
+                    || this.exit_anim.is_some()
+                {
                     return;
                 }
                 if this.dismiss_space_popups(true, cx) {
@@ -8111,9 +8977,17 @@ impl Render for SwitcherView {
                             .px(px(6.0))
                             .py(px(4.0))
                             .rounded_full()
-                            .bg(rgba(0x0B0F1866))
+                            .bg(if is_reordering_native {
+                                rgba(0x0B152888)
+                            } else {
+                                rgba(0x0B0F1866)
+                            })
                             .border_1()
-                            .border_color(rgba(0xFFFFFF18))
+                            .border_color(if is_reordering_native {
+                                rgba(0x64D2FF66)
+                            } else {
+                                rgba(0xFFFFFF18)
+                            })
                             .flex()
                             .flex_row()
                             .items_center()
@@ -8130,13 +9004,13 @@ impl Render for SwitcherView {
                             .px(px(6.0))
                             .py(px(4.0))
                             .rounded_full()
-                            .bg(if is_dragging_window {
+                            .bg(if is_dragging_window || is_reordering_vspace {
                                 rgba(0x1E183899)
                             } else {
                                 rgba(0x16122A7A)
                             })
                             .border_1()
-                            .border_color(if is_dragging_window {
+                            .border_color(if is_dragging_window || is_reordering_vspace {
                                 rgba(0xC4B5FD99)
                             } else {
                                 rgba(0xA78BFA38)
@@ -8224,6 +9098,48 @@ impl Render for SwitcherView {
                                     .children(group_elements),
                             ),
                     )
+                    // Desktop group drag insertion indicator rail
+                    .when_some(desktop_reorder_insertion_y, |el, content_y| {
+                        let line_y = content_y - scroll_y;
+                        el.child(
+                            div()
+                                .absolute()
+                                .left(px(grid_left_logical))
+                                .top(px(line_y - 5.0))
+                                .w(px(grid_total_w))
+                                .h(px(10.0))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .size(px(8.0))
+                                        .flex_shrink_0()
+                                        .rounded_full()
+                                        .bg(rgb(0x64D2FF))
+                                        .border(px(1.5))
+                                        .border_color(rgba(0xFFFFFFCC)),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .h(px(3.0))
+                                        .rounded_full()
+                                        .bg(rgba(0x0A84FFEE))
+                                        .border_t_1()
+                                        .border_color(rgba(0x64D2FFCC)),
+                                )
+                                .child(
+                                    div()
+                                        .size(px(8.0))
+                                        .flex_shrink_0()
+                                        .rounded_full()
+                                        .bg(rgb(0x64D2FF))
+                                        .border(px(1.5))
+                                        .border_color(rgba(0xFFFFFFCC)),
+                                ),
+                        )
+                    })
                     // Scene B smooth floating 3-ring focus frame
                     .when_some(floating_focus_rect, |el, rect| {
                         let ring_x = f32::from(rect.origin.x);
@@ -8633,6 +9549,195 @@ impl Render for SwitcherView {
                 );
 
                 el.child(menu_box)
+            })
+            // === FLOATING DRAGGED DESKTOP PILL / CONTENT GROUP CHIP OVERLAY ===
+            .when_some(desktop_reorder_overlay, |el, payload| match payload {
+                DesktopReorderOverlayPayload::TopNativePill {
+                    left,
+                    top,
+                    width,
+                    height,
+                    badge,
+                } => el.child(
+                    div()
+                        .absolute()
+                        .left(px(left - 2.0))
+                        .top(px(top - 2.0))
+                        .w(px(width + 4.0))
+                        .h(px(height + 4.0))
+                        .rounded_full()
+                        .border(px(2.0))
+                        .border_color(rgba(0x0A84FF4D))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .w(px(width))
+                                .h(px(height))
+                                .px(px(14.0))
+                                .rounded_full()
+                                .bg(rgba(0x0E1F3CEB))
+                                .border_1()
+                                .border_color(rgba(0x64D2FFEE))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_center()
+                                .gap(px(5.0))
+                                .when(badge.is_current, |inner| {
+                                    inner.child(
+                                        div().size(px(5.0)).rounded_full().bg(rgb(0x0A84FF)),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(rgba(0xFFFFFFFA))
+                                        .child(badge.label),
+                                ),
+                        ),
+                ),
+                DesktopReorderOverlayPayload::TopVirtualSpacePill {
+                    left,
+                    top,
+                    width,
+                    height,
+                    badge,
+                } => el.child(
+                    div()
+                        .absolute()
+                        .left(px(left - 2.0))
+                        .top(px(top - 2.0))
+                        .w(px(width + 4.0))
+                        .h(px(height + 4.0))
+                        .rounded_full()
+                        .border(px(2.0))
+                        .border_color(rgba(0xA78BFA55))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .w(px(width))
+                                .h(px(height))
+                                .px(px(12.0))
+                                .rounded_full()
+                                .bg(rgba(0x281B4EEB))
+                                .border_1()
+                                .border_color(rgba(0xE9D5FFEE))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_center()
+                                .gap(px(5.0))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .text_ellipsis()
+                                        .text_xs()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(rgba(0xFFFFFFFA))
+                                        .child(badge.label),
+                                )
+                                .when(badge.live_count > 0, |inner| {
+                                    inner.child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(rgba(0xE9D5FFE8))
+                                            .child(badge.live_count.to_string()),
+                                    )
+                                }),
+                        ),
+                ),
+                DesktopReorderOverlayPayload::ContentGroupChip {
+                    cursor_x,
+                    cursor_y,
+                    badge,
+                } => {
+                    let chip_left = (cursor_x + 14.0).clamp(12.0, (viewport_w_logical - 220.0).max(12.0));
+                    let chip_top = (cursor_y - 18.0).clamp(
+                        TOP_SPACES_BAR_H + 4.0,
+                        (total_win_h_logical - 48.0).max(TOP_SPACES_BAR_H + 4.0),
+                    );
+                    let extra_count = badge.total_windows.saturating_sub(badge.app_icons.len());
+                    el.child(
+                        div()
+                            .absolute()
+                            .left(px(chip_left - 2.0))
+                            .top(px(chip_top - 2.0))
+                            .p(px(2.0))
+                            .rounded_full()
+                            .border(px(2.0))
+                            .border_color(rgba(0x0A84FF4D))
+                            .child(
+                                div()
+                                    .h(px(32.0))
+                                    .px(px(12.0))
+                                    .rounded_full()
+                                    .bg(rgba(0x0B1528EB))
+                                    .border_1()
+                                    .border_color(rgba(0x64D2FFEE))
+                                    .flex()
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(7.0))
+                                    .child(drag_grip_icon(true))
+                                    .when(badge.is_current, |inner| {
+                                        inner.child(
+                                            div().size(px(5.0)).rounded_full().bg(rgb(0x0A84FF)),
+                                        )
+                                    })
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(rgba(0xFFFFFFFA))
+                                            .child(badge.label),
+                                    )
+                                    .when(!badge.app_icons.is_empty(), |inner| {
+                                        inner
+                                            .child(
+                                                div()
+                                                    .w(px(1.0))
+                                                    .h(px(12.0))
+                                                    .bg(rgba(0xFFFFFF24)),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .gap(px(4.0))
+                                                    .children(badge.app_icons.into_iter().map(
+                                                        |icon_img| {
+                                                            img(icon_img)
+                                                                .size(px(15.0))
+                                                                .rounded(px(3.0))
+                                                        },
+                                                    )),
+                                            )
+                                    })
+                                    .when(extra_count > 0, |inner| {
+                                        inner.child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(gpui::FontWeight::MEDIUM)
+                                                .text_color(rgba(0xFFFFFF99))
+                                                .child(if badge.total_windows == extra_count {
+                                                    extra_count.to_string()
+                                                } else {
+                                                    format!("+{extra_count}")
+                                                }),
+                                        )
+                                    }),
+                            ),
+                    )
+                }
             })
             // === FLOATING DRAGGED CARD OVERLAY (above cards, headers & top Spaces bar) ===
             .when_some(drag_overlay_payload, |el, (rect, full_img, target)| {

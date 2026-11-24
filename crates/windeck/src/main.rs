@@ -2,6 +2,7 @@
 
 mod animation;
 mod config;
+mod desktop_reorder;
 mod genie;
 mod nav;
 mod settings_panel;
