@@ -455,11 +455,47 @@ impl AddWindowPickerState {
 }
 
 fn picker_matches_query(win: &WindowInfo, query_lower: &str) -> bool {
-    if query_lower.is_empty() {
-        return true;
+    crate::search::matches_window(win, query_lower)
+}
+
+const MAX_SEARCH_QUERY_CHARS: usize = 48;
+
+#[derive(Clone, Default)]
+pub(crate) struct OverlaySearchState {
+    pub(crate) active: bool,
+    pub(crate) opened_explicitly: bool,
+    pub(crate) query: String,
+    pub(crate) marked_range: Option<Range<usize>>,
+    pub(crate) select_all: bool,
+}
+
+impl OverlaySearchState {
+    pub(crate) fn is_filtering(&self) -> bool {
+        self.active && !self.query.trim().is_empty()
     }
-    win.title.to_lowercase().contains(query_lower)
-        || win.process_name.to_lowercase().contains(query_lower)
+
+    pub(crate) fn reset(&mut self) {
+        self.active = false;
+        self.opened_explicitly = false;
+        self.query.clear();
+        self.marked_range = None;
+        self.select_all = false;
+    }
+
+    fn clamp_query(&mut self) {
+        if self.query.chars().count() > MAX_SEARCH_QUERY_CHARS {
+            let truncated: String = self.query.chars().take(MAX_SEARCH_QUERY_CHARS).collect();
+            self.query = truncated;
+            if let Some(ref mut mr) = self.marked_range {
+                let len = self.query.len();
+                mr.start = mr.start.min(len);
+                mr.end = mr.end.min(len);
+                if mr.start >= mr.end {
+                    self.marked_range = None;
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -686,13 +722,8 @@ fn check_mark_dot(checked: bool) -> gpui::Div {
         })
 }
 
-/// Crisp geometric magnifying glass for the window picker search field.
-fn search_icon(active: bool) -> gpui::Div {
-    let color = if active {
-        rgba(0xE9D5FFDD)
-    } else {
-        rgba(0xFFFFFF66)
-    };
+/// Crisp geometric magnifying glass for search inputs.
+fn search_icon_tinted(color: gpui::Rgba) -> gpui::Div {
     div()
         .relative()
         .size(px(12.0))
@@ -717,6 +748,15 @@ fn search_icon(active: bool) -> gpui::Div {
                 .rounded(px(1.0))
                 .bg(color),
         )
+}
+
+fn search_icon(active: bool) -> gpui::Div {
+    let color = if active {
+        rgba(0xE9D5FFDD)
+    } else {
+        rgba(0xFFFFFF66)
+    };
+    search_icon_tinted(color)
 }
 
 /// Crisp geometric plus glyph for the virtual-space add-window tile.
@@ -842,6 +882,7 @@ pub struct SwitcherView {
     context_menu: Option<CardContextMenu>,
     renaming_space: Option<RenameSpaceState>,
     add_picker: Option<AddWindowPickerState>,
+    pub(crate) search: OverlaySearchState,
     pub(crate) settings_open: bool,
     pub(crate) recording_hotkey_letter: bool,
     pub(crate) recording_force_quit_key: bool,
@@ -906,6 +947,8 @@ impl EntityInputHandler for SwitcherView {
             state.text.as_str()
         } else if let Some(ref picker) = self.add_picker.as_ref().filter(|p| p.search_focused) {
             picker.query.as_str()
+        } else if self.is_main_search_input_active() {
+            self.search.query.as_str()
         } else {
             return None;
         };
@@ -940,6 +983,18 @@ impl EntityInputHandler for SwitcherView {
                 reversed: false,
             });
         }
+        if self.is_main_search_input_active() {
+            let len_u16 = utf8_offset_to_utf16(&self.search.query, self.search.query.len());
+            let range = if self.search.select_all {
+                0..len_u16
+            } else {
+                len_u16..len_u16
+            };
+            return Some(UTF16Selection {
+                range,
+                reversed: false,
+            });
+        }
         None
     }
 
@@ -962,16 +1017,31 @@ impl EntityInputHandler for SwitcherView {
                     ..utf8_offset_to_utf16(&picker.query, mr.end),
             );
         }
+        if self.is_main_search_input_active() {
+            let mr = self.search.marked_range.as_ref()?;
+            return Some(
+                utf8_offset_to_utf16(&self.search.query, mr.start)
+                    ..utf8_offset_to_utf16(&self.search.query, mr.end),
+            );
+        }
         None
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    fn unmark_text(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(ref mut state) = self.renaming_space {
             state.marked_range = None;
             cx.notify();
         } else if let Some(ref mut picker) = self.add_picker.as_mut().filter(|p| p.search_focused) {
             picker.marked_range = None;
             cx.notify();
+        } else if self.is_main_search_input_active() {
+            self.search.marked_range = None;
+            if !self.search.opened_explicitly && self.search.query.is_empty() {
+                self.search.active = false;
+                self.apply_search_filter(window, cx);
+            } else {
+                cx.notify();
+            }
         }
     }
 
@@ -979,7 +1049,7 @@ impl EntityInputHandler for SwitcherView {
         &mut self,
         range_utf16: Option<Range<usize>>,
         new_text: &str,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(ref mut state) = self.renaming_space {
@@ -1042,6 +1112,54 @@ impl EntityInputHandler for SwitcherView {
             picker.focused_idx = 0;
             picker.scroll_y = 0.0;
             cx.notify();
+            return;
+        }
+
+        if self.can_use_main_search_input() {
+            let sanitized: String = new_text.chars().filter(|c| !c.is_control()).collect();
+            if !self.search.active {
+                if !sanitized.chars().any(char::is_alphabetic) {
+                    return;
+                }
+                self.disarm_hold_mode();
+                self.clear_space_popups();
+                self.search.active = true;
+                self.search.opened_explicitly = false;
+                self.search.select_all = false;
+            }
+            let replace_range = if let Some(ref r16) = range_utf16 {
+                let s = utf16_offset_to_utf8(&self.search.query, r16.start);
+                let e = utf16_offset_to_utf8(&self.search.query, r16.end).max(s);
+                s..e
+            } else if let Some(mr) = self.search.marked_range.take() {
+                let len = self.search.query.len();
+                mr.start.min(len)..mr.end.min(len)
+            } else if self.search.select_all {
+                0..self.search.query.len()
+            } else {
+                self.search.query.len()..self.search.query.len()
+            };
+
+            if sanitized.is_empty()
+                && range_utf16.is_none()
+                && replace_range.start == replace_range.end
+            {
+                self.search.marked_range = None;
+                if !self.search.opened_explicitly && self.search.query.is_empty() {
+                    self.search.active = false;
+                }
+                self.apply_search_filter(window, cx);
+                return;
+            }
+
+            self.search.query.replace_range(replace_range, &sanitized);
+            self.search.marked_range = None;
+            self.search.select_all = false;
+            self.search.clamp_query();
+            if !self.search.opened_explicitly && self.search.query.is_empty() {
+                self.search.active = false;
+            }
+            self.apply_search_filter(window, cx);
         }
     }
 
@@ -1050,7 +1168,7 @@ impl EntityInputHandler for SwitcherView {
         range_utf16: Option<Range<usize>>,
         new_text: &str,
         _new_selected_range_utf16: Option<Range<usize>>,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(ref mut state) = self.renaming_space {
@@ -1103,6 +1221,49 @@ impl EntityInputHandler for SwitcherView {
             picker.focused_idx = 0;
             picker.scroll_y = 0.0;
             cx.notify();
+            return;
+        }
+
+        if self.can_use_main_search_input() {
+            if !self.search.active {
+                if !new_text.chars().any(char::is_alphabetic) {
+                    return;
+                }
+                self.disarm_hold_mode();
+                self.clear_space_popups();
+                self.search.active = true;
+                self.search.opened_explicitly = false;
+                self.search.select_all = false;
+            }
+            let replace_range = if let Some(r16) = range_utf16 {
+                let s = utf16_offset_to_utf8(&self.search.query, r16.start);
+                let e = utf16_offset_to_utf8(&self.search.query, r16.end).max(s);
+                s..e
+            } else if let Some(mr) = self.search.marked_range.clone() {
+                let len = self.search.query.len();
+                mr.start.min(len)..mr.end.min(len)
+            } else if self.search.select_all {
+                0..self.search.query.len()
+            } else {
+                self.search.query.len()..self.search.query.len()
+            };
+
+            let start = replace_range.start;
+            self.search.query.replace_range(replace_range, new_text);
+            self.search.select_all = false;
+            if new_text.is_empty() {
+                self.search.marked_range = None;
+            } else {
+                self.search.marked_range = Some(start..(start + new_text.len()));
+            }
+            self.search.clamp_query();
+            if !self.search.opened_explicitly
+                && self.search.query.is_empty()
+                && self.search.marked_range.is_none()
+            {
+                self.search.active = false;
+            }
+            self.apply_search_filter(window, cx);
         }
     }
 
@@ -1127,6 +1288,12 @@ impl EntityInputHandler for SwitcherView {
         }
         if let Some(ref picker) = self.add_picker.as_ref().filter(|p| p.search_focused) {
             return Some(utf8_offset_to_utf16(&picker.query, picker.query.len()));
+        }
+        if self.is_main_search_input_active() {
+            return Some(utf8_offset_to_utf16(
+                &self.search.query,
+                self.search.query.len(),
+            ));
         }
         None
     }
@@ -1193,6 +1360,7 @@ impl SwitcherView {
             context_menu: None,
             renaming_space: None,
             add_picker: None,
+            search: OverlaySearchState::default(),
             settings_open: false,
             recording_hotkey_letter: false,
             recording_force_quit_key: false,
@@ -1368,6 +1536,81 @@ impl SwitcherView {
         self.add_picker = None;
     }
 
+    fn can_use_main_search_input(&self) -> bool {
+        self.visible
+            && !self.settings_open
+            && !self.update_dialog_open
+            && self.renaming_space.is_none()
+            && self.add_picker.is_none()
+            && self.active_drag.is_none()
+            && self.active_desktop_reorder.is_none()
+            && self.exit_anim.is_none()
+    }
+
+    fn is_main_search_input_active(&self) -> bool {
+        self.search.active && self.can_use_main_search_input()
+    }
+
+    fn is_search_filtering(&self) -> bool {
+        self.search.is_filtering()
+    }
+
+    fn begin_type_to_search(&mut self, cx: &mut Context<Self>) {
+        self.disarm_hold_mode();
+        self.clear_space_popups();
+        self.search.active = true;
+        self.search.opened_explicitly = false;
+        self.search.select_all = false;
+        cx.notify();
+    }
+
+    fn open_search_explicitly(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.disarm_hold_mode();
+        self.clear_space_popups();
+        self.search.active = true;
+        self.search.opened_explicitly = true;
+        self.search.select_all = !self.search.query.is_empty();
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
+    fn clear_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let was_filtering = self.search.is_filtering();
+        self.search.reset();
+        if was_filtering {
+            self.apply_search_filter(window, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn reset_search_without_refresh(&mut self) {
+        let was_filtering = self.search.is_filtering();
+        self.search.reset();
+        if was_filtering {
+            self.rebuild_visible_groups(false);
+        }
+    }
+
+    fn apply_search_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.tab_anim = None;
+        self.reflow_anim = None;
+        self.selection_anim = None;
+        self.hovered_flat = None;
+        self.scroll_y = 0.0;
+        self.scroll_target_y = 0.0;
+        self.scroll_last_tick = None;
+        let filtering = self.search.is_filtering();
+        self.rebuild_visible_groups(!filtering);
+        if filtering {
+            self.selected_flat = 0;
+        }
+        self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
+        self.ensure_selected_visible_instant();
+        window.refresh();
+        cx.notify();
+    }
+
     pub fn handle_hold_navigate(
         &mut self,
         dir: HoldNavDirection,
@@ -1378,6 +1621,10 @@ impl SwitcherView {
             return;
         }
         self.clear_space_popups();
+        if self.search.active {
+            self.reset_search_without_refresh();
+            self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
+        }
         self.hold_active = true;
         self.hold_navigated = true;
 
@@ -1451,6 +1698,7 @@ impl SwitcherView {
         self.hold_navigated = false;
         self.hovered_flat = None;
         self.clear_space_popups();
+        self.search.reset();
         self.settings_open = false;
         self.update_dialog_open = false;
         self.recording_hotkey_letter = false;
@@ -1501,6 +1749,7 @@ impl SwitcherView {
         self.capture_foreground_candidates();
         self.hovered_flat = None;
         self.clear_space_popups();
+        self.search.reset();
         self.settings_open = false;
         self.update_dialog_open = false;
         self.recording_hotkey_letter = false;
@@ -1750,11 +1999,16 @@ impl SwitcherView {
         self.rebuild_visible_groups(true);
     }
 
-    /// Rebuilds visible desktop/space groups & flat HWND index list according to `self.view_filter`.
+    /// Rebuilds visible desktop/space groups & flat HWND index list according to `self.view_filter`
+    /// and any active overlay search query.
     fn rebuild_visible_groups(&mut self, pick_smart_initial: bool) {
         let mut groups = Vec::new();
         let mut flat_hwnds = Vec::new();
         let mut flat_idx = 0usize;
+        let active_query = self
+            .search
+            .is_filtering()
+            .then(|| self.search.query.trim().to_string());
 
         if let ViewFilter::VirtualSpace(space_id) = self.view_filter {
             if let Some(space) = self.virtual_spaces.get(space_id) {
@@ -1764,6 +2018,11 @@ impl SwitcherView {
                     .ordered_windows_for_space(space_id, &self.all_windows);
                 let mut cards = Vec::with_capacity(space_windows.len());
                 for info in space_windows {
+                    if let Some(ref q) = active_query {
+                        if !crate::search::matches_window(&info, q) {
+                            continue;
+                        }
+                    }
                     let icon = self.cached_icon(&info);
                     let (monogram, accent_color) =
                         monogram_and_color(&info.process_name, &info.title);
@@ -1777,13 +2036,15 @@ impl SwitcherView {
                     });
                     flat_idx += 1;
                 }
-                groups.push(DesktopGroup {
-                    title: space_title,
-                    desktop_id: None,
-                    virtual_space_id: Some(space_id),
-                    is_current: true,
-                    cards,
-                });
+                if active_query.is_none() || !cards.is_empty() {
+                    groups.push(DesktopGroup {
+                        title: space_title,
+                        desktop_id: None,
+                        virtual_space_id: Some(space_id),
+                        is_current: true,
+                        cards,
+                    });
+                }
             }
             self.total_window_count = flat_hwnds.len();
             self.groups = groups;
@@ -1799,7 +2060,15 @@ impl SwitcherView {
         }
 
         let desktops = self.desktops.clone();
-        let windows = self.window_order.ordered(&self.all_windows);
+        let windows: Vec<WindowInfo> = self
+            .window_order
+            .ordered(&self.all_windows)
+            .into_iter()
+            .filter(|w| match active_query.as_deref() {
+                Some(q) => crate::search::matches_window(w, q),
+                None => true,
+            })
+            .collect();
         let filter = match self.view_filter {
             ViewFilter::NativeDesktop(did) => Some(did),
             ViewFilter::All | ViewFilter::VirtualSpace(_) => None,
@@ -1888,6 +2157,9 @@ impl SwitcherView {
                     });
                     flat_idx += 1;
                 }
+            }
+            if active_query.is_some() && cards.is_empty() {
+                continue;
             }
             groups.push(DesktopGroup {
                 title: label_shared,
@@ -3364,7 +3636,7 @@ impl SwitcherView {
             y += GROUP_HEADER_H;
 
             let has_preview = group.desktop_id.is_some() && group.desktop_id == preview_did;
-            let has_add_tile = group.virtual_space_id.is_some();
+            let has_add_tile = group.virtual_space_id.is_some() && !self.is_search_filtering();
             let total_slots =
                 group.cards.len() + usize::from(has_preview) + usize::from(has_add_tile);
             if total_slots == 0 {
@@ -3485,7 +3757,7 @@ impl SwitcherView {
             y += GROUP_HEADER_H;
 
             let has_preview = group.desktop_id.is_some() && group.desktop_id == preview_did;
-            let has_add_tile = group.virtual_space_id.is_some();
+            let has_add_tile = group.virtual_space_id.is_some() && !self.is_search_filtering();
             let visual_count =
                 group.cards.len() + usize::from(has_preview) + usize::from(has_add_tile);
             if visual_count == 0 {
@@ -3535,7 +3807,7 @@ impl SwitcherView {
     /// Computes deterministic content-space `(top, bottom)` ranges for every native desktop group
     /// currently visible in `ViewFilter::All`, sharing exact geometry with `compute_layout_metrics`.
     fn compute_native_group_layouts(&self) -> Vec<GroupSlotLayout> {
-        if self.view_filter != ViewFilter::All {
+        if self.view_filter != ViewFilter::All || self.is_search_filtering() {
             return Vec::new();
         }
         let (cols, _, preview_h, _, _) = self.fixed_grid_geometry();
@@ -3557,7 +3829,7 @@ impl SwitcherView {
             y += GROUP_HEADER_H;
 
             let has_preview = group.desktop_id.is_some() && group.desktop_id == preview_did;
-            let has_add_tile = group.virtual_space_id.is_some();
+            let has_add_tile = group.virtual_space_id.is_some() && !self.is_search_filtering();
             let total_slots =
                 group.cards.len() + usize::from(has_preview) + usize::from(has_add_tile);
             if total_slots == 0 {
@@ -4418,6 +4690,35 @@ impl SwitcherView {
         }
     }
 
+    fn cycle_label_position(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.config.label_position = self.config.label_position.next();
+        self.persist_config();
+        self.transient_toast = Some((
+            SharedString::from(format!(
+                "标签位置：{}（已自动保存）",
+                self.config.label_position.display_label()
+            )),
+            Instant::now(),
+        ));
+        self.ensure_selected_visible();
+        window.refresh();
+        cx.notify();
+    }
+
+    fn toggle_preview_fit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.config.preview_fit = self.config.preview_fit.toggle();
+        self.persist_config();
+        self.transient_toast = Some((
+            SharedString::from(format!(
+                "预览适配：{}（已自动保存）",
+                self.config.preview_fit.display_label()
+            )),
+            Instant::now(),
+        ));
+        window.refresh();
+        cx.notify();
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         if !self.visible {
             return;
@@ -4759,6 +5060,10 @@ impl SwitcherView {
             if self.dismiss_space_popups(false, cx) {
                 return;
             }
+            if self.search.active {
+                self.clear_search(window, cx);
+                return;
+            }
             self.hide(cx);
             return;
         }
@@ -4771,64 +5076,277 @@ impl SwitcherView {
 
         // Configurable force-quit shortcut on hovered/selected window
         let held_primary = self.hold_active.then(|| self.config.parsed_hotkey().primary);
-        if self.config.parsed_force_quit_key().matches(
-            key,
-            mods.control,
-            mods.alt,
-            mods.shift,
-            held_primary,
-        ) {
+        let fq_shortcut = self.config.parsed_force_quit_key();
+        let skip_fq_for_search = self.search.active
+            && (fq_shortcut.is_bare_printable() || (self.search.select_all && key == "delete"));
+        if !skip_fq_for_search
+            && fq_shortcut.matches(key, mods.control, mods.alt, mods.shift, held_primary)
+        {
             cx.stop_propagation();
             self.force_quit_target_window(window, cx);
             return;
         }
 
         // Quick move selected window across native virtual desktops (default: Alt + ↑/↓, Alt + 1..9)
-        if let Some(move_action) = self.config.move_desktop_modifier.match_move_action(
-            key,
-            mods.control,
-            mods.alt,
-            mods.shift,
-        ) {
-            let conflicts_with_held_primary = matches!(
-                (self.config.move_desktop_modifier, held_primary),
-                (MoveDesktopModifier::Alt, Some(PrimaryModifier::Alt))
-                    | (MoveDesktopModifier::Ctrl, Some(PrimaryModifier::Ctrl))
-            );
-            if !conflicts_with_held_primary || matches!(move_action, MoveDesktopAction::Index(_)) {
-                cx.stop_propagation();
-                self.move_selected_window_by_hotkey(move_action, event.is_held, window, cx);
-                return;
+        let allow_move_desktop = !self.search.active
+            || self.config.move_desktop_modifier != MoveDesktopModifier::Shift
+            || matches!(key, "up" | "down");
+        if allow_move_desktop {
+            if let Some(move_action) = self.config.move_desktop_modifier.match_move_action(
+                key,
+                mods.control,
+                mods.alt,
+                mods.shift,
+            ) {
+                let conflicts_with_held_primary = matches!(
+                    (self.config.move_desktop_modifier, held_primary),
+                    (MoveDesktopModifier::Alt, Some(PrimaryModifier::Alt))
+                        | (MoveDesktopModifier::Ctrl, Some(PrimaryModifier::Ctrl))
+                );
+                if !conflicts_with_held_primary || matches!(move_action, MoveDesktopAction::Index(_))
+                {
+                    cx.stop_propagation();
+                    self.move_selected_window_by_hotkey(move_action, event.is_held, window, cx);
+                    return;
+                }
             }
         }
 
         // Configurable columns-per-row zoom shortcuts (default: Ctrl++ / Ctrl+-)
-        if self.config.parsed_columns_inc_key().matches(
-            key,
-            mods.control,
-            mods.alt,
-            mods.shift,
-            held_primary,
-        ) {
+        let col_inc_shortcut = self.config.parsed_columns_inc_key();
+        if !(self.search.active && col_inc_shortcut.is_bare_printable())
+            && col_inc_shortcut.matches(key, mods.control, mods.alt, mods.shift, held_primary)
+        {
             cx.stop_propagation();
             self.disarm_hold_mode();
             self.adjust_columns_by_delta(1, window, cx);
             return;
         }
-        if self.config.parsed_columns_dec_key().matches(
-            key,
-            mods.control,
-            mods.alt,
-            mods.shift,
-            held_primary,
-        ) {
+        let col_dec_shortcut = self.config.parsed_columns_dec_key();
+        if !(self.search.active && col_dec_shortcut.is_bare_printable())
+            && col_dec_shortcut.matches(key, mods.control, mods.alt, mods.shift, held_primary)
+        {
             cx.stop_propagation();
             self.disarm_hold_mode();
             self.adjust_columns_by_delta(-1, window, cx);
             return;
         }
 
+        // Ctrl+F explicitly activates / focuses overlay search
+        if key == "f" && mods.control && !mods.alt && !mods.shift {
+            cx.stop_propagation();
+            self.open_search_explicitly(window, cx);
+            return;
+        }
+
+        // Active overlay search mode: typing/IME feeds EntityInputHandler while arrows/Tab/Enter navigate matches
+        if self.search.active {
+            match key {
+                "enter" => {
+                    cx.stop_propagation();
+                    if let Some(&hwnd) = self.flat_hwnds.get(self.selected_flat) {
+                        self.activate_window(hwnd, window, cx);
+                    }
+                }
+                "backspace" => {
+                    cx.stop_propagation();
+                    let had_text = !self.search.query.is_empty();
+                    if self.search.select_all || mods.control {
+                        self.search.query.clear();
+                        self.search.select_all = false;
+                    } else {
+                        self.search.query.pop();
+                    }
+                    self.search.marked_range = None;
+                    if !self.search.opened_explicitly && self.search.query.is_empty() {
+                        self.search.active = false;
+                    }
+                    if had_text {
+                        self.apply_search_filter(window, cx);
+                    } else {
+                        cx.notify();
+                    }
+                }
+                "delete" if self.search.select_all => {
+                    cx.stop_propagation();
+                    self.search.query.clear();
+                    self.search.select_all = false;
+                    self.search.marked_range = None;
+                    if !self.search.opened_explicitly {
+                        self.search.active = false;
+                    }
+                    self.apply_search_filter(window, cx);
+                }
+                "a" if mods.control && !mods.alt && !mods.shift => {
+                    cx.stop_propagation();
+                    self.search.select_all = !self.search.query.is_empty();
+                    cx.notify();
+                }
+                "v" if mods.control && !mods.alt && !mods.shift => {
+                    cx.stop_propagation();
+                    if let Some(clip) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        let clean: String = clip.chars().filter(|c| !c.is_control()).collect();
+                        if self.search.select_all {
+                            self.search.query.clear();
+                            self.search.select_all = false;
+                        }
+                        self.search.query.push_str(&clean);
+                        self.search.marked_range = None;
+                        self.search.clamp_query();
+                        self.apply_search_filter(window, cx);
+                    }
+                }
+                "right" => {
+                    cx.stop_propagation();
+                    self.search.select_all = false;
+                    let next = navigate(
+                        &sizes,
+                        cols,
+                        self.selected_flat,
+                        NavDirection::Right,
+                        self.config.cross_desktop_nav,
+                    );
+                    self.move_selection(next, window, cx);
+                }
+                "left" => {
+                    cx.stop_propagation();
+                    self.search.select_all = false;
+                    let next = navigate(
+                        &sizes,
+                        cols,
+                        self.selected_flat,
+                        NavDirection::Left,
+                        self.config.cross_desktop_nav,
+                    );
+                    self.move_selection(next, window, cx);
+                }
+                "down" => {
+                    cx.stop_propagation();
+                    self.search.select_all = false;
+                    let next = navigate(
+                        &sizes,
+                        cols,
+                        self.selected_flat,
+                        NavDirection::Down,
+                        self.config.cross_desktop_nav,
+                    );
+                    self.move_selection(next, window, cx);
+                }
+                "up" => {
+                    cx.stop_propagation();
+                    self.search.select_all = false;
+                    let next = navigate(
+                        &sizes,
+                        cols,
+                        self.selected_flat,
+                        NavDirection::Up,
+                        self.config.cross_desktop_nav,
+                    );
+                    self.move_selection(next, window, cx);
+                }
+                "tab" => {
+                    cx.stop_propagation();
+                    self.search.select_all = false;
+                    let dir = if shift {
+                        NavDirection::Left
+                    } else {
+                        NavDirection::Right
+                    };
+                    let next = navigate(&sizes, cols, self.selected_flat, dir, true);
+                    self.move_selection(next, window, cx);
+                }
+                "home" => {
+                    cx.stop_propagation();
+                    self.search.select_all = false;
+                    let next = navigate(&sizes, cols, self.selected_flat, NavDirection::Home, true);
+                    self.move_selection(next, window, cx);
+                }
+                "end" => {
+                    cx.stop_propagation();
+                    self.search.select_all = false;
+                    let next = navigate(&sizes, cols, self.selected_flat, NavDirection::End, true);
+                    self.move_selection(next, window, cx);
+                }
+                "l" if mods.control && !mods.alt && !mods.shift => {
+                    cx.stop_propagation();
+                    self.cycle_label_position(window, cx);
+                }
+                "f" if mods.control && mods.shift && !mods.alt => {
+                    cx.stop_propagation();
+                    self.toggle_preview_fit(window, cx);
+                }
+                "f5" => {
+                    cx.stop_propagation();
+                    self.refresh_snapshot();
+                    self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
+                    self.clamp_scroll();
+                    window.refresh();
+                    cx.notify();
+                }
+                "r" if mods.control && !mods.alt && !mods.shift => {
+                    cx.stop_propagation();
+                    self.refresh_snapshot();
+                    self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
+                    self.clamp_scroll();
+                    window.refresh();
+                    cx.notify();
+                }
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9"
+                    if mods.control && !mods.alt && !mods.shift =>
+                {
+                    cx.stop_propagation();
+                    if let Ok(n) = key.parse::<usize>() {
+                        if let Some(s) = self.virtual_spaces.spaces().get(n - 1) {
+                            let sid = s.id;
+                            self.set_view_filter(ViewFilter::VirtualSpace(sid), window, cx);
+                        }
+                    }
+                }
+                _ if mods.control || mods.alt || mods.platform => {
+                    cx.stop_propagation();
+                }
+                _ => {
+                    // Leave unhandled so GPUI calls TranslateMessage -> WM_CHAR / IME composition!
+                }
+            }
+            return;
+        }
+
+        // Default type-to-search: typing any bare ASCII letter activates search immediately
+        // (supports English LIKE, Chinese software names, and Hanzi pinyin initials / full pinyin,
+        // plus live Windows Chinese IME composition).
+        if !mods.control
+            && !mods.alt
+            && !mods.platform
+            && key.len() == 1
+            && key.as_bytes()[0].is_ascii_alphabetic()
+        {
+            self.begin_type_to_search(cx);
+            return;
+        }
+
         match key {
+            "/" if !mods.control && !mods.alt && !mods.shift => {
+                cx.stop_propagation();
+                self.open_search_explicitly(window, cx);
+            }
+            "v" if mods.control && !mods.alt && !mods.shift => {
+                cx.stop_propagation();
+                if let Some(clip) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                    let clean: String = clip.chars().filter(|c| !c.is_control()).collect();
+                    if !clean.trim().is_empty() {
+                        self.disarm_hold_mode();
+                        self.clear_space_popups();
+                        self.search.active = true;
+                        self.search.opened_explicitly = false;
+                        self.search.query = clean;
+                        self.search.marked_range = None;
+                        self.search.select_all = false;
+                        self.search.clamp_query();
+                        self.apply_search_filter(window, cx);
+                    }
+                }
+            }
             "enter" | "space" => {
                 cx.stop_propagation();
                 if let Some(&hwnd) = self.flat_hwnds.get(self.selected_flat) {
@@ -4852,7 +5370,7 @@ impl SwitcherView {
                     self.start_renaming_space(sid, window, cx);
                 }
             }
-            "a" if !mods.control && !mods.alt && !mods.shift => {
+            "a" if mods.control && mods.shift && !mods.alt => {
                 if let ViewFilter::VirtualSpace(sid) = self.view_filter {
                     cx.stop_propagation();
                     self.open_add_picker(sid, window, cx);
@@ -4964,36 +5482,15 @@ impl SwitcherView {
                 let next = navigate(&sizes, cols, self.selected_flat, NavDirection::End, true);
                 self.move_selection(next, window, cx);
             }
-            // Press L to live-cycle label placement: bottom_right -> bottom_left -> center -> below
-            "l" => {
+            // Ctrl+L cycles label placement: bottom_right -> bottom_left -> center -> below
+            "l" if mods.control && !mods.alt && !mods.shift => {
                 cx.stop_propagation();
-                self.config.label_position = self.config.label_position.next();
-                self.persist_config();
-                self.transient_toast = Some((
-                    SharedString::from(format!(
-                        "标签位置：{}（已自动保存）",
-                        self.config.label_position.display_label()
-                    )),
-                    Instant::now(),
-                ));
-                self.ensure_selected_visible();
-                window.refresh();
-                cx.notify();
+                self.cycle_label_position(window, cx);
             }
-            // Press F to live-toggle fixed box fit mode: cover <-> contain
-            "f" => {
+            // Ctrl+Shift+F toggles fixed box fit mode: cover <-> contain
+            "f" if mods.control && mods.shift && !mods.alt => {
                 cx.stop_propagation();
-                self.config.preview_fit = self.config.preview_fit.toggle();
-                self.persist_config();
-                self.transient_toast = Some((
-                    SharedString::from(format!(
-                        "预览适配：{}（已自动保存）",
-                        self.config.preview_fit.display_label()
-                    )),
-                    Instant::now(),
-                ));
-                window.refresh();
-                cx.notify();
+                self.toggle_preview_fit(window, cx);
             }
             // Press bare - / = to live-tune Gaussian blur transparency
             "-" | "_" if !mods.control && !mods.alt => {
@@ -5032,7 +5529,16 @@ impl SwitcherView {
                 ));
                 cx.notify();
             }
-            "f5" | "r" => {
+            "f5" => {
+                cx.stop_propagation();
+                self.refresh_snapshot();
+                self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
+                self.clamp_scroll();
+                window.refresh();
+                cx.notify();
+            }
+            "r" if mods.control && !mods.alt && !mods.shift => {
+                cx.stop_propagation();
                 self.refresh_snapshot();
                 self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
                 self.clamp_scroll();
@@ -5040,17 +5546,20 @@ impl SwitcherView {
                 cx.notify();
             }
             // Number keys: 0 = 全部, 1..9 = filter Native Desktop 1..9, Ctrl+1..9 = filter Virtual Space 1..9
-            "0" => {
+            "0" if !mods.control && !mods.alt && !mods.shift => {
+                cx.stop_propagation();
                 self.set_view_filter(ViewFilter::All, window, cx);
             }
             "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
                 if let Ok(n) = key.parse::<usize>() {
                     if mods.control && !mods.alt && !mods.shift {
+                        cx.stop_propagation();
                         if let Some(s) = self.virtual_spaces.spaces().get(n - 1) {
                             let sid = s.id;
                             self.set_view_filter(ViewFilter::VirtualSpace(sid), window, cx);
                         }
                     } else if !mods.control && !mods.alt && !mods.shift {
+                        cx.stop_propagation();
                         if let Some(d) = self.desktops.get(n - 1) {
                             let did = d.id;
                             self.set_view_filter(ViewFilter::NativeDesktop(did), window, cx);
@@ -5441,7 +5950,9 @@ impl SwitcherView {
             && match source {
                 DesktopReorderSource::NativeTopPill(_) => self.desktops.len() >= 2,
                 DesktopReorderSource::NativeContentGroup(_) => {
-                    self.view_filter == ViewFilter::All && self.desktops.len() >= 2
+                    self.view_filter == ViewFilter::All
+                        && !self.is_search_filtering()
+                        && self.desktops.len() >= 2
                 }
                 DesktopReorderSource::VirtualSpaceTopPill(_) => {
                     self.virtual_spaces.spaces().len() >= 2
@@ -8271,9 +8782,11 @@ impl Render for SwitcherView {
         );
 
         // === FIXED-SIZE UNIFORM MISSION CONTROL GROUPS ===
-        let show_group_labels = self.groups.len() > 1;
+        let search_filtering = self.is_search_filtering();
+        let show_group_labels = self.groups.len() > 1
+            || (search_filtering && self.view_filter == ViewFilter::All && self.desktops.len() > 1);
         let can_reorder_content_groups =
-            self.view_filter == ViewFilter::All && self.desktops.len() >= 2;
+            self.view_filter == ViewFilter::All && !search_filtering && self.desktops.len() >= 2;
         let mut group_elements = Vec::with_capacity(self.groups.len());
 
         for (g_idx, group) in self.groups.iter().enumerate() {
@@ -8507,7 +9020,7 @@ impl Render for SwitcherView {
             } else {
                 let mut rows_col = div().flex().flex_col().gap(px(ROW_GAP));
                 let total_chunks = group.cards.chunks(cols).len();
-                let mut add_tile = group_vspace_id.map(|sid| {
+                let mut add_tile = group_vspace_id.filter(|_| !search_filtering).map(|sid| {
                     let below_spacer = if label_pos.is_embedded() {
                         0.0
                     } else {
@@ -9672,7 +10185,185 @@ impl Render for SwitcherView {
                                 this.dismiss_space_popups(true, cx);
                             }))
                             .children(virtual_space_pills),
-                    ),
+                    )
+                    .child({
+                        let attach_main_ime =
+                            self.renaming_space.is_none() && self.add_picker.is_none();
+                        let entity_for_search_ime = view_entity.clone();
+                        let focus_for_search_ime = focus_for_ime.clone();
+                        let search_active = self.search.active;
+                        let search_query = self.search.query.clone();
+                        let search_query_empty = search_query.is_empty();
+                        let search_all_selected = self.search.select_all && !search_query_empty;
+                        let search_composing = self.search.marked_range.is_some();
+                        let match_count = self.flat_hwnds.len();
+
+                        if search_active {
+                            div()
+                                .id("top-search-capsule")
+                                .relative()
+                                .h(px(34.0))
+                                .w(px(228.0))
+                                .px(px(12.0))
+                                .rounded_full()
+                                .cursor_text()
+                                .bg(rgba(0x0B1528C8))
+                                .border_1()
+                                .border_color(rgba(0x64D2FFAA))
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(7.0))
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.search.select_all = false;
+                                    window.focus(&this.focus_handle);
+                                    cx.notify();
+                                }))
+                                .child(search_icon_tinted(rgba(0x64D2FFEE)))
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .overflow_hidden()
+                                        .whitespace_nowrap()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .overflow_hidden()
+                                                .whitespace_nowrap()
+                                                .rounded(px(3.0))
+                                                .when(search_all_selected, |el| {
+                                                    el.bg(rgba(0x0A84FF66)).px(px(2.0))
+                                                })
+                                                .when(search_composing, |el| {
+                                                    el.border_b_1().border_color(rgba(0x64D2FFCC))
+                                                })
+                                                .text_xs()
+                                                .font_weight(gpui::FontWeight::MEDIUM)
+                                                .text_color(rgba(0xFFFFFFFA))
+                                                .child(search_query),
+                                        )
+                                        .when(!search_all_selected, |el| {
+                                            el.child(
+                                                div()
+                                                    .ml(px(1.0))
+                                                    .flex_shrink_0()
+                                                    .w(px(1.5))
+                                                    .h(px(13.0))
+                                                    .rounded(px(1.0))
+                                                    .bg(rgba(0xFFFFFFEE)),
+                                            )
+                                        }),
+                                )
+                                .when(!search_query_empty, |el| {
+                                    el.child(
+                                        div()
+                                            .flex_shrink_0()
+                                            .text_xs()
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(if match_count == 0 {
+                                                rgba(0xFF8A80EE)
+                                            } else {
+                                                rgba(0xFFFFFF78)
+                                            })
+                                            .child(match_count.to_string()),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("top-search-clear")
+                                            .size(px(16.0))
+                                            .flex_shrink_0()
+                                            .rounded_full()
+                                            .cursor_pointer()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .hover(|s| s.bg(rgba(0xFFFFFF22)))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                this.clear_search(window, cx);
+                                            }))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(rgba(0xFFFFFFAA))
+                                                    .child("×"),
+                                            ),
+                                    )
+                                })
+                                .when(attach_main_ime, |el| {
+                                    el.child(
+                                        canvas(
+                                            |bounds, _, _| bounds,
+                                            move |bounds, _, window, cx| {
+                                                window.handle_input(
+                                                    &focus_for_search_ime,
+                                                    ElementInputHandler::new(
+                                                        bounds,
+                                                        entity_for_search_ime.clone(),
+                                                    ),
+                                                    cx,
+                                                );
+                                            },
+                                        )
+                                        .absolute()
+                                        .inset_0()
+                                        .size_full(),
+                                    )
+                                })
+                        } else {
+                            div()
+                                .id("top-search-trigger")
+                                .relative()
+                                .size(px(34.0))
+                                .rounded_full()
+                                .bg(rgba(0x0B0F1866))
+                                .border_1()
+                                .border_color(rgba(0xFFFFFF18))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .when(!is_any_drag_active, |el| {
+                                    el.cursor_pointer().hover(|s| {
+                                        s.bg(rgba(0xFFFFFF22)).border_color(rgba(0xFFFFFF30))
+                                    })
+                                })
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    if this.dismiss_space_popups(true, cx) {
+                                        return;
+                                    }
+                                    this.open_search_explicitly(window, cx);
+                                }))
+                                .child(search_icon_tinted(rgba(0xFFFFFFB8)))
+                                .when(attach_main_ime, |el| {
+                                    el.child(
+                                        canvas(
+                                            |bounds, _, _| bounds,
+                                            move |bounds, _, window, cx| {
+                                                window.handle_input(
+                                                    &focus_for_search_ime,
+                                                    ElementInputHandler::new(
+                                                        bounds,
+                                                        entity_for_search_ime.clone(),
+                                                    ),
+                                                    cx,
+                                                );
+                                            },
+                                        )
+                                        .absolute()
+                                        .inset_0()
+                                        .size_full(),
+                                    )
+                                })
+                        }
+                    }),
             )
             // === FIXED-SIZE MISSION CONTROL CANVAS ===
             .child(
@@ -9747,6 +10438,37 @@ impl Render for SwitcherView {
                                     .when_some(below_new_desktop_el, |el, zone| el.child(zone)),
                             ),
                     )
+                    .when(search_filtering && self.groups.is_empty(), |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .inset_0()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .px(px(16.0))
+                                        .h(px(36.0))
+                                        .rounded_full()
+                                        .bg(rgba(0x0B0F1878))
+                                        .border_1()
+                                        .border_color(rgba(0xFFFFFF18))
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(8.0))
+                                        .child(search_icon_tinted(rgba(0xFFFFFF78)))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(gpui::FontWeight::MEDIUM)
+                                                .text_color(rgba(0xFFFFFFA8))
+                                                .child("无匹配窗口"),
+                                        ),
+                                ),
+                        )
+                    })
                     // Desktop group drag insertion indicator rail
                     .when_some(desktop_reorder_insertion_y, |el, content_y| {
                         let line_y = content_y - scroll_y;

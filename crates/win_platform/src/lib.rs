@@ -35,7 +35,8 @@ pub use virtual_desktop::{
     ComProbeStatus, DesktopId, VirtualDesktopClient, VirtualDesktopInfo, WindowDesktopLookup,
 };
 pub use window_enum::{
-    MonitorInfo, WindowInfo, enumerate_monitors, enumerate_windows, refresh_window_geometry,
+    MonitorInfo, WindowInfo, enumerate_monitors, enumerate_windows, query_exe_app_name,
+    refresh_window_geometry,
 };
 pub use window_icon::{IconBgra, extract_window_icon};
 pub use window_switch::{

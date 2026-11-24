@@ -1,6 +1,7 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::path::Path;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::Result;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, HWND, LPARAM, RECT};
@@ -13,6 +14,10 @@ use windows::Win32::Graphics::Gdi::{
     MonitorFromRect, MonitorFromWindow,
 };
 use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
+use windows::Win32::Storage::FileSystem::{
+    FILE_VER_GET_LOCALISED, GetFileVersionInfoExW, GetFileVersionInfoSizeExW,
+    GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW,
+};
 use windows::Win32::System::Threading::{
     OpenProcess, OpenProcessToken, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     QueryFullProcessImageNameW,
@@ -24,7 +29,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed, SW_SHOWMAXIMIZED,
     WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
-use windows_core::{BOOL, PWSTR};
+use windows_core::{BOOL, HSTRING, PCWSTR, PWSTR};
 
 use crate::virtual_desktop::{DesktopId, VirtualDesktopClient, VirtualDesktopInfo};
 
@@ -46,6 +51,7 @@ pub struct WindowInfo {
     pub hwnd: isize,
     pub pid: u32,
     pub process_name: String,
+    pub app_name: String,
     pub exe_path: String,
     pub class_name: String,
     pub title: String,
@@ -326,6 +332,174 @@ fn query_process_info(pid: u32) -> (String, String, Option<bool>) {
     (process_name, exe_path, is_elevated)
 }
 
+fn is_generic_product_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    (lower.contains("windows") && lower.contains("operating system"))
+        || name.contains("操作系统")
+        || lower == "application frame host"
+}
+
+fn ver_query_string(buf: &[u8], sub_block: &str) -> Option<String> {
+    let wide_sub = HSTRING::from(sub_block);
+    let mut ptr: *mut c_void = std::ptr::null_mut();
+    let mut len: u32 = 0;
+    let ok = unsafe {
+        VerQueryValueW(
+            buf.as_ptr() as *const c_void,
+            PCWSTR(wide_sub.as_ptr()),
+            &mut ptr,
+            &mut len,
+        )
+    };
+    if !ok.as_bool() || ptr.is_null() || len == 0 {
+        return None;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(ptr as *const u16, len as usize) };
+    let nul_pos = slice.iter().position(|&c| c == 0).unwrap_or(slice.len());
+    let text = String::from_utf16_lossy(&slice[..nul_pos]).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+fn read_version_info_bytes(exe_path: &str) -> Option<Vec<u8>> {
+    let wide = HSTRING::from(exe_path);
+    let mut handle = 0u32;
+    let size = unsafe {
+        GetFileVersionInfoSizeExW(FILE_VER_GET_LOCALISED, PCWSTR(wide.as_ptr()), &mut handle)
+    };
+    if size > 0 {
+        let mut buf = vec![0u8; size as usize];
+        if unsafe {
+            GetFileVersionInfoExW(
+                FILE_VER_GET_LOCALISED,
+                PCWSTR(wide.as_ptr()),
+                None,
+                size,
+                buf.as_mut_ptr() as *mut c_void,
+            )
+        }
+        .is_ok()
+        {
+            return Some(buf);
+        }
+    }
+
+    let size = unsafe { GetFileVersionInfoSizeW(PCWSTR(wide.as_ptr()), None) };
+    if size == 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; size as usize];
+    unsafe {
+        GetFileVersionInfoW(
+            PCWSTR(wide.as_ptr()),
+            None,
+            size,
+            buf.as_mut_ptr() as *mut c_void,
+        )
+    }
+    .ok()?;
+    Some(buf)
+}
+
+fn extract_exe_app_name_uncached(exe_path: &str) -> String {
+    if exe_path.is_empty() {
+        return String::new();
+    }
+    if Path::new(exe_path)
+        .file_name()
+        .is_some_and(|n| n.eq_ignore_ascii_case("ApplicationFrameHost.exe"))
+    {
+        return String::new();
+    }
+
+    let Some(buf) = read_version_info_bytes(exe_path) else {
+        return String::new();
+    };
+
+    let mut translations: Vec<(u16, u16)> = Vec::new();
+    let trans_sub = HSTRING::from(r"\VarFileInfo\Translation");
+    let mut trans_ptr: *mut c_void = std::ptr::null_mut();
+    let mut trans_bytes: u32 = 0;
+    if unsafe {
+        VerQueryValueW(
+            buf.as_ptr() as *const c_void,
+            PCWSTR(trans_sub.as_ptr()),
+            &mut trans_ptr,
+            &mut trans_bytes,
+        )
+    }
+    .as_bool()
+        && !trans_ptr.is_null()
+        && trans_bytes >= 4
+    {
+        let pair_count = (trans_bytes as usize) / 4;
+        let words = unsafe { std::slice::from_raw_parts(trans_ptr as *const u16, pair_count * 2) };
+        for &[lang, cp] in words.as_chunks::<2>().0 {
+            translations.push((lang, cp));
+        }
+    }
+
+    // Prefer Chinese localized string tables (primary lang ID 0x0004: zh-CN / zh-TW / zh-HK) first.
+    translations.sort_by_key(|&(lang, _)| if (lang & 0x03FF) == 0x0004 { 0u8 } else { 1u8 });
+
+    for fallback in [(0x0804u16, 0x04B0u16), (0x0409, 0x04B0), (0x0409, 0x04E4)] {
+        if !translations.contains(&fallback) {
+            translations.push(fallback);
+        }
+    }
+
+    let mut names: Vec<String> = Vec::new();
+    fn push_unique(names: &mut Vec<String>, candidate: String) {
+        let trimmed = candidate.trim();
+        if trimmed.is_empty() || is_generic_product_name(trimmed) || names.len() >= 3 {
+            return;
+        }
+        let cand_lower = trimmed.to_lowercase();
+        if names
+            .iter()
+            .any(|existing| existing.to_lowercase().contains(&cand_lower))
+        {
+            return;
+        }
+        names.push(trimmed.to_string());
+    }
+
+    for (lang, cp) in translations {
+        let prefix = format!(r"\StringFileInfo\{lang:04x}{cp:04x}");
+        if let Some(desc) = ver_query_string(&buf, &format!(r"{prefix}\FileDescription")) {
+            push_unique(&mut names, desc);
+        }
+        if let Some(prod) = ver_query_string(&buf, &format!(r"{prefix}\ProductName")) {
+            push_unique(&mut names, prod);
+        }
+        if names.len() >= 3 {
+            break;
+        }
+    }
+
+    names.join(" ")
+}
+
+/// Resolves localized application display names (`FileDescription` / `ProductName`) from an
+/// executable's PE version resource, cached per path so repeated window enumerations do zero I/O.
+pub fn query_exe_app_name(exe_path: &str) -> String {
+    if exe_path.is_empty() {
+        return String::new();
+    }
+    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let key = exe_path.to_ascii_lowercase();
+    if let Ok(guard) = cache.lock()
+        && let Some(cached) = guard.get(&key)
+    {
+        return cached.clone();
+    }
+    let resolved = extract_exe_app_name_uncached(exe_path);
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(key, resolved.clone());
+    }
+    resolved
+}
+
 /// Raymond Chen's Alt-Tab root owner / last active popup walk.
 fn passes_alt_tab_owner_walk(hwnd: HWND) -> bool {
     let mut hwnd_walk = unsafe { GetAncestor(hwnd, GA_ROOTOWNER) };
@@ -452,6 +626,7 @@ pub fn enumerate_windows(
         let mut pid = 0u32;
         unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
         let (process_name, exe_path, is_elevated) = query_process_info(pid);
+        let app_name = query_exe_app_name(&exe_path);
 
         // Determine desktop assignment
         let desktop_id = if lookup.is_pinned {
@@ -472,6 +647,7 @@ pub fn enumerate_windows(
             hwnd: raw_id,
             pid,
             process_name,
+            app_name,
             exe_path,
             class_name,
             title,
@@ -491,4 +667,30 @@ pub fn enumerate_windows(
     }
 
     Ok(windows_out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn query_exe_app_name_skips_uwp_host_and_reads_real_system_exe() {
+        assert_eq!(
+            query_exe_app_name(r"C:\Windows\System32\ApplicationFrameHost.exe"),
+            ""
+        );
+        assert_eq!(query_exe_app_name(""), "");
+
+        let notepad = r"C:\Windows\System32\notepad.exe";
+        if Path::new(notepad).exists() {
+            let first = query_exe_app_name(notepad);
+            let second = query_exe_app_name(notepad);
+            assert!(!first.is_empty(), "expected non-empty version name for notepad.exe");
+            assert_eq!(first, second);
+            assert!(
+                !first.to_ascii_lowercase().contains("operating system"),
+                "generic OS product name should be filtered out, got: {first}"
+            );
+        }
+    }
 }
