@@ -1593,6 +1593,8 @@ impl SwitcherView {
     }
 
     fn apply_search_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.flush_genie_anim_now();
+        self.below_new_desktop_anim.reset_immediate();
         self.tab_anim = None;
         self.reflow_anim = None;
         self.selection_anim = None;
@@ -10206,7 +10208,7 @@ impl Render for SwitcherView {
                                 .w(px(228.0))
                                 .px(px(12.0))
                                 .rounded_full()
-                                .cursor_text()
+                                .when(!is_any_drag_active, |el| el.cursor_text())
                                 .bg(rgba(0x0B1528C8))
                                 .border_1()
                                 .border_color(rgba(0x64D2FFAA))
@@ -10280,11 +10282,12 @@ impl Render for SwitcherView {
                                             .size(px(16.0))
                                             .flex_shrink_0()
                                             .rounded_full()
-                                            .cursor_pointer()
                                             .flex()
                                             .items_center()
                                             .justify_center()
-                                            .hover(|s| s.bg(rgba(0xFFFFFF22)))
+                                            .when(!is_any_drag_active, |el| {
+                                                el.cursor_pointer().hover(|s| s.bg(rgba(0xFFFFFF22)))
+                                            })
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 cx.stop_propagation();
                                                 this.clear_search(window, cx);
@@ -10438,7 +10441,12 @@ impl Render for SwitcherView {
                                     .when_some(below_new_desktop_el, |el, zone| el.child(zone)),
                             ),
                     )
-                    .when(search_filtering && self.groups.is_empty(), |el| {
+                    .when(
+                        search_filtering
+                            && self.groups.is_empty()
+                            && !self.below_new_desktop_anim.is_visible()
+                            && self.genie_anim.is_none(),
+                        |el| {
                         el.child(
                             div()
                                 .absolute()
