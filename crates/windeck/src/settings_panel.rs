@@ -12,15 +12,13 @@ use win_platform::{
 };
 
 use crate::config::{
-    AppConfig, ColumnsConfig, LabelPosition, LocalShortcut, PreviewFit, TransitionEffect,
-    append_log, config_dir,
+    AppConfig, ColumnsConfig, LabelPosition, LocalShortcut, PreviewFit, append_log, config_dir,
 };
 use crate::switcher_view::SwitcherView;
 use crate::update_dialog::UpdateStatus;
 
 const SHEET_W: f32 = 500.0;
-const SHEET_CONTENT_EST_H: f32 = 805.0;
-const SHEET_TRANSITION_SUB_H: f32 = 114.0;
+const SHEET_CONTENT_EST_H: f32 = 760.0;
 
 /// Minimalist 3-slider icon matching the hairline weight of the top Spaces bar.
 fn sliders_icon() -> Div {
@@ -79,27 +77,6 @@ fn setting_row(label: &'static str, control: impl IntoElement) -> Div {
                 .text_xs()
                 .font_weight(gpui::FontWeight::MEDIUM)
                 .text_color(rgba(0xFFFFFFCC))
-                .child(label),
-        )
-        .child(control)
-}
-
-fn sub_setting_row(label: &'static str, control: impl IntoElement) -> Div {
-    div()
-        .w_full()
-        .min_h(px(36.0))
-        .py(px(4.0))
-        .pl(px(14.0))
-        .flex()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .gap(px(16.0))
-        .child(
-            div()
-                .text_xs()
-                .font_weight(gpui::FontWeight::NORMAL)
-                .text_color(rgba(0xFFFFFF99))
                 .child(label),
         )
         .child(control)
@@ -429,10 +406,6 @@ impl SwitcherView {
         let background = self.config.background;
         let blur_pct = (self.config.blur_opacity * 100.0).round() as i32;
         let blur_ratio = ((self.config.blur_opacity - 0.05) / 0.80).clamp(0.0, 1.0);
-        let transition = self.config.transition_effect;
-        let tr_tab = self.config.transition_tab;
-        let tr_sel = self.config.transition_selection;
-        let tr_switch = self.config.transition_switch;
         let immersive = self.config.immersive;
         let monitor = self.config.monitor;
         let cross_nav = self.config.cross_desktop_nav;
@@ -539,13 +512,7 @@ impl SwitcherView {
             );
 
         let avail_h = (self.viewport_height_px.get() - 96.0).max(260.0);
-        let est_content_h = SHEET_CONTENT_EST_H
-            + if transition.is_enabled() {
-                SHEET_TRANSITION_SUB_H
-            } else {
-                0.0
-            };
-        let max_scroll = (est_content_h - avail_h).max(0.0);
+        let max_scroll = (SHEET_CONTENT_EST_H - avail_h).max(0.0);
         let scroll_y = self.settings_scroll_y.clamp(0.0, max_scroll);
 
         // Hotkey row: [ Ctrl | Alt | Win ] + [ Q ]
@@ -964,49 +931,6 @@ impl SwitcherView {
                     .child(format!("{blur_pct}%")),
             );
 
-        // Transition effect row: [ 关闭 | 轻盈 | 流畅 | 灵动 ]
-        let transition_control = pill_group()
-            .child(glass_pill(
-                "tr-off",
-                "关闭",
-                transition == TransitionEffect::Off,
-                cx.listener(|this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.config.transition_effect = TransitionEffect::Off;
-                    this.apply_visual_and_save(window, cx);
-                }),
-            ))
-            .child(glass_pill(
-                "tr-subtle",
-                "轻盈",
-                transition == TransitionEffect::Subtle,
-                cx.listener(|this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.config.transition_effect = TransitionEffect::Subtle;
-                    this.apply_visual_and_save(window, cx);
-                }),
-            ))
-            .child(glass_pill(
-                "tr-smooth",
-                "流畅",
-                transition == TransitionEffect::Smooth,
-                cx.listener(|this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.config.transition_effect = TransitionEffect::Smooth;
-                    this.apply_visual_and_save(window, cx);
-                }),
-            ))
-            .child(glass_pill(
-                "tr-spring",
-                "灵动",
-                transition == TransitionEffect::Spring,
-                cx.listener(|this, _, window, cx| {
-                    cx.stop_propagation();
-                    this.config.transition_effect = TransitionEffect::Spring;
-                    this.apply_visual_and_save(window, cx);
-                }),
-            ));
-
         // Monitor policy row
         let monitor_control = pill_group()
             .child(glass_pill(
@@ -1163,46 +1087,6 @@ impl SwitcherView {
                                     .child(setting_row("背景效果", bg_control))
                                     .child(row_divider())
                                     .child(setting_row("背景暗度", blur_control))
-                                    .child(row_divider())
-                                    .child(setting_row("转场特效", transition_control))
-                                    .when(transition.is_enabled(), |el| {
-                                        el.child(sub_setting_row(
-                                            "桌面标签过渡",
-                                            minimal_switch(
-                                                "sw-tr-tab",
-                                                tr_tab,
-                                                cx.listener(move |this, _, window, cx| {
-                                                    cx.stop_propagation();
-                                                    this.config.transition_tab = !tr_tab;
-                                                    this.apply_visual_and_save(window, cx);
-                                                }),
-                                            ),
-                                        ))
-                                        .child(sub_setting_row(
-                                            "焦点与滚动平滑",
-                                            minimal_switch(
-                                                "sw-tr-sel",
-                                                tr_sel,
-                                                cx.listener(move |this, _, window, cx| {
-                                                    cx.stop_propagation();
-                                                    this.config.transition_selection = !tr_sel;
-                                                    this.apply_visual_and_save(window, cx);
-                                                }),
-                                            ),
-                                        ))
-                                        .child(sub_setting_row(
-                                            "切窗与桌面转场",
-                                            minimal_switch(
-                                                "sw-tr-switch",
-                                                tr_switch,
-                                                cx.listener(move |this, _, window, cx| {
-                                                    cx.stop_propagation();
-                                                    this.config.transition_switch = !tr_switch;
-                                                    this.apply_visual_and_save(window, cx);
-                                                }),
-                                            ),
-                                        ))
-                                    })
                                     .child(row_divider())
                                     .child(setting_row("弹出屏幕", monitor_control))
                                     .child(row_divider())

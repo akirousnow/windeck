@@ -104,8 +104,6 @@ impl PreviewFit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransitionEffect {
     Off,
-    Subtle,
-    Smooth,
     Spring,
 }
 
@@ -113,9 +111,9 @@ impl TransitionEffect {
     pub fn parse(val: &str) -> Option<Self> {
         match val.to_ascii_lowercase().replace('-', "_").as_str() {
             "off" | "none" | "false" | "disabled" => Some(Self::Off),
-            "subtle" | "light" | "fast" | "minimal" => Some(Self::Subtle),
-            "smooth" | "standard" | "default" | "normal" => Some(Self::Smooth),
-            "spring" | "dynamic" | "bouncy" => Some(Self::Spring),
+            "spring" | "dynamic" | "bouncy" | "on" | "true" | "enabled" | "smooth" | "subtle" => {
+                Some(Self::Spring)
+            }
             _ => None,
         }
     }
@@ -123,14 +121,12 @@ impl TransitionEffect {
     pub fn as_config_str(self) -> &'static str {
         match self {
             Self::Off => "off",
-            Self::Subtle => "subtle",
-            Self::Smooth => "smooth",
             Self::Spring => "spring",
         }
     }
 
     pub fn is_enabled(self) -> bool {
-        !matches!(self, Self::Off)
+        matches!(self, Self::Spring)
     }
 }
 
@@ -272,7 +268,7 @@ impl Default for AppConfig {
             columns: ColumnsConfig::Auto,
             background: BackdropStyle::Blurred,
             blur_opacity: 0.28,
-            transition_effect: TransitionEffect::Smooth,
+            transition_effect: TransitionEffect::Spring,
             transition_tab: true,
             transition_selection: true,
             transition_switch: true,
@@ -323,13 +319,13 @@ background = "blurred"
 # 毛玻璃背景暗色叠加浓度 (0.05 ~ 0.85，越小高斯模糊越通透；界面内按 - / = 键可实时微调)
 blur_opacity = 0.28
 
-# 转场特效风格: "off" (关闭) | "subtle" (轻盈) | "smooth" (流畅，默认) | "spring" (灵动)
-transition_effect = "smooth"
+# 转场特效（仅支持通过配置文件修改）: "spring" (灵动，默认开启) | "off" (关闭)
+transition_effect = "spring"
 
-# 转场特效分场景开关（仅当 transition_effect != "off" 时生效）:
+# 转场特效分场景开关（仅当 transition_effect = "spring" 时生效，仅支持通过配置文件修改）:
 #   transition_tab       = 顶部虚拟桌面标签切换过渡（共有卡片滑移 + 交叉淡入淡出）
 #   transition_selection = 键盘 Tab / 方向键焦点框滑移与平滑滚动
-#   transition_switch    = 确认切窗口缩放飞向目标位置与双击切桌面平滑过渡
+#   transition_switch    = 确认切窗口与跨桌面两阶段转场特效
 transition_tab = true
 transition_selection = true
 transition_switch = true
@@ -572,7 +568,7 @@ background = "{background}"
 # 毛玻璃背景暗色叠加浓度 (0.05 ~ 0.85，越小高斯模糊越通透；界面内按 - / = 键可实时微调)
 blur_opacity = {blur_opacity:.2}
 
-# 转场特效风格: "off" (关闭) | "subtle" (轻盈) | "smooth" (流畅) | "spring" (灵动)
+# 转场特效（仅支持通过配置文件修改）: "spring" (灵动) | "off" (关闭)
 transition_effect = "{transition_effect}"
 transition_tab = {transition_tab}
 transition_selection = {transition_selection}
@@ -701,6 +697,15 @@ mod tests {
         assert_eq!(round_tripped.transition_selection, cfg.transition_selection);
         assert_eq!(round_tripped.transition_switch, cfg.transition_switch);
         assert_eq!(round_tripped.columns, cfg.columns);
+
+        let default_cfg = AppConfig::default();
+        assert_eq!(default_cfg.transition_effect, TransitionEffect::Spring);
+        assert!(default_cfg.tab_transition_enabled());
+        assert!(default_cfg.selection_transition_enabled());
+        assert!(default_cfg.switch_transition_enabled());
+
+        let legacy_cfg = AppConfig::parse("transition_effect = \"smooth\"\n");
+        assert_eq!(legacy_cfg.transition_effect, TransitionEffect::Spring);
 
         let off_cfg = AppConfig::parse("transition_effect = \"off\"\ntransition_tab = true\n");
         assert_eq!(off_cfg.transition_effect, TransitionEffect::Off);
