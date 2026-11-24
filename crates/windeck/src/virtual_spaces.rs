@@ -229,6 +229,23 @@ impl VirtualSpaceStore {
         Some(removed.name)
     }
 
+    /// Reorders `id` to `target_index` (clamped to valid range). Returns `true` if order changed.
+    pub fn move_space(&mut self, id: SpaceId, target_index: usize) -> bool {
+        let Some(from_index) = self.spaces.iter().position(|s| s.id == id) else {
+            return false;
+        };
+        if self.spaces.len() <= 1 {
+            return false;
+        }
+        let clamped_target = target_index.min(self.spaces.len() - 1);
+        if from_index == clamped_target {
+            return false;
+        }
+        let space = self.spaces.remove(from_index);
+        self.spaces.insert(clamped_target, space);
+        true
+    }
+
     fn alloc_rule_id(&mut self) -> RuleId {
         let id = RuleId(self.next_rule_id);
         self.next_rule_id = self.next_rule_id.saturating_add(1);
@@ -1271,5 +1288,32 @@ mod tests {
         assert_eq!(loaded.live_count(s1, &[win]), 1);
         assert_eq!(loaded.delete_space(s2), Some("空间 2".to_string()));
         assert_eq!(loaded.spaces().len(), 1);
+    }
+
+    #[test]
+    fn move_space_reorders_cleanly_and_persists_through_json() {
+        let mut store = VirtualSpaceStore::new();
+        let s1 = store.create_space(Some("工作".to_string()));
+        let s2 = store.create_space(Some("聊天".to_string()));
+        let s3 = store.create_space(Some("文档".to_string()));
+
+        // No-op & unknown id
+        assert!(!store.move_space(s1, 0));
+        assert!(!store.move_space(SpaceId(999), 1));
+
+        // Move forward: [s1, s2, s3] -> [s2, s3, s1]
+        assert!(store.move_space(s1, 99));
+        let ids: Vec<SpaceId> = store.spaces().iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec![s2, s3, s1]);
+
+        // Move backward: [s2, s3, s1] -> [s3, s2, s1]
+        assert!(store.move_space(s3, 0));
+        let ids: Vec<SpaceId> = store.spaces().iter().map(|s| s.id).collect();
+        assert_eq!(ids, vec![s3, s2, s1]);
+
+        // Persisted JSON preserves reordered array order
+        let reloaded = VirtualSpaceStore::from_json(&store.to_json()).expect("round-trip json");
+        let reloaded_ids: Vec<SpaceId> = reloaded.spaces().iter().map(|s| s.id).collect();
+        assert_eq!(reloaded_ids, vec![s3, s2, s1]);
     }
 }

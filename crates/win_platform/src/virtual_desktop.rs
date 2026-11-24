@@ -486,6 +486,31 @@ impl InternalVdm {
         Ok(unsafe { self.wrap_raw_desktop(raw) })
     }
 
+    fn supports_move_desktop(&self) -> bool {
+        !matches!(self, InternalVdm::Win10(_))
+    }
+
+    unsafe fn move_desktop(
+        &self,
+        desktop: &ComVirtualDesktop,
+        index: i32,
+    ) -> windows_core::Result<()> {
+        let hr = match self {
+            InternalVdm::Win11_24H2(v) => unsafe { v.move_desktop(desktop.as_raw(), index) },
+            InternalVdm::Win11_23H2Late(v) => unsafe { v.move_desktop(desktop.as_raw(), index) },
+            InternalVdm::Win11_23H2Early(v) => unsafe { v.move_desktop(desktop.as_raw(), index) },
+            InternalVdm::Win11_21H2(v) => unsafe {
+                v.move_desktop(desktop.as_raw(), HMONITOR::default(), index)
+            },
+            InternalVdm::Win10(_) => {
+                return Err(windows_core::Error::from(
+                    windows::Win32::Foundation::E_NOTIMPL,
+                ));
+            }
+        };
+        hr.ok()
+    }
+
     unsafe fn remove_desktop(
         &self,
         destroy: &ComVirtualDesktop,
@@ -896,6 +921,60 @@ impl ComSession {
         Err(anyhow!("CreateDesktop failed after reconnect retry"))
     }
 
+    fn move_desktop(&mut self, desktop_id: DesktopId, target_index: usize) -> Result<()> {
+        if desktop_id.is_zero() {
+            return Err(anyhow!("无效的虚拟桌面 ID"));
+        }
+        for attempt in 0..2 {
+            let Some(ref internal) = self.internal else {
+                return Err(anyhow!("当前系统不支持通过内部 COM 调整虚拟桌面顺序"));
+            };
+            if !internal.supports_move_desktop() {
+                return Err(anyhow!("当前 Windows 版本不支持调整虚拟桌面顺序"));
+            }
+            let list = match self.list_com_desktops() {
+                Ok((list, _)) => list,
+                Err(e) if attempt == 0 && is_rpc_disconnect(&e) => {
+                    *self = ComSession::connect();
+                    continue;
+                }
+                Err(e) => return Err(anyhow!("获取虚拟桌面列表失败：{e}")),
+            };
+            if target_index >= list.len() {
+                return Err(anyhow!(
+                    "目标桌面位置 {} 超出范围（共 {} 个桌面）",
+                    target_index,
+                    list.len()
+                ));
+            }
+            let mut found_idx = None;
+            for (idx, d) in list.iter().enumerate() {
+                if unsafe { d.get_id() }.ok() == Some(desktop_id) {
+                    found_idx = Some(idx);
+                    break;
+                }
+            }
+            let Some(current_idx) = found_idx else {
+                return Err(anyhow!("目标桌面 {} 不存在", desktop_id));
+            };
+            if current_idx == target_index {
+                return Ok(());
+            }
+            let desktop = &list[current_idx];
+            if let Some(ref internal) = self.internal {
+                match unsafe { internal.move_desktop(desktop, target_index as i32) } {
+                    Ok(()) => return Ok(()),
+                    Err(e) if attempt == 0 && is_rpc_disconnect(&e) => {
+                        *self = ComSession::connect();
+                        continue;
+                    }
+                    Err(e) => return Err(anyhow!("MoveDesktop 失败：{e}")),
+                }
+            }
+        }
+        Err(anyhow!("MoveDesktop 在 COM 重连后仍然失败"))
+    }
+
     fn remove_desktop(&mut self, destroy_id: DesktopId, fallback_id: DesktopId) -> Result<()> {
         for attempt in 0..2 {
             let list = match self.list_com_desktops() {
@@ -1031,6 +1110,7 @@ enum Command {
     QueryWindows(Vec<isize>, mpsc::Sender<HashMap<isize, WindowDesktopLookup>>),
     SwitchToDesktop(DesktopId, mpsc::Sender<Result<()>>),
     CreateDesktop(mpsc::Sender<Result<DesktopId>>),
+    MoveDesktop(DesktopId, usize, mpsc::Sender<Result<()>>),
     RemoveDesktop(DesktopId, DesktopId, mpsc::Sender<Result<()>>),
     MoveWindowToDesktop(isize, DesktopId, mpsc::Sender<Result<()>>),
     Reconnect(mpsc::Sender<ComProbeStatus>),
@@ -1072,6 +1152,9 @@ impl VirtualDesktopClient {
                         }
                         Command::CreateDesktop(reply) => {
                             let _ = reply.send(session.create_desktop());
+                        }
+                        Command::MoveDesktop(id, target_index, reply) => {
+                            let _ = reply.send(session.move_desktop(id, target_index));
                         }
                         Command::RemoveDesktop(destroy_id, fallback_id, reply) => {
                             let _ = reply.send(session.remove_desktop(destroy_id, fallback_id));
@@ -1134,6 +1217,14 @@ impl VirtualDesktopClient {
         rx.recv().context("recv create_desktop")?
     }
 
+    pub fn move_desktop(&self, id: DesktopId, target_index: usize) -> Result<()> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(Command::MoveDesktop(id, target_index, tx))
+            .map_err(|_| anyhow!("vdm worker stopped"))?;
+        rx.recv().context("recv move_desktop")?
+    }
+
     pub fn remove_desktop(&self, destroy_id: DesktopId, fallback_id: DesktopId) -> Result<()> {
         let (tx, rx) = mpsc::channel();
         self.tx
@@ -1178,5 +1269,67 @@ mod tests {
         let dummy_desktop = DesktopId(GUID::zeroed());
         assert!(client.move_window_to_desktop(0, dummy_desktop).is_err());
         assert!(client.move_window_to_desktop(0x7FFF_1234, dummy_desktop).is_err());
+    }
+
+    #[test]
+    fn move_desktop_validates_id_bounds_and_noop_safely() {
+        let client = VirtualDesktopClient::new().expect("start VDM STA worker");
+        let zero_id = DesktopId(GUID::zeroed());
+        assert!(client.move_desktop(zero_id, 0).is_err());
+
+        let unknown_id = DesktopId(GUID::from_u128(0xDEAD_BEEF_1234_5678_9ABC_DEF0_1122_3344));
+        assert!(client.move_desktop(unknown_id, 0).is_err());
+
+        if let Ok(desktops) = client.get_desktops() {
+            if let Some(first) = desktops.first() {
+                // Out-of-range target index must always be rejected without touching OS state
+                assert!(client.move_desktop(first.id, desktops.len() + 5).is_err());
+                // Moving to its own current index is a safe no-op on Win11 (or Err on Win10)
+                if OsVersion::current().is_ok_and(|v| v.build >= 22000) {
+                    assert!(client.move_desktop(first.id, 0).is_ok());
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "temporarily swaps first two live OS virtual desktops and restores exact original order"]
+    fn live_move_desktop_round_trip_on_win11() {
+        let os = OsVersion::current().expect("query OsVersion");
+        eprintln!("OS: {os}");
+        let client = VirtualDesktopClient::new().expect("start VDM STA worker");
+        let probe = client.reconnect().expect("probe COM");
+        eprintln!("COM probe: {probe:?}");
+
+        let before = client.get_desktops().expect("list desktops before");
+        let before_ids: Vec<DesktopId> = before.iter().map(|d| d.id).collect();
+        eprintln!("Desktops before ({}): {:?}", before_ids.len(), before_ids);
+        if before_ids.len() < 2 {
+            eprintln!("Skipping live swap: fewer than 2 desktops exist");
+            return;
+        }
+
+        let moved_id = before_ids[0];
+        let target_idx = before_ids.len() - 1;
+        client
+            .move_desktop(moved_id, target_idx)
+            .expect("move desktop 0 to last index");
+
+        let mid = client.get_desktops().expect("list desktops after forward move");
+        let mid_ids: Vec<DesktopId> = mid.iter().map(|d| d.id).collect();
+        eprintln!("Desktops mid: {:?}", mid_ids);
+
+        // Always restore original order even if assertion fails below
+        let restore_res = client.move_desktop(moved_id, 0);
+        let after = client.get_desktops().expect("list desktops after restore");
+        let after_ids: Vec<DesktopId> = after.iter().map(|d| d.id).collect();
+        eprintln!("Desktops restored: {:?}", after_ids);
+
+        let mut expected_mid = before_ids.clone();
+        let item = expected_mid.remove(0);
+        expected_mid.insert(target_idx, item);
+        assert_eq!(mid_ids, expected_mid, "MoveDesktop(0 -> last) should land at exact target_idx");
+        restore_res.expect("restore desktop back to index 0");
+        assert_eq!(after_ids, before_ids, "desktop order must be restored cleanly");
     }
 }
