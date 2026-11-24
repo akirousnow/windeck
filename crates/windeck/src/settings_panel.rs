@@ -12,14 +12,14 @@ use win_platform::{
 };
 
 use crate::config::{
-    AppConfig, ColumnsConfig, LabelPosition, LocalShortcut, MoveDesktopModifier, PreviewFit,
-    append_log, config_dir,
+    AppConfig, COLUMNS_HARD_MAX, COLUMNS_HARD_MIN, ColumnsConfig, LabelPosition, LocalShortcut,
+    MoveDesktopModifier, PreviewFit, append_log, config_dir,
 };
 use crate::switcher_view::SwitcherView;
 use crate::update_dialog::UpdateStatus;
 
 const SHEET_W: f32 = 500.0;
-const SHEET_CONTENT_EST_H: f32 = 925.0;
+const SHEET_CONTENT_EST_H: f32 = 1015.0;
 
 /// Minimalist 3-slider icon matching the hairline weight of the top Spaces bar.
 fn sliders_icon() -> Div {
@@ -265,6 +265,13 @@ fn mini_step(
 }
 
 impl SwitcherView {
+    pub(crate) fn clear_shortcut_recordings(&mut self) {
+        self.recording_hotkey_letter = false;
+        self.recording_force_quit_key = false;
+        self.recording_columns_inc_key = false;
+        self.recording_columns_dec_key = false;
+    }
+
     pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.visible {
             self.show_and_refresh(window, cx);
@@ -275,8 +282,7 @@ impl SwitcherView {
         // Clear live DWM thumbnails while in Settings so Layer 1 exposes pure, unobstructed Gaussian blur
         self.thumbs.borrow_mut().unregister_all();
         self.settings_open = true;
-        self.recording_hotkey_letter = false;
-        self.recording_force_quit_key = false;
+        self.clear_shortcut_recordings();
         self.settings_error = None;
         self.win_arrow_patch_error = None;
         self.settings_scroll_y = 0.0;
@@ -291,8 +297,7 @@ impl SwitcherView {
             return;
         }
         self.settings_open = false;
-        self.recording_hotkey_letter = false;
-        self.recording_force_quit_key = false;
+        self.clear_shortcut_recordings();
         self.settings_error = None;
         self.win_arrow_patch_error = None;
         // Immediately restore live DWM thumbnails for the Mission Control grid
@@ -353,10 +358,38 @@ impl SwitcherView {
     ) {
         let label = shortcut.canonical_label();
         self.config.force_quit_key = label.clone();
-        self.recording_force_quit_key = false;
+        self.clear_shortcut_recordings();
         self.settings_error = None;
         self.persist_config();
         append_log(&format!("FORCE_QUIT_KEY UPDATED -> {label}"));
+        cx.notify();
+    }
+
+    pub(crate) fn apply_columns_inc_key_change(
+        &mut self,
+        shortcut: LocalShortcut,
+        cx: &mut Context<Self>,
+    ) {
+        let label = shortcut.canonical_label();
+        self.config.columns_inc_key = label.clone();
+        self.clear_shortcut_recordings();
+        self.settings_error = None;
+        self.persist_config();
+        append_log(&format!("COLUMNS_INC_KEY UPDATED -> {label}"));
+        cx.notify();
+    }
+
+    pub(crate) fn apply_columns_dec_key_change(
+        &mut self,
+        shortcut: LocalShortcut,
+        cx: &mut Context<Self>,
+    ) {
+        let label = shortcut.canonical_label();
+        self.config.columns_dec_key = label.clone();
+        self.clear_shortcut_recordings();
+        self.settings_error = None;
+        self.persist_config();
+        append_log(&format!("COLUMNS_DEC_KEY UPDATED -> {label}"));
         cx.notify();
     }
 
@@ -454,15 +487,18 @@ impl SwitcherView {
             self.win_arrow_patch_error = None;
         }
         self.config = defaults;
-        self.recording_hotkey_letter = false;
-        self.recording_force_quit_key = false;
+        self.clear_shortcut_recordings();
         self.apply_geometry_and_save(window, cx);
         self.transient_toast = Some((SharedString::from("已恢复默认"), Instant::now()));
         cx.notify();
     }
 
     /// Quiet circular frosted icon button in the bottom-right corner — matches top Spaces bar glass.
-    pub(crate) fn render_settings_trigger(&self, cx: &mut Context<Self>) -> gpui::Stateful<Div> {
+    pub(crate) fn render_settings_trigger(
+        &self,
+        suppress_hover: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
         div()
             .id("windeck-settings-trigger")
             .absolute()
@@ -470,14 +506,16 @@ impl SwitcherView {
             .right(px(24.0))
             .size(px(34.0))
             .rounded_full()
-            .cursor_pointer()
             .flex()
             .items_center()
             .justify_center()
             .bg(rgba(0x0B0F1866))
             .border_1()
             .border_color(rgba(0xFFFFFF18))
-            .hover(|s| s.bg(rgba(0xFFFFFF22)).border_color(rgba(0xFFFFFF30)))
+            .when(!suppress_hover, |el| {
+                el.cursor_pointer()
+                    .hover(|s| s.bg(rgba(0xFFFFFF22)).border_color(rgba(0xFFFFFF30)))
+            })
             .on_click(cx.listener(|this, _, window, cx| {
                 cx.stop_propagation();
                 this.open_settings(window, cx);
@@ -492,7 +530,11 @@ impl SwitcherView {
         let cur_letter = char::from_u32(hk.vk).unwrap_or('Q');
         let recording = self.recording_hotkey_letter;
         let recording_fq = self.recording_force_quit_key;
+        let recording_col_inc = self.recording_columns_inc_key;
+        let recording_col_dec = self.recording_columns_dec_key;
         let fq_label = self.config.parsed_force_quit_key().canonical_label();
+        let col_inc_label = self.config.parsed_columns_inc_key().canonical_label();
+        let col_dec_label = self.config.parsed_columns_dec_key().canonical_label();
         let move_mod = self.config.move_desktop_modifier;
         let autostart = self.autostart_enabled;
         let label_pos = self.config.label_position;
@@ -500,6 +542,7 @@ impl SwitcherView {
         let preview_w = self.config.preview_width.round() as i32;
         let preview_h = self.config.preview_height.round() as i32;
         let columns = self.config.columns;
+        let (columns_min, columns_max) = self.config.effective_columns_bounds();
         let background = self.config.background;
         let blur_pct = (self.config.blur_opacity * 100.0).round() as i32;
         let blur_ratio = ((self.config.blur_opacity - 0.05) / 0.80).clamp(0.0, 1.0);
@@ -680,8 +723,9 @@ impl SwitcherView {
                     })
                     .on_click(cx.listener(|this, _, _, cx| {
                         cx.stop_propagation();
-                        this.recording_force_quit_key = false;
-                        this.recording_hotkey_letter = !this.recording_hotkey_letter;
+                        let next = !this.recording_hotkey_letter;
+                        this.clear_shortcut_recordings();
+                        this.recording_hotkey_letter = next;
                         this.settings_error = None;
                         cx.notify();
                     }))
@@ -729,8 +773,9 @@ impl SwitcherView {
             })
             .on_click(cx.listener(|this, _, _, cx| {
                 cx.stop_propagation();
-                this.recording_hotkey_letter = false;
-                this.recording_force_quit_key = !this.recording_force_quit_key;
+                let next = !this.recording_force_quit_key;
+                this.clear_shortcut_recordings();
+                this.recording_force_quit_key = next;
                 this.settings_error = None;
                 cx.notify();
             }))
@@ -813,6 +858,133 @@ impl SwitcherView {
                         .child("↑↓ · 1-9"),
                 )
             });
+
+        // Columns increase / decrease shortcut recorders: [ + Ctrl++ ] [ − Ctrl+- ]
+        let columns_keys_control = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .id("col-inc-key-record")
+                    .h(px(27.0))
+                    .min_w(px(if recording_col_inc { 86.0 } else { 76.0 }))
+                    .px(px(11.0))
+                    .rounded_full()
+                    .cursor_pointer()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(5.0))
+                    .bg(if recording_col_inc {
+                        rgba(0x0A84FFCC)
+                    } else {
+                        rgba(0xFFFFFF1C)
+                    })
+                    .border_1()
+                    .border_color(if recording_col_inc {
+                        rgba(0xFFFFFF55)
+                    } else {
+                        rgba(0xFFFFFF1E)
+                    })
+                    .hover(|s| {
+                        s.bg(if recording_col_inc {
+                            rgba(0x0A84FFE6)
+                        } else {
+                            rgba(0xFFFFFF2C)
+                        })
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        let next = !this.recording_columns_inc_key;
+                        this.clear_shortcut_recordings();
+                        this.recording_columns_inc_key = next;
+                        this.settings_error = None;
+                        cx.notify();
+                    }))
+                    .when(!recording_col_inc, |el| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(rgba(0xFFFFFF6E))
+                                .child("+"),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgba(0xFFFFFFFA))
+                            .child(if recording_col_inc {
+                                "请按键...".to_string()
+                            } else {
+                                col_inc_label
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .id("col-dec-key-record")
+                    .h(px(27.0))
+                    .min_w(px(if recording_col_dec { 86.0 } else { 76.0 }))
+                    .px(px(11.0))
+                    .rounded_full()
+                    .cursor_pointer()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(5.0))
+                    .bg(if recording_col_dec {
+                        rgba(0x0A84FFCC)
+                    } else {
+                        rgba(0xFFFFFF1C)
+                    })
+                    .border_1()
+                    .border_color(if recording_col_dec {
+                        rgba(0xFFFFFF55)
+                    } else {
+                        rgba(0xFFFFFF1E)
+                    })
+                    .hover(|s| {
+                        s.bg(if recording_col_dec {
+                            rgba(0x0A84FFE6)
+                        } else {
+                            rgba(0xFFFFFF2C)
+                        })
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        let next = !this.recording_columns_dec_key;
+                        this.clear_shortcut_recordings();
+                        this.recording_columns_dec_key = next;
+                        this.settings_error = None;
+                        cx.notify();
+                    }))
+                    .when(!recording_col_dec, |el| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(rgba(0xFFFFFF6E))
+                                .child("−"),
+                        )
+                    })
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgba(0xFFFFFFFA))
+                            .child(if recording_col_dec {
+                                "请按键...".to_string()
+                            } else {
+                                col_dec_label
+                            }),
+                    ),
+            );
 
         // Label placement row
         let label_control = pill_group()
@@ -961,6 +1133,10 @@ impl SwitcherView {
             );
 
         // Columns row
+        let custom_col_badge = match columns {
+            ColumnsConfig::Fixed(n) if !(3..=6).contains(&n) => Some(n),
+            _ => None,
+        };
         let cols_control = pill_group()
             .child(glass_pill(
                 "col-auto",
@@ -979,6 +1155,8 @@ impl SwitcherView {
                 cx.listener(|this, _, window, cx| {
                     cx.stop_propagation();
                     this.config.columns = ColumnsConfig::Fixed(3);
+                    this.config.columns_min = this.config.columns_min.min(3);
+                    this.config.columns_max = this.config.columns_max.max(3);
                     this.apply_visual_and_save(window, cx);
                 }),
             ))
@@ -989,6 +1167,8 @@ impl SwitcherView {
                 cx.listener(|this, _, window, cx| {
                     cx.stop_propagation();
                     this.config.columns = ColumnsConfig::Fixed(4);
+                    this.config.columns_min = this.config.columns_min.min(4);
+                    this.config.columns_max = this.config.columns_max.max(4);
                     this.apply_visual_and_save(window, cx);
                 }),
             ))
@@ -999,6 +1179,8 @@ impl SwitcherView {
                 cx.listener(|this, _, window, cx| {
                     cx.stop_propagation();
                     this.config.columns = ColumnsConfig::Fixed(5);
+                    this.config.columns_min = this.config.columns_min.min(5);
+                    this.config.columns_max = this.config.columns_max.max(5);
                     this.apply_visual_and_save(window, cx);
                 }),
             ))
@@ -1009,9 +1191,139 @@ impl SwitcherView {
                 cx.listener(|this, _, window, cx| {
                     cx.stop_propagation();
                     this.config.columns = ColumnsConfig::Fixed(6);
+                    this.config.columns_min = this.config.columns_min.min(6);
+                    this.config.columns_max = this.config.columns_max.max(6);
                     this.apply_visual_and_save(window, cx);
                 }),
-            ));
+            ))
+            .when_some(custom_col_badge, |el, n| {
+                el.child(
+                    div()
+                        .h(px(22.0))
+                        .px(px(10.0))
+                        .rounded_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(rgba(0xFFFFFF2E))
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgba(0xFFFFFFFA))
+                        .child(n.to_string()),
+                )
+            });
+
+        // Columns min / max bounds steppers: (−) 1 (+)  ~  (−) 8 (+)
+        let cols_bounds_control = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(5.0))
+                    .child(mini_step(
+                        "col-min-dec",
+                        "−",
+                        cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            let next = this
+                                .config
+                                .columns_min
+                                .saturating_sub(1)
+                                .clamp(COLUMNS_HARD_MIN, COLUMNS_HARD_MAX);
+                            this.config.columns_min = next;
+                            if this.config.columns_max < next {
+                                this.config.columns_max = next;
+                            }
+                            this.apply_visual_and_save(window, cx);
+                        }),
+                    ))
+                    .child(
+                        div()
+                            .w(px(22.0))
+                            .flex()
+                            .justify_center()
+                            .text_xs()
+                            .text_color(rgba(0xFFFFFFDC))
+                            .child(columns_min.to_string()),
+                    )
+                    .child(mini_step(
+                        "col-min-inc",
+                        "+",
+                        cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            let next = (this.config.columns_min + 1)
+                                .clamp(COLUMNS_HARD_MIN, COLUMNS_HARD_MAX);
+                            this.config.columns_min = next;
+                            if this.config.columns_max < next {
+                                this.config.columns_max = next;
+                            }
+                            if let ColumnsConfig::Fixed(n) = this.config.columns {
+                                if n < next {
+                                    this.config.columns = ColumnsConfig::Fixed(next);
+                                }
+                            }
+                            this.apply_visual_and_save(window, cx);
+                        }),
+                    )),
+            )
+            .child(div().text_xs().text_color(rgba(0xFFFFFF44)).child("~"))
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(5.0))
+                    .child(mini_step(
+                        "col-max-dec",
+                        "−",
+                        cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            let next = this
+                                .config
+                                .columns_max
+                                .saturating_sub(1)
+                                .clamp(COLUMNS_HARD_MIN, COLUMNS_HARD_MAX);
+                            this.config.columns_max = next;
+                            if this.config.columns_min > next {
+                                this.config.columns_min = next;
+                            }
+                            if let ColumnsConfig::Fixed(n) = this.config.columns {
+                                if n > next {
+                                    this.config.columns = ColumnsConfig::Fixed(next);
+                                }
+                            }
+                            this.apply_visual_and_save(window, cx);
+                        }),
+                    ))
+                    .child(
+                        div()
+                            .w(px(22.0))
+                            .flex()
+                            .justify_center()
+                            .text_xs()
+                            .text_color(rgba(0xFFFFFFDC))
+                            .child(columns_max.to_string()),
+                    )
+                    .child(mini_step(
+                        "col-max-inc",
+                        "+",
+                        cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            let next = (this.config.columns_max + 1)
+                                .clamp(COLUMNS_HARD_MIN, COLUMNS_HARD_MAX);
+                            this.config.columns_max = next;
+                            if this.config.columns_min > next {
+                                this.config.columns_min = next;
+                            }
+                            this.apply_visual_and_save(window, cx);
+                        }),
+                    )),
+            );
 
         // Backdrop style row
         let bg_control = pill_group()
@@ -1244,6 +1556,8 @@ impl SwitcherView {
                                     .child(row_divider())
                                     .child(setting_row("移动桌面", move_desktop_control))
                                     .child(row_divider())
+                                    .child(setting_row("增减列数", columns_keys_control))
+                                    .child(row_divider())
                                     .child(setting_row("标签位置", label_control))
                                     .child(row_divider())
                                     .child(setting_row("画面适配", fit_control))
@@ -1251,6 +1565,8 @@ impl SwitcherView {
                                     .child(setting_row("预览尺寸", size_control))
                                     .child(row_divider())
                                     .child(setting_row("每行列数", cols_control))
+                                    .child(row_divider())
+                                    .child(setting_row("列数范围", cols_bounds_control))
                                     .child(row_divider())
                                     .child(setting_row("背景效果", bg_control))
                                     .child(row_divider())

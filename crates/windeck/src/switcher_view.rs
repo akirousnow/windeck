@@ -37,7 +37,8 @@ use crate::animation::{
     scale_rect_around_center,
 };
 use crate::config::{
-    AppConfig, LabelPosition, MoveDesktopAction, MoveDesktopModifier, PreviewFit, append_log,
+    AppConfig, ColumnsConfig, LabelPosition, MoveDesktopAction, MoveDesktopModifier, PreviewFit,
+    append_log,
 };
 use crate::desktop_reorder::{
     ActiveDesktopReorder, CAPSULE_PILL_GAP, DesktopPressAction, DesktopReorderSource,
@@ -760,6 +761,8 @@ pub struct SwitcherView {
     pub(crate) settings_open: bool,
     pub(crate) recording_hotkey_letter: bool,
     pub(crate) recording_force_quit_key: bool,
+    pub(crate) recording_columns_inc_key: bool,
+    pub(crate) recording_columns_dec_key: bool,
     pub(crate) settings_error: Option<SharedString>,
     pub(crate) win_arrow_patch_error: Option<SharedString>,
     pub(crate) settings_scroll_y: f32,
@@ -1108,6 +1111,8 @@ impl SwitcherView {
             settings_open: false,
             recording_hotkey_letter: false,
             recording_force_quit_key: false,
+            recording_columns_inc_key: false,
+            recording_columns_dec_key: false,
             settings_error: None,
             win_arrow_patch_error: None,
             settings_scroll_y: 0.0,
@@ -3119,27 +3124,99 @@ impl SwitcherView {
         self.groups.iter().map(|g| g.cards.len()).collect()
     }
 
+    fn physical_max_columns(&self, max_avail_w: f32) -> usize {
+        let min_tile_outer_w = 100.0 + TOTAL_RING_PAD * 2.0;
+        (((max_avail_w + COL_GAP) / (min_tile_outer_w + COL_GAP)).floor() as usize).max(1)
+    }
+
     /// Returns `(cols, preview_w, preview_h, tile_outer_w, grid_total_w)`.
-    /// Every window card uses the exact uniform fixed `(preview_w, preview_h)`.
+    /// Every window card uses the exact uniform `(preview_w, preview_h)`, shrinking
+    /// proportionally only when the chosen column count exceeds the viewport width at
+    /// `config.preview_width`.
     fn fixed_grid_geometry(&self) -> (usize, f32, f32, f32, f32) {
         let vw = self.viewport_width_px.get().max(640.0);
         let max_avail_w = (vw - CANVAS_PAD_X * 2.0).clamp(320.0, CANVAS_MAX_W);
 
-        // Respect fixed configured preview size (clamped only if single card exceeds entire viewport)
-        let preview_w = self
+        let base_preview_w = self
             .config
             .preview_width
-            .min((max_avail_w - TOTAL_RING_PAD * 2.0).max(160.0));
-        let preview_h = self.config.preview_height;
-        let tile_outer_w = preview_w + TOTAL_RING_PAD * 2.0;
+            .min((max_avail_w - TOTAL_RING_PAD * 2.0).max(120.0));
+        let base_preview_h = self.config.preview_height;
+        let base_tile_outer_w = base_preview_w + TOTAL_RING_PAD * 2.0;
 
+        let physical_max = self.physical_max_columns(max_avail_w);
         let cols = self
             .config
-            .resolve_columns(max_avail_w, tile_outer_w, COL_GAP);
+            .resolve_columns(max_avail_w, base_tile_outer_w, COL_GAP)
+            .min(physical_max)
+            .max(1);
+
+        let max_tile_outer_w_for_cols =
+            (max_avail_w - (cols.saturating_sub(1) as f32) * COL_GAP) / (cols as f32);
+        let fitted_preview_w = (max_tile_outer_w_for_cols - TOTAL_RING_PAD * 2.0).max(100.0);
+        let (preview_w, preview_h) = if fitted_preview_w < base_preview_w {
+            let scale = fitted_preview_w / base_preview_w.max(1.0);
+            (fitted_preview_w, (base_preview_h * scale).max(64.0))
+        } else {
+            (base_preview_w, base_preview_h)
+        };
+
+        let tile_outer_w = preview_w + TOTAL_RING_PAD * 2.0;
         let grid_total_w =
             (cols as f32) * tile_outer_w + (cols.saturating_sub(1) as f32) * COL_GAP;
 
         (cols, preview_w, preview_h, tile_outer_w, grid_total_w)
+    }
+
+    fn adjust_columns_by_delta(
+        &mut self,
+        delta: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let vw = self.viewport_width_px.get().max(640.0);
+        let max_avail_w = (vw - CANVAS_PAD_X * 2.0).clamp(320.0, CANVAS_MAX_W);
+        let physical_max = self.physical_max_columns(max_avail_w);
+        let (min_c, max_c) = self.config.effective_columns_bounds();
+        let effective_max = max_c.min(physical_max).max(1);
+        let effective_min = min_c.min(effective_max);
+
+        let current_cols = self.fixed_grid_geometry().0;
+        let next_cols = ((current_cols as isize) + delta)
+            .clamp(effective_min as isize, effective_max as isize) as usize;
+
+        if next_cols == current_cols {
+            let msg = if delta > 0 {
+                format!("每行列数已达上限（{effective_max} 列）")
+            } else {
+                format!("每行列数已达下限（{effective_min} 列）")
+            };
+            self.transient_toast = Some((SharedString::from(msg), Instant::now()));
+            cx.notify();
+            return;
+        }
+
+        let prev_bounds = self.snapshot_current_thumb_bounds();
+        self.config.columns = ColumnsConfig::Fixed(next_cols);
+        self.persist_config();
+        self.selection_anim = None;
+        self.ensure_selected_visible();
+        self.clamp_scroll();
+        if self.config.transition_effect.is_enabled() && !prev_bounds.is_empty() {
+            let profile = TransitionProfile::from_effect(self.config.transition_effect);
+            self.reflow_anim = Some(ReflowAnim {
+                started_at: Instant::now(),
+                duration: Duration::from_millis(200),
+                use_spring: profile.use_spring,
+                from_bounds: prev_bounds,
+            });
+        }
+        self.transient_toast = Some((
+            SharedString::from(format!("每行列数：{next_cols} 列")),
+            Instant::now(),
+        ));
+        window.refresh();
+        cx.notify();
     }
 
     fn extra_item_h(&self) -> f32 {
@@ -4220,6 +4297,30 @@ impl SwitcherView {
                 ) {
                     self.apply_force_quit_key_change(sc, cx);
                 }
+            } else if self.recording_columns_inc_key {
+                if key == "escape" {
+                    self.recording_columns_inc_key = false;
+                    cx.notify();
+                } else if let Some(sc) = crate::config::LocalShortcut::from_keystroke(
+                    key,
+                    mods.control,
+                    mods.alt,
+                    mods.shift,
+                ) {
+                    self.apply_columns_inc_key_change(sc, cx);
+                }
+            } else if self.recording_columns_dec_key {
+                if key == "escape" {
+                    self.recording_columns_dec_key = false;
+                    cx.notify();
+                } else if let Some(sc) = crate::config::LocalShortcut::from_keystroke(
+                    key,
+                    mods.control,
+                    mods.alt,
+                    mods.shift,
+                ) {
+                    self.apply_columns_dec_key_change(sc, cx);
+                }
             } else if key == "escape" {
                 self.close_settings(window, cx);
             }
@@ -4537,6 +4638,32 @@ impl SwitcherView {
             }
         }
 
+        // Configurable columns-per-row zoom shortcuts (default: Ctrl++ / Ctrl+-)
+        if self.config.parsed_columns_inc_key().matches(
+            key,
+            mods.control,
+            mods.alt,
+            mods.shift,
+            held_primary,
+        ) {
+            cx.stop_propagation();
+            self.disarm_hold_mode();
+            self.adjust_columns_by_delta(1, window, cx);
+            return;
+        }
+        if self.config.parsed_columns_dec_key().matches(
+            key,
+            mods.control,
+            mods.alt,
+            mods.shift,
+            held_primary,
+        ) {
+            cx.stop_propagation();
+            self.disarm_hold_mode();
+            self.adjust_columns_by_delta(-1, window, cx);
+            return;
+        }
+
         match key {
             "enter" | "space" => {
                 cx.stop_propagation();
@@ -4704,8 +4831,8 @@ impl SwitcherView {
                 window.refresh();
                 cx.notify();
             }
-            // Press - / = to live-tune Gaussian blur transparency
-            "-" | "_" => {
+            // Press bare - / = to live-tune Gaussian blur transparency
+            "-" | "_" if !mods.control && !mods.alt => {
                 cx.stop_propagation();
                 self.config.blur_opacity = (self.config.blur_opacity - 0.05).clamp(0.05, 0.85);
                 self.thumb_host.configure(
@@ -4723,7 +4850,7 @@ impl SwitcherView {
                 ));
                 cx.notify();
             }
-            "=" | "+" => {
+            "=" | "+" if !mods.control && !mods.alt => {
                 cx.stop_propagation();
                 self.config.blur_opacity = (self.config.blur_opacity + 0.05).clamp(0.05, 0.85);
                 self.thumb_host.configure(
@@ -7186,7 +7313,6 @@ impl Render for SwitcherView {
                 .h(px(24.0))
                 .px(px(14.0))
                 .rounded_full()
-                .cursor_pointer()
                 .flex()
                 .flex_row()
                 .items_center()
@@ -7196,11 +7322,13 @@ impl Render for SwitcherView {
                 } else {
                     rgba(0x00000000)
                 })
-                .hover(|s| {
-                    s.bg(if all_selected {
-                        rgba(0xFFFFFF38)
-                    } else {
-                        rgba(0xFFFFFF18)
+                .when(!is_any_drag_active, |el| {
+                    el.cursor_pointer().hover(|s| {
+                        s.bg(if all_selected {
+                            rgba(0xFFFFFF38)
+                        } else {
+                            rgba(0xFFFFFF18)
+                        })
                     })
                 })
                 .on_click(cx.listener(|this, _, window, cx| {
@@ -7279,7 +7407,7 @@ impl Render for SwitcherView {
                 .min_w(px(58.0))
                 .px(px(14.0))
                 .rounded_full()
-                .cursor_pointer()
+                .when(!is_any_drag_active, |el| el.cursor_pointer())
                 .flex()
                 .flex_row()
                 .items_center()
@@ -7338,7 +7466,9 @@ impl Render for SwitcherView {
                 pill.bg(rgba(0xFF453AD8))
                     .border_1()
                     .border_color(rgba(0xFFFFFF38))
-                    .hover(|s| s.bg(rgba(0xFF453AF5)).border_color(rgba(0xFFFFFF66)))
+                    .when(!is_any_drag_active, |el| {
+                        el.hover(|s| s.bg(rgba(0xFF453AF5)).border_color(rgba(0xFFFFFF66)))
+                    })
                     .child(trash_icon())
             } else {
                 let bg_color = if is_drag_over_pill || is_synced_group_pill {
@@ -7372,13 +7502,13 @@ impl Render for SwitcherView {
                             el.border_1().border_color(border_col)
                         },
                     )
-                    .hover(|s| {
-                        s.bg(if is_drag_over_pill || is_synced_group_pill {
-                            rgba(0x0A84FF78)
-                        } else if is_filtered {
-                            rgba(0xFFFFFF38)
-                        } else {
-                            rgba(0xFFFFFF18)
+                    .when(!is_any_drag_active, |el| {
+                        el.hover(|s| {
+                            s.bg(if is_filtered {
+                                rgba(0xFFFFFF38)
+                            } else {
+                                rgba(0xFFFFFF18)
+                            })
                         })
                     })
                     .when(is_cur, |el| {
@@ -7437,7 +7567,6 @@ impl Render for SwitcherView {
                 .relative()
                 .size(px(24.0))
                 .rounded_full()
-                .cursor_pointer()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -7449,12 +7578,8 @@ impl Render for SwitcherView {
                 .when(is_drag_over_add, |el| {
                     el.border_1().border_color(rgba(0x64D2FFEE))
                 })
-                .hover(|s| {
-                    s.bg(if is_drag_over_add {
-                        rgba(0x0A84FF88)
-                    } else {
-                        rgba(0xFFFFFF28)
-                    })
+                .when(!is_any_drag_active, |el| {
+                    el.cursor_pointer().hover(|s| s.bg(rgba(0xFFFFFF28)))
                 })
                 .child(
                     canvas(
@@ -7623,7 +7748,7 @@ impl Render for SwitcherView {
                 .max_w(px(176.0))
                 .px(px(12.0))
                 .rounded_full()
-                .cursor_pointer()
+                .when(!is_any_drag_active, |el| el.cursor_pointer())
                 .flex()
                 .flex_row()
                 .items_center()
@@ -7679,7 +7804,9 @@ impl Render for SwitcherView {
                 pill.bg(rgba(0xFF453AD8))
                     .border_1()
                     .border_color(rgba(0xFFFFFF38))
-                    .hover(|s| s.bg(rgba(0xFF453AF5)).border_color(rgba(0xFFFFFF66)))
+                    .when(!is_any_drag_active, |el| {
+                        el.hover(|s| s.bg(rgba(0xFF453AF5)).border_color(rgba(0xFFFFFF66)))
+                    })
                     .child(trash_icon())
             } else {
                 let bg_color = if is_drag_over_vspace {
@@ -7704,13 +7831,13 @@ impl Render for SwitcherView {
                         };
                         el.border_1().border_color(border_col)
                     })
-                    .hover(|s| {
-                        s.bg(if is_drag_over_vspace {
-                            rgba(0xA78BFA7E)
-                        } else if is_filtered {
-                            rgba(0xA78BFA4F)
-                        } else {
-                            rgba(0xA78BFA24)
+                    .when(!is_any_drag_active, |el| {
+                        el.hover(|s| {
+                            s.bg(if is_filtered {
+                                rgba(0xA78BFA4F)
+                            } else {
+                                rgba(0xA78BFA24)
+                            })
                         })
                     })
                     .child(
@@ -7770,7 +7897,6 @@ impl Render for SwitcherView {
                 .relative()
                 .size(px(24.0))
                 .rounded_full()
-                .cursor_pointer()
                 .flex()
                 .items_center()
                 .justify_center()
@@ -7782,12 +7908,8 @@ impl Render for SwitcherView {
                 .when(is_drag_over_vadd, |el| {
                     el.border_1().border_color(rgba(0xE9D5FFEE))
                 })
-                .hover(|s| {
-                    s.bg(if is_drag_over_vadd {
-                        rgba(0xA78BFA8C)
-                    } else {
-                        rgba(0xA78BFA42)
-                    })
+                .when(!is_any_drag_active, |el| {
+                    el.cursor_pointer().hover(|s| s.bg(rgba(0xA78BFA42)))
                 })
                 .child(
                     canvas(
@@ -7848,15 +7970,16 @@ impl Render for SwitcherView {
                 .px(px(TOTAL_RING_PAD))
                 .when(can_reorder_group, |el| el.rounded(px(6.0)))
                 .when_some(desktop_id, |el, did| {
-                    el.cursor_pointer()
-                        .hover(move |s| {
+                    el.when(!is_any_drag_active, |el| {
+                        el.cursor_pointer().hover(move |s| {
                             if can_reorder_group {
                                 s.bg(rgba(0xFFFFFF0D))
                             } else {
                                 s.opacity(1.0)
                             }
                         })
-                        .on_mouse_down(
+                    })
+                    .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                                 cx.stop_propagation();
@@ -8028,9 +8151,11 @@ impl Render for SwitcherView {
                         .text_xs()
                         .text_color(rgba(0xFFFFFF66))
                         .when_some(desktop_id, |el, did| {
-                            el.cursor_pointer()
-                                .hover(|s| s.bg(rgba(0xFFFFFF1A)).text_color(rgba(0xFFFFFFD0)))
-                                .on_mouse_down(
+                            el.when(!is_any_drag_active, |el| {
+                                el.cursor_pointer()
+                                    .hover(|s| s.bg(rgba(0xFFFFFF1A)).text_color(rgba(0xFFFFFFD0)))
+                            })
+                            .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                                         cx.stop_propagation();
@@ -8077,13 +8202,14 @@ impl Render for SwitcherView {
                                 .w(px(preview_w))
                                 .h(px(preview_h))
                                 .rounded(px(8.0))
-                                .cursor_pointer()
                                 .bg(rgba(0xA78BFA0E))
                                 .border_1()
                                 .border_color(rgba(0xA78BFA33))
-                                .hover(|s| {
-                                    s.bg(rgba(0xA78BFA20))
-                                        .border_color(rgba(0xC4B5FD88))
+                                .when(!is_any_drag_active, |el| {
+                                    el.cursor_pointer().hover(|s| {
+                                        s.bg(rgba(0xA78BFA20))
+                                            .border_color(rgba(0xC4B5FD88))
+                                    })
                                 })
                                 .flex()
                                 .items_center()
@@ -8570,7 +8696,7 @@ impl Render for SwitcherView {
                             .flex_col()
                             .items_center()
                             .justify_center()
-                            .cursor_pointer()
+                            .when(!is_any_drag_active, |el| el.cursor_pointer())
                             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                                 if this.exit_anim.is_some()
                                     || this.active_drag.is_some()
@@ -8911,6 +9037,7 @@ impl Render for SwitcherView {
         let root = div()
             .id("windeck-mission-control")
             .relative()
+            .when(is_any_drag_active, |el| el.cursor_grabbing())
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
@@ -9420,7 +9547,7 @@ impl Render for SwitcherView {
             )
             // === BOTTOM-RIGHT QUIET FLOATING SETTINGS ICON ===
             .child(
-                self.render_settings_trigger(cx)
+                self.render_settings_trigger(is_any_drag_active, cx)
                     .when(chrome_opacity < 0.999, |el| el.opacity(chrome_opacity)),
             )
             // === RIGHT-CLICK CARD POPOVER (PUT INTO / REMOVE FROM VIRTUAL SPACES) ===

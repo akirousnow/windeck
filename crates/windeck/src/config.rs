@@ -140,13 +140,24 @@ pub struct LocalShortcut {
     pub key: String,
 }
 
+pub const COLUMNS_HARD_MIN: usize = 1;
+pub const COLUMNS_HARD_MAX: usize = 12;
+
 impl LocalShortcut {
     pub fn normalize_key_name(raw: &str) -> Option<String> {
         let lower = raw.trim().to_ascii_lowercase();
         match lower.as_str() {
             "delete" | "del" => Some("delete".to_string()),
             "backspace" | "back" => Some("backspace".to_string()),
-            k if k.len() == 1 && k.as_bytes()[0].is_ascii_alphabetic() => Some(k.to_string()),
+            "+" | "=" | "plus" | "equal" | "equals" => Some("+".to_string()),
+            "-" | "_" | "minus" => Some("-".to_string()),
+            "[" | "]" | "," | "." | "/" => Some(lower),
+            "up" | "down" | "left" | "right" => Some(lower),
+            k if k.len() == 1
+                && (k.as_bytes()[0].is_ascii_alphabetic() || k.as_bytes()[0].is_ascii_digit()) =>
+            {
+                Some(k.to_string())
+            }
             k if k.starts_with('f') && k.len() <= 3 => {
                 let n: u32 = k[1..].parse().ok()?;
                 (1..=12).contains(&n).then(|| format!("f{n}"))
@@ -156,12 +167,25 @@ impl LocalShortcut {
     }
 
     pub fn parse(spec: &str) -> Option<Self> {
+        let trimmed = spec.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let (mod_prefix, trailing_plus) = if trimmed == "+" {
+            ("", true)
+        } else if let Some(prefix) = trimmed.strip_suffix("++") {
+            (prefix, true)
+        } else {
+            (trimmed, false)
+        };
+
         let mut ctrl = false;
         let mut alt = false;
         let mut shift = false;
-        let mut key: Option<String> = None;
+        let mut key: Option<String> = trailing_plus.then(|| "+".to_string());
 
-        for part in spec.split('+') {
+        for part in mod_prefix.split('+') {
             let token = part.trim();
             if token.is_empty() {
                 continue;
@@ -211,6 +235,12 @@ impl LocalShortcut {
         let key_disp = match self.key.as_str() {
             "delete" => "Delete".to_string(),
             "backspace" => "Backspace".to_string(),
+            "up" => "Up".to_string(),
+            "down" => "Down".to_string(),
+            "left" => "Left".to_string(),
+            "right" => "Right".to_string(),
+            "+" => "+".to_string(),
+            "-" => "-".to_string(),
             other => other.to_ascii_uppercase(),
         };
         parts.push(key_disp);
@@ -225,7 +255,12 @@ impl LocalShortcut {
         shift: bool,
         held_primary: Option<PrimaryModifier>,
     ) -> bool {
-        if !self.key.eq_ignore_ascii_case(key) {
+        let key_matches = match self.key.as_str() {
+            "+" => key == "+" || key == "=",
+            "-" => key == "-" || key == "_",
+            expected => expected.eq_ignore_ascii_case(key),
+        };
+        if !key_matches {
             return false;
         }
         if self.ctrl || self.alt || self.shift {
@@ -349,7 +384,11 @@ pub struct AppConfig {
     pub hotkey: String,
     pub force_quit_key: String,
     pub move_desktop_modifier: MoveDesktopModifier,
+    pub columns_inc_key: String,
+    pub columns_dec_key: String,
     pub columns: ColumnsConfig,
+    pub columns_min: usize,
+    pub columns_max: usize,
     pub background: BackdropStyle,
     pub blur_opacity: f32,
     pub transition_effect: TransitionEffect,
@@ -374,7 +413,11 @@ impl Default for AppConfig {
             hotkey: "Alt+Q".to_string(),
             force_quit_key: "Delete".to_string(),
             move_desktop_modifier: MoveDesktopModifier::Alt,
+            columns_inc_key: "Ctrl++".to_string(),
+            columns_dec_key: "Ctrl+-".to_string(),
             columns: ColumnsConfig::Auto,
+            columns_min: 1,
+            columns_max: 8,
             background: BackdropStyle::Blurred,
             blur_opacity: 0.28,
             transition_effect: TransitionEffect::Spring,
@@ -406,6 +449,10 @@ force_quit_key = "Delete"
 
 # 快捷移动窗口到其他原生虚拟桌面修饰键（配合 ↑/↓ 移动至上/下桌面，1~9 直达指定桌面）: "alt" | "ctrl" | "shift" | "off"
 move_desktop_modifier = "alt"
+
+# 实时增减单行展示列数的快捷键（支持单键或组合键，如 "Ctrl++", "Ctrl+-", "Alt+]", "Alt+["）
+columns_inc_key = "Ctrl++"
+columns_dec_key = "Ctrl+-"
 
 # 沉浸式无边框全屏（仿 macOS Mission Control 调度中心）: true = 全屏无边框 | false = 居中浮层
 immersive = true
@@ -445,6 +492,10 @@ transition_switch = true
 
 # 每行卡片列数: "auto" (按固定预览宽度与屏幕自动排满) 或正整数 (如 4)
 columns = "auto"
+
+# 单行展示列数上下限 (1 ~ 12，约束自动列数与快捷键增减范围)
+columns_min = 1
+columns_max = 8
 
 # 多显示器弹出位置: "cursor" (鼠标当前所在屏) | "primary" (主显示器)
 monitor = "cursor"
@@ -537,6 +588,8 @@ impl AppConfig {
                         cfg.move_desktop_modifier = m;
                     }
                 }
+                "columns_inc_key" if !val.is_empty() => cfg.columns_inc_key = val.to_string(),
+                "columns_dec_key" if !val.is_empty() => cfg.columns_dec_key = val.to_string(),
                 "immersive" => {
                     if let Ok(b) = val.parse::<bool>() {
                         cfg.immersive = b;
@@ -566,9 +619,19 @@ impl AppConfig {
                     if val.eq_ignore_ascii_case("auto") {
                         cfg.columns = ColumnsConfig::Auto;
                     } else if let Ok(n) = val.parse::<usize>() {
-                        if (1..=8).contains(&n) {
+                        if (COLUMNS_HARD_MIN..=COLUMNS_HARD_MAX).contains(&n) {
                             cfg.columns = ColumnsConfig::Fixed(n);
                         }
+                    }
+                }
+                "columns_min" => {
+                    if let Ok(n) = val.parse::<usize>() {
+                        cfg.columns_min = n.clamp(COLUMNS_HARD_MIN, COLUMNS_HARD_MAX);
+                    }
+                }
+                "columns_max" => {
+                    if let Ok(n) = val.parse::<usize>() {
+                        cfg.columns_max = n.clamp(COLUMNS_HARD_MIN, COLUMNS_HARD_MAX);
                     }
                 }
                 "background" => match val.to_ascii_lowercase().as_str() {
@@ -631,6 +694,9 @@ impl AppConfig {
             }
         }
 
+        cfg.columns_min = cfg.columns_min.clamp(COLUMNS_HARD_MIN, COLUMNS_HARD_MAX);
+        cfg.columns_max = cfg.columns_max.clamp(cfg.columns_min, COLUMNS_HARD_MAX);
+
         cfg
     }
 
@@ -642,6 +708,22 @@ impl AppConfig {
     pub fn parsed_force_quit_key(&self) -> LocalShortcut {
         LocalShortcut::parse(&self.force_quit_key)
             .unwrap_or_else(|| LocalShortcut::parse("Delete").expect("default force_quit_key valid"))
+    }
+
+    pub fn parsed_columns_inc_key(&self) -> LocalShortcut {
+        LocalShortcut::parse(&self.columns_inc_key)
+            .unwrap_or_else(|| LocalShortcut::parse("Ctrl++").expect("default columns_inc_key valid"))
+    }
+
+    pub fn parsed_columns_dec_key(&self) -> LocalShortcut {
+        LocalShortcut::parse(&self.columns_dec_key)
+            .unwrap_or_else(|| LocalShortcut::parse("Ctrl+-").expect("default columns_dec_key valid"))
+    }
+
+    pub fn effective_columns_bounds(&self) -> (usize, usize) {
+        let min_c = self.columns_min.clamp(COLUMNS_HARD_MIN, COLUMNS_HARD_MAX);
+        let max_c = self.columns_max.clamp(min_c, COLUMNS_HARD_MAX);
+        (min_c, max_c)
     }
 
     pub fn tab_transition_enabled(&self) -> bool {
@@ -670,6 +752,7 @@ impl AppConfig {
             OverlayMonitorPolicy::Cursor => "cursor",
             OverlayMonitorPolicy::Primary => "primary",
         };
+        let (columns_min, columns_max) = self.effective_columns_bounds();
         format!(
             r#"# WinDeck 配置文件（由设置页面自动保存，也可手动编辑后在托盘点「重新加载配置」）
 
@@ -681,6 +764,10 @@ force_quit_key = "{force_quit_key}"
 
 # 快捷移动窗口到其他原生虚拟桌面修饰键（配合 ↑/↓ 移动至上/下桌面，1~9 直达指定桌面）: "alt" | "ctrl" | "shift" | "off"
 move_desktop_modifier = "{move_desktop_modifier}"
+
+# 实时增减单行展示列数的快捷键（支持单键或组合键，如 "Ctrl++", "Ctrl+-", "Alt+]", "Alt+["）
+columns_inc_key = "{columns_inc_key}"
+columns_dec_key = "{columns_dec_key}"
 
 # 沉浸式无边框全屏（仿 macOS Mission Control 调度中心）: true = 全屏无边框 | false = 居中浮层
 immersive = {immersive}
@@ -710,6 +797,10 @@ transition_switch = {transition_switch}
 # 每行卡片列数: "auto" 或正整数 (如 4)
 columns = {columns}
 
+# 单行展示列数上下限 (1 ~ 12，约束自动列数与快捷键增减范围)
+columns_min = {columns_min}
+columns_max = {columns_max}
+
 # 多显示器弹出位置: "cursor" (鼠标当前所在屏) | "primary" (主显示器)
 monitor = "{monitor}"
 
@@ -728,6 +819,8 @@ win_arrow_switch_desktop = {win_arrow_switch_desktop}
             hotkey = self.parsed_hotkey().canonical_label(),
             force_quit_key = self.parsed_force_quit_key().canonical_label(),
             move_desktop_modifier = self.move_desktop_modifier.as_config_str(),
+            columns_inc_key = self.parsed_columns_inc_key().canonical_label(),
+            columns_dec_key = self.parsed_columns_dec_key().canonical_label(),
             immersive = self.immersive,
             preview_width = self.preview_width.round() as i32,
             preview_height = self.preview_height.round() as i32,
@@ -740,6 +833,8 @@ win_arrow_switch_desktop = {win_arrow_switch_desktop}
             transition_selection = self.transition_selection,
             transition_switch = self.transition_switch,
             columns = columns_str,
+            columns_min = columns_min,
+            columns_max = columns_max,
             monitor = monitor_str,
             cross_desktop_nav = self.cross_desktop_nav,
             hide_on_blur = self.hide_on_blur,
@@ -754,14 +849,15 @@ win_arrow_switch_desktop = {win_arrow_switch_desktop}
         fs::write(config_file_path(), self.to_toml())
     }
 
-    /// Computes how many fixed-size tiles fit in a single row cleanly.
+    /// Computes how many tiles to place in a single row, clamped to `[columns_min, columns_max]`.
     pub fn resolve_columns(&self, content_width_px: f32, tile_outer_w: f32, col_gap: f32) -> usize {
-        let max_fit = (((content_width_px + col_gap) / (tile_outer_w + col_gap)).floor() as usize)
-            .max(1)
-            .min(8);
+        let (min_c, max_c) = self.effective_columns_bounds();
+        let natural_fit = (((content_width_px + col_gap) / (tile_outer_w + col_gap)).floor()
+            as usize)
+            .max(1);
         match self.columns {
-            ColumnsConfig::Fixed(n) => n.clamp(1, max_fit),
-            ColumnsConfig::Auto => max_fit,
+            ColumnsConfig::Fixed(n) => n.clamp(min_c, max_c),
+            ColumnsConfig::Auto => natural_fit.clamp(min_c, max_c),
         }
     }
 }
@@ -920,5 +1016,58 @@ mod tests {
             MoveDesktopModifier::Off.match_move_action("down", false, true, false),
             None
         );
+    }
+
+    #[test]
+    fn columns_shortcuts_and_bounds_parse_match_and_round_trip() {
+        let def = AppConfig::default();
+        assert_eq!(def.parsed_columns_inc_key().canonical_label(), "Ctrl++");
+        assert_eq!(def.parsed_columns_dec_key().canonical_label(), "Ctrl+-");
+        assert_eq!(def.effective_columns_bounds(), (1, 8));
+
+        // Ctrl++ matches both main-keyboard '=' and shifted/numpad '+'
+        let inc = def.parsed_columns_inc_key();
+        assert!(inc.matches("=", true, false, false, None));
+        assert!(inc.matches("+", true, false, false, None));
+        assert!(!inc.matches("=", false, false, false, None));
+
+        // Ctrl+- matches both '-' and '_'
+        let dec = def.parsed_columns_dec_key();
+        assert!(dec.matches("-", true, false, false, None));
+        assert!(dec.matches("_", true, false, false, None));
+        assert!(!dec.matches("-", false, false, false, None));
+
+        // Alternate syntaxes parse cleanly
+        assert_eq!(
+            LocalShortcut::parse("Ctrl+=").unwrap().canonical_label(),
+            "Ctrl++"
+        );
+        assert_eq!(
+            LocalShortcut::parse("Alt+Shift++").unwrap().canonical_label(),
+            "Alt+Shift++"
+        );
+        assert_eq!(LocalShortcut::parse("+").unwrap().canonical_label(), "+");
+        assert_eq!(LocalShortcut::parse("Ctrl+]").unwrap().canonical_label(), "Ctrl+]");
+
+        // Config parse + round-trip + inverted min/max normalization
+        let cfg = AppConfig::parse(
+            "columns = 6\ncolumns_min = 3\ncolumns_max = 10\ncolumns_inc_key = \"Alt+]\"\ncolumns_dec_key = \"Alt+[\"\n",
+        );
+        assert_eq!(cfg.columns, ColumnsConfig::Fixed(6));
+        assert_eq!(cfg.effective_columns_bounds(), (3, 10));
+        assert_eq!(cfg.parsed_columns_inc_key().canonical_label(), "Alt+]");
+        assert_eq!(cfg.parsed_columns_dec_key().canonical_label(), "Alt+[");
+        assert_eq!(cfg.resolve_columns(1000.0, 400.0, 20.0), 6);
+
+        let rt = AppConfig::parse(&cfg.to_toml());
+        assert_eq!(rt.columns, ColumnsConfig::Fixed(6));
+        assert_eq!(rt.effective_columns_bounds(), (3, 10));
+        assert_eq!(rt.parsed_columns_inc_key().canonical_label(), "Alt+]");
+        assert_eq!(rt.parsed_columns_dec_key().canonical_label(), "Alt+[");
+
+        // Inverted min > max clamps max up to min, and Auto respects [min, max]
+        let clamped = AppConfig::parse("columns = \"auto\"\ncolumns_min = 5\ncolumns_max = 2\n");
+        assert_eq!(clamped.effective_columns_bounds(), (5, 5));
+        assert_eq!(clamped.resolve_columns(1200.0, 400.0, 20.0), 5);
     }
 }
