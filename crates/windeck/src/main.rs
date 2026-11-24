@@ -7,6 +7,7 @@ mod settings_panel;
 mod switcher_view;
 mod thumb_manager;
 mod update_dialog;
+mod virtual_spaces;
 mod window_order;
 
 use std::ffi::c_void;

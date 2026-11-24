@@ -105,7 +105,7 @@ impl SwitcherView {
         }
         self.disarm_hold_mode();
         self.clear_all_animations(false);
-        self.armed_delete_desktop = None;
+        self.clear_space_popups();
         self.recording_hotkey_letter = false;
         self.recording_force_quit_key = false;
         // Clear live DWM thumbnails so Layer 1 exposes clean Gaussian blur behind the modal dialog

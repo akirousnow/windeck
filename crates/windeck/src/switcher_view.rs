@@ -1,14 +1,16 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, Bounds, ClickEvent, Context, FocusHandle, Focusable, KeyDownEvent, MouseButton, Pixels,
-    RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, Window, WindowBackgroundAppearance,
-    canvas, div, img, point, prelude::*, px, rgb, rgba, size,
+    App, Bounds, ClickEvent, Context, ElementInputHandler, EntityInputHandler, FocusHandle,
+    Focusable, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, RenderImage, ScrollDelta,
+    ScrollWheelEvent, SharedString, UTF16Selection, Window, WindowBackgroundAppearance, canvas,
+    div, img, point, prelude::*, px, rgb, rgba, size,
 };
 use smallvec::smallvec;
 use win_platform::{
@@ -37,6 +39,7 @@ use crate::config::{AppConfig, LabelPosition, PreviewFit, append_log};
 use crate::nav::{NavDirection, navigate};
 use crate::thumb_manager::ThumbnailManager;
 use crate::update_dialog::UpdateStatus;
+use crate::virtual_spaces::{AddWindowOutcome, SpaceId, VirtualSpaceStore};
 use crate::window_order::{SelectionCard, StableWindowOrder, pick_initial_selection_index};
 
 // Balanced, breathable macOS Mission Control spatial constants (logical px)
@@ -57,6 +60,323 @@ const ROW_GAP: f32 = 22.0;
 const COL_GAP: f32 = 24.0;
 const EMPTY_GROUP_H: f32 = 38.0;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ViewFilter {
+    All,
+    NativeDesktop(DesktopId),
+    VirtualSpace(SpaceId),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ArmedDelete {
+    NativeDesktop(DesktopId),
+    VirtualSpace(SpaceId),
+}
+
+#[derive(Clone)]
+struct CardContextMenu {
+    hwnd: isize,
+    position: Point<Pixels>,
+}
+
+const MAX_SPACE_NAME_CHARS: usize = 24;
+const MAX_PICKER_QUERY_CHARS: usize = 48;
+const PICKER_ROW_H: f32 = 42.0;
+const PICKER_ROW_GAP: f32 = 3.0;
+const PICKER_LIST_MAX_H: f32 = 384.0;
+
+#[derive(Clone)]
+struct AddWindowPickerState {
+    space_id: SpaceId,
+    query: String,
+    marked_range: Option<Range<usize>>,
+    search_focused: bool,
+    selected: HashSet<isize>,
+    focused_idx: usize,
+    anchor_idx: Option<usize>,
+    scroll_y: f32,
+}
+
+impl AddWindowPickerState {
+    fn new(space_id: SpaceId) -> Self {
+        Self {
+            space_id,
+            query: String::new(),
+            marked_range: None,
+            search_focused: false,
+            selected: HashSet::new(),
+            focused_idx: 0,
+            anchor_idx: None,
+            scroll_y: 0.0,
+        }
+    }
+
+    fn clamp_query(&mut self) {
+        if self.query.chars().count() > MAX_PICKER_QUERY_CHARS {
+            let truncated: String = self.query.chars().take(MAX_PICKER_QUERY_CHARS).collect();
+            self.query = truncated;
+            if let Some(ref mut mr) = self.marked_range {
+                let len = self.query.len();
+                mr.start = mr.start.min(len);
+                mr.end = mr.end.min(len);
+                if mr.start >= mr.end {
+                    self.marked_range = None;
+                }
+            }
+        }
+    }
+
+    fn list_content_height(item_count: usize) -> f32 {
+        if item_count == 0 {
+            0.0
+        } else {
+            (item_count as f32) * PICKER_ROW_H
+                + (item_count.saturating_sub(1) as f32) * PICKER_ROW_GAP
+        }
+    }
+
+    fn clamp_focus_and_scroll(&mut self, item_count: usize, viewport_h: f32) {
+        if item_count == 0 {
+            self.focused_idx = 0;
+            self.scroll_y = 0.0;
+            return;
+        }
+        self.focused_idx = self.focused_idx.min(item_count - 1);
+        let max_scroll = (Self::list_content_height(item_count) - viewport_h).max(0.0);
+        self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
+    }
+
+    fn ensure_focused_visible(&mut self, item_count: usize, viewport_h: f32) {
+        self.clamp_focus_and_scroll(item_count, viewport_h);
+        if item_count == 0 {
+            return;
+        }
+        let stride = PICKER_ROW_H + PICKER_ROW_GAP;
+        let row_top = (self.focused_idx as f32) * stride;
+        let row_bottom = row_top + PICKER_ROW_H;
+        if row_top < self.scroll_y {
+            self.scroll_y = row_top;
+        } else if row_bottom > self.scroll_y + viewport_h {
+            self.scroll_y = row_bottom - viewport_h;
+        }
+        let max_scroll = (Self::list_content_height(item_count) - viewport_h).max(0.0);
+        self.scroll_y = self.scroll_y.clamp(0.0, max_scroll);
+    }
+
+    fn move_focus(&mut self, delta: isize, item_count: usize, viewport_h: f32) {
+        if item_count == 0 {
+            self.focused_idx = 0;
+            self.scroll_y = 0.0;
+            return;
+        }
+        let cur = self.focused_idx.min(item_count - 1) as isize;
+        let next = (cur + delta).rem_euclid(item_count as isize) as usize;
+        self.focused_idx = next;
+        self.ensure_focused_visible(item_count, viewport_h);
+    }
+
+    fn toggle_hwnd(&mut self, hwnd: isize, idx: usize) {
+        self.focused_idx = idx;
+        self.anchor_idx = Some(idx);
+        self.search_focused = false;
+        if !self.selected.remove(&hwnd) {
+            self.selected.insert(hwnd);
+        }
+    }
+
+    fn single_select(&mut self, hwnd: isize, idx: usize) {
+        self.focused_idx = idx;
+        self.anchor_idx = Some(idx);
+        self.search_focused = false;
+        self.selected.clear();
+        self.selected.insert(hwnd);
+    }
+
+    fn range_select(&mut self, visible_hwnds: &[isize], idx: usize) {
+        if visible_hwnds.is_empty() || idx >= visible_hwnds.len() {
+            return;
+        }
+        let anchor = self
+            .anchor_idx
+            .unwrap_or(self.focused_idx)
+            .min(visible_hwnds.len() - 1);
+        let (start, end) = if anchor <= idx {
+            (anchor, idx)
+        } else {
+            (idx, anchor)
+        };
+        for &h in &visible_hwnds[start..=end] {
+            self.selected.insert(h);
+        }
+        self.focused_idx = idx;
+        self.search_focused = false;
+    }
+
+    fn toggle_focused(&mut self, visible_hwnds: &[isize]) -> bool {
+        let Some(&hwnd) = visible_hwnds.get(self.focused_idx) else {
+            return false;
+        };
+        self.anchor_idx = Some(self.focused_idx);
+        if !self.selected.remove(&hwnd) {
+            self.selected.insert(hwnd);
+        }
+        true
+    }
+
+    fn select_all_visible(&mut self, visible_hwnds: &[isize]) {
+        if visible_hwnds.is_empty() {
+            return;
+        }
+        let all_already_selected = visible_hwnds.iter().all(|h| self.selected.contains(h));
+        if all_already_selected {
+            for h in visible_hwnds {
+                self.selected.remove(h);
+            }
+        } else {
+            for &h in visible_hwnds {
+                self.selected.insert(h);
+            }
+        }
+    }
+
+    fn resolve_commit_hwnds(
+        &self,
+        all_candidate_hwnds: &[isize],
+        filtered_hwnds: &[isize],
+    ) -> Vec<isize> {
+        if !self.selected.is_empty() {
+            all_candidate_hwnds
+                .iter()
+                .copied()
+                .filter(|h| self.selected.contains(h))
+                .collect()
+        } else {
+            filtered_hwnds
+                .get(self.focused_idx)
+                .copied()
+                .into_iter()
+                .collect()
+        }
+    }
+}
+
+fn picker_matches_query(win: &WindowInfo, query_lower: &str) -> bool {
+    if query_lower.is_empty() {
+        return true;
+    }
+    win.title.to_lowercase().contains(query_lower)
+        || win.process_name.to_lowercase().contains(query_lower)
+}
+
+#[derive(Clone)]
+struct RenameSpaceState {
+    space_id: SpaceId,
+    text: String,
+    marked_range: Option<Range<usize>>,
+    select_all: bool,
+}
+
+impl RenameSpaceState {
+    fn clamp_name(&mut self) {
+        if self.text.chars().count() > MAX_SPACE_NAME_CHARS {
+            let truncated: String = self.text.chars().take(MAX_SPACE_NAME_CHARS).collect();
+            self.text = truncated;
+            if let Some(ref mut mr) = self.marked_range {
+                let len = self.text.len();
+                mr.start = mr.start.min(len);
+                mr.end = mr.end.min(len);
+                if mr.start >= mr.end {
+                    self.marked_range = None;
+                }
+            }
+        }
+    }
+}
+
+fn utf16_offset_to_utf8(text: &str, utf16_offset: usize) -> usize {
+    let mut u16_count = 0usize;
+    for (byte_idx, ch) in text.char_indices() {
+        if u16_count >= utf16_offset {
+            return byte_idx;
+        }
+        u16_count += ch.len_utf16();
+    }
+    text.len()
+}
+
+fn utf8_offset_to_utf16(text: &str, utf8_offset: usize) -> usize {
+    let clamped = utf8_offset.min(text.len());
+    text.char_indices()
+        .take_while(|&(i, _)| i < clamped)
+        .map(|(_, ch)| ch.len_utf16())
+        .sum()
+}
+
+#[derive(Clone)]
+struct DraggedWindow {
+    hwnd: isize,
+    title: SharedString,
+    icon: Option<Arc<RenderImage>>,
+    monogram: SharedString,
+    accent_color: u32,
+}
+
+struct DraggedWindowGhost {
+    data: DraggedWindow,
+    cursor_offset: Point<Pixels>,
+}
+
+impl Render for DraggedWindowGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let icon_el = if let Some(ref render_img) = self.data.icon {
+            div()
+                .size(px(16.0))
+                .flex_shrink_0()
+                .child(img(render_img.clone()).size(px(16.0)).rounded(px(3.0)))
+        } else {
+            div()
+                .size(px(16.0))
+                .flex_shrink_0()
+                .rounded(px(4.0))
+                .bg(rgb(self.data.accent_color))
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_xs()
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(rgb(0xFFFFFF))
+                .child(self.data.monogram.clone())
+        };
+
+        div()
+            .ml(self.cursor_offset.x + px(12.0))
+            .mt(self.cursor_offset.y - px(14.0))
+            .max_w(px(236.0))
+            .h(px(30.0))
+            .px(px(11.0))
+            .rounded_full()
+            .bg(rgba(0x16122AE8))
+            .border_1()
+            .border_color(rgba(0xA78BFA99))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(7.0))
+            .child(icon_el)
+            .child(
+                div()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::MEDIUM)
+                    .text_color(rgba(0xFFFFFFFA))
+                    .child(self.data.title.clone()),
+            )
+    }
+}
+
 #[derive(Clone)]
 struct WindowCard {
     flat_index: usize,
@@ -70,6 +390,7 @@ struct WindowCard {
 struct DesktopGroup {
     title: SharedString,
     desktop_id: Option<DesktopId>,
+    virtual_space_id: Option<SpaceId>,
     is_current: bool,
     cards: Vec<WindowCard>,
 }
@@ -169,6 +490,132 @@ fn trash_icon() -> gpui::Div {
         )
 }
 
+/// Crisp layered-frames geometric glyph distinguishing WinDeck logical virtual spaces from OS desktops.
+fn virtual_space_icon(active: bool) -> gpui::Div {
+    let front_color = if active {
+        rgba(0xD8B4FEFF)
+    } else {
+        rgba(0xC4B5FDA8)
+    };
+    let back_color = if active {
+        rgba(0xA78BFA99)
+    } else {
+        rgba(0xA78BFA55)
+    };
+    div()
+        .relative()
+        .w(px(12.0))
+        .h(px(11.0))
+        .flex_shrink_0()
+        .child(
+            div()
+                .absolute()
+                .top(px(0.5))
+                .left(px(3.5))
+                .w(px(8.0))
+                .h(px(7.0))
+                .rounded(px(2.0))
+                .border_1()
+                .border_color(back_color),
+        )
+        .child(
+            div()
+                .absolute()
+                .top(px(3.5))
+                .left(px(0.5))
+                .w(px(8.0))
+                .h(px(7.0))
+                .rounded(px(2.0))
+                .bg(rgba(0x16122AE0))
+                .border_1()
+                .border_color(front_color),
+        )
+}
+
+/// Crisp geometric checkmark for card popover membership rows.
+fn check_mark_dot(checked: bool) -> gpui::Div {
+    div()
+        .size(px(14.0))
+        .flex_shrink_0()
+        .rounded(px(4.0))
+        .border_1()
+        .border_color(if checked {
+            rgba(0xC4B5FDE0)
+        } else {
+            rgba(0xFFFFFF33)
+        })
+        .bg(if checked {
+            rgba(0x8B5CF6CC)
+        } else {
+            rgba(0xFFFFFF08)
+        })
+        .flex()
+        .items_center()
+        .justify_center()
+        .when(checked, |el| {
+            el.child(div().size(px(5.0)).rounded_full().bg(rgb(0xFFFFFF)))
+        })
+}
+
+/// Crisp geometric magnifying glass for the window picker search field.
+fn search_icon(active: bool) -> gpui::Div {
+    let color = if active {
+        rgba(0xE9D5FFDD)
+    } else {
+        rgba(0xFFFFFF66)
+    };
+    div()
+        .relative()
+        .size(px(12.0))
+        .flex_shrink_0()
+        .child(
+            div()
+                .absolute()
+                .top(px(1.0))
+                .left(px(1.0))
+                .size(px(8.0))
+                .rounded_full()
+                .border(px(1.4))
+                .border_color(color),
+        )
+        .child(
+            div()
+                .absolute()
+                .bottom(px(1.5))
+                .right(px(1.5))
+                .w(px(3.5))
+                .h(px(1.5))
+                .rounded(px(1.0))
+                .bg(color),
+        )
+}
+
+/// Crisp geometric plus glyph for the virtual-space add-window tile.
+fn large_plus_icon() -> gpui::Div {
+    div()
+        .relative()
+        .size(px(26.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            div()
+                .absolute()
+                .w(px(24.0))
+                .h(px(2.0))
+                .rounded_full()
+                .bg(rgba(0xE9D5FFA8)),
+        )
+        .child(
+            div()
+                .absolute()
+                .w(px(2.0))
+                .h(px(24.0))
+                .rounded_full()
+                .bg(rgba(0xE9D5FFA8)),
+        )
+}
+
 pub struct SwitcherView {
     pub(crate) focus_handle: FocusHandle,
     pub(crate) gpui_hwnd: HWND,
@@ -201,12 +648,16 @@ pub struct SwitcherView {
     monitors: Vec<MonitorInfo>,
     all_windows: Vec<WindowInfo>,
     window_order: StableWindowOrder,
-    desktop_filter: Option<DesktopId>,
+    virtual_spaces: VirtualSpaceStore,
+    view_filter: ViewFilter,
     groups: Vec<DesktopGroup>,
     pub(crate) flat_hwnds: Vec<isize>,
     selected_flat: usize,
     hovered_flat: Option<usize>,
-    pub(crate) armed_delete_desktop: Option<DesktopId>,
+    pub(crate) armed_delete: Option<ArmedDelete>,
+    context_menu: Option<CardContextMenu>,
+    renaming_space: Option<RenameSpaceState>,
+    add_picker: Option<AddWindowPickerState>,
     pub(crate) settings_open: bool,
     pub(crate) recording_hotkey_letter: bool,
     pub(crate) recording_force_quit_key: bool,
@@ -238,6 +689,244 @@ pub struct SwitcherView {
 impl Focusable for SwitcherView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+impl EntityInputHandler for SwitcherView {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let text = if let Some(ref state) = self.renaming_space {
+            state.text.as_str()
+        } else if let Some(ref picker) = self.add_picker.as_ref().filter(|p| p.search_focused) {
+            picker.query.as_str()
+        } else {
+            return None;
+        };
+        let start = utf16_offset_to_utf8(text, range_utf16.start);
+        let end = utf16_offset_to_utf8(text, range_utf16.end).max(start);
+        *adjusted_range = Some(utf8_offset_to_utf16(text, start)..utf8_offset_to_utf16(text, end));
+        Some(text[start..end].to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        if let Some(ref state) = self.renaming_space {
+            let len_u16 = utf8_offset_to_utf16(&state.text, state.text.len());
+            let range = if state.select_all {
+                0..len_u16
+            } else {
+                len_u16..len_u16
+            };
+            return Some(UTF16Selection {
+                range,
+                reversed: false,
+            });
+        }
+        if let Some(ref picker) = self.add_picker.as_ref().filter(|p| p.search_focused) {
+            let len_u16 = utf8_offset_to_utf16(&picker.query, picker.query.len());
+            return Some(UTF16Selection {
+                range: len_u16..len_u16,
+                reversed: false,
+            });
+        }
+        None
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        if let Some(ref state) = self.renaming_space {
+            let mr = state.marked_range.as_ref()?;
+            return Some(
+                utf8_offset_to_utf16(&state.text, mr.start)
+                    ..utf8_offset_to_utf16(&state.text, mr.end),
+            );
+        }
+        if let Some(ref picker) = self.add_picker.as_ref().filter(|p| p.search_focused) {
+            let mr = picker.marked_range.as_ref()?;
+            return Some(
+                utf8_offset_to_utf16(&picker.query, mr.start)
+                    ..utf8_offset_to_utf16(&picker.query, mr.end),
+            );
+        }
+        None
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ref mut state) = self.renaming_space {
+            state.marked_range = None;
+            cx.notify();
+        } else if let Some(ref mut picker) = self.add_picker.as_mut().filter(|p| p.search_focused) {
+            picker.marked_range = None;
+            cx.notify();
+        }
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ref mut state) = self.renaming_space {
+            let sanitized: String = new_text.chars().filter(|c| !c.is_control()).collect();
+            let replace_range = if let Some(ref r16) = range_utf16 {
+                let s = utf16_offset_to_utf8(&state.text, r16.start);
+                let e = utf16_offset_to_utf8(&state.text, r16.end).max(s);
+                s..e
+            } else if let Some(mr) = state.marked_range.take() {
+                let len = state.text.len();
+                mr.start.min(len)..mr.end.min(len)
+            } else if state.select_all {
+                0..state.text.len()
+            } else {
+                state.text.len()..state.text.len()
+            };
+
+            if sanitized.is_empty()
+                && range_utf16.is_none()
+                && replace_range.start == replace_range.end
+            {
+                state.marked_range = None;
+                cx.notify();
+                return;
+            }
+
+            state.text.replace_range(replace_range, &sanitized);
+            state.marked_range = None;
+            state.select_all = false;
+            state.clamp_name();
+            cx.notify();
+            return;
+        }
+
+        if let Some(ref mut picker) = self.add_picker.as_mut().filter(|p| p.search_focused) {
+            let sanitized: String = new_text.chars().filter(|c| !c.is_control()).collect();
+            let replace_range = if let Some(ref r16) = range_utf16 {
+                let s = utf16_offset_to_utf8(&picker.query, r16.start);
+                let e = utf16_offset_to_utf8(&picker.query, r16.end).max(s);
+                s..e
+            } else if let Some(mr) = picker.marked_range.take() {
+                let len = picker.query.len();
+                mr.start.min(len)..mr.end.min(len)
+            } else {
+                picker.query.len()..picker.query.len()
+            };
+
+            if sanitized.is_empty()
+                && range_utf16.is_none()
+                && replace_range.start == replace_range.end
+            {
+                picker.marked_range = None;
+                cx.notify();
+                return;
+            }
+
+            picker.query.replace_range(replace_range, &sanitized);
+            picker.marked_range = None;
+            picker.clamp_query();
+            picker.focused_idx = 0;
+            picker.scroll_y = 0.0;
+            cx.notify();
+        }
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        _new_selected_range_utf16: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ref mut state) = self.renaming_space {
+            let replace_range = if let Some(r16) = range_utf16 {
+                let s = utf16_offset_to_utf8(&state.text, r16.start);
+                let e = utf16_offset_to_utf8(&state.text, r16.end).max(s);
+                s..e
+            } else if let Some(mr) = state.marked_range.clone() {
+                let len = state.text.len();
+                mr.start.min(len)..mr.end.min(len)
+            } else if state.select_all {
+                0..state.text.len()
+            } else {
+                state.text.len()..state.text.len()
+            };
+
+            let start = replace_range.start;
+            state.text.replace_range(replace_range, new_text);
+            state.select_all = false;
+            if new_text.is_empty() {
+                state.marked_range = None;
+            } else {
+                state.marked_range = Some(start..(start + new_text.len()));
+            }
+            state.clamp_name();
+            cx.notify();
+            return;
+        }
+
+        if let Some(ref mut picker) = self.add_picker.as_mut().filter(|p| p.search_focused) {
+            let replace_range = if let Some(r16) = range_utf16 {
+                let s = utf16_offset_to_utf8(&picker.query, r16.start);
+                let e = utf16_offset_to_utf8(&picker.query, r16.end).max(s);
+                s..e
+            } else if let Some(mr) = picker.marked_range.clone() {
+                let len = picker.query.len();
+                mr.start.min(len)..mr.end.min(len)
+            } else {
+                picker.query.len()..picker.query.len()
+            };
+
+            let start = replace_range.start;
+            picker.query.replace_range(replace_range, new_text);
+            if new_text.is_empty() {
+                picker.marked_range = None;
+            } else {
+                picker.marked_range = Some(start..(start + new_text.len()));
+            }
+            picker.clamp_query();
+            picker.focused_idx = 0;
+            picker.scroll_y = 0.0;
+            cx.notify();
+        }
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        Some(element_bounds)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        if let Some(ref state) = self.renaming_space {
+            return Some(utf8_offset_to_utf16(&state.text, state.text.len()));
+        }
+        if let Some(ref picker) = self.add_picker.as_ref().filter(|p| p.search_focused) {
+            return Some(utf8_offset_to_utf16(&picker.query, picker.query.len()));
+        }
+        None
     }
 }
 
@@ -292,12 +981,16 @@ impl SwitcherView {
             monitors: Vec::new(),
             all_windows: Vec::new(),
             window_order: StableWindowOrder::new(),
-            desktop_filter: None,
+            virtual_spaces: VirtualSpaceStore::load_or_default(),
+            view_filter: ViewFilter::All,
             groups: Vec::new(),
             flat_hwnds: Vec::new(),
             selected_flat: 0,
             hovered_flat: None,
-            armed_delete_desktop: None,
+            armed_delete: None,
+            context_menu: None,
+            renaming_space: None,
+            add_picker: None,
             settings_open: false,
             recording_hotkey_letter: false,
             recording_force_quit_key: false,
@@ -422,6 +1115,13 @@ impl SwitcherView {
         }
     }
 
+    pub(crate) fn clear_space_popups(&mut self) {
+        self.armed_delete = None;
+        self.context_menu = None;
+        self.renaming_space = None;
+        self.add_picker = None;
+    }
+
     pub fn handle_hold_navigate(
         &mut self,
         dir: HoldNavDirection,
@@ -431,7 +1131,7 @@ impl SwitcherView {
         if !self.visible || self.exit_anim.is_some() {
             return;
         }
-        self.armed_delete_desktop = None;
+        self.clear_space_popups();
         self.hold_active = true;
         self.hold_navigated = true;
 
@@ -470,7 +1170,7 @@ impl SwitcherView {
         if should_jump {
             if let Some(&hwnd) = self.flat_hwnds.get(self.selected_flat) {
                 self.activate_window(hwnd, window, cx);
-            } else if let Some(did) = self.desktop_filter {
+            } else if let ViewFilter::NativeDesktop(did) = self.view_filter {
                 self.switch_to_desktop_only(did, window, cx);
             } else {
                 cx.notify();
@@ -498,7 +1198,7 @@ impl SwitcherView {
         self.hold_active = false;
         self.hold_navigated = false;
         self.hovered_flat = None;
-        self.armed_delete_desktop = None;
+        self.clear_space_popups();
         self.settings_open = false;
         self.update_dialog_open = false;
         self.recording_hotkey_letter = false;
@@ -548,7 +1248,7 @@ impl SwitcherView {
         let t_start = Instant::now();
         self.capture_foreground_candidates();
         self.hovered_flat = None;
-        self.armed_delete_desktop = None;
+        self.clear_space_popups();
         self.settings_open = false;
         self.update_dialog_open = false;
         self.recording_hotkey_letter = false;
@@ -563,7 +1263,7 @@ impl SwitcherView {
         self.scroll_last_tick = None;
         *self.viewport_clip.borrow_mut() = None;
         // Always open in full panorama ("全部") so all desktops' windows are visible at once
-        self.desktop_filter = None;
+        self.view_filter = ViewFilter::All;
 
         self.refresh_snapshot();
 
@@ -726,16 +1426,32 @@ impl SwitcherView {
             enumerate_windows(&self.vdm, &desktops, &monitors, &exclude).unwrap_or_default();
         self.last_enum_ms = t_enum.elapsed().as_secs_f64() * 1000.0;
 
-        // If filtered/armed desktop was removed externally, reset cleanly
-        if let Some(fid) = self.desktop_filter {
-            if !desktops.iter().any(|d| d.id == fid) {
-                self.desktop_filter = None;
+        // If filtered/armed desktop or virtual space was removed externally, reset cleanly
+        match self.view_filter {
+            ViewFilter::NativeDesktop(fid) => {
+                if !desktops.iter().any(|d| d.id == fid) {
+                    self.view_filter = ViewFilter::All;
+                }
             }
+            ViewFilter::VirtualSpace(sid) => {
+                if self.virtual_spaces.get(sid).is_none() {
+                    self.view_filter = ViewFilter::All;
+                }
+            }
+            ViewFilter::All => {}
         }
-        if let Some(aid) = self.armed_delete_desktop {
-            if !desktops.iter().any(|d| d.id == aid) {
-                self.armed_delete_desktop = None;
+        match self.armed_delete {
+            Some(ArmedDelete::NativeDesktop(aid)) => {
+                if !desktops.iter().any(|d| d.id == aid) {
+                    self.armed_delete = None;
+                }
             }
+            Some(ArmedDelete::VirtualSpace(sid)) => {
+                if self.virtual_spaces.get(sid).is_none() {
+                    self.armed_delete = None;
+                }
+            }
+            None => {}
         }
 
         self.desktops = desktops;
@@ -746,14 +1462,87 @@ impl SwitcherView {
             &self.desktops,
             is_window_alive_with_pid,
         );
+        let spaces_dirty = self
+            .virtual_spaces
+            .sync(&self.all_windows, is_window_alive_with_pid);
+        if spaces_dirty {
+            self.persist_virtual_spaces();
+        }
+        if let Some(ref menu) = self.context_menu {
+            if !self.all_windows.iter().any(|w| w.hwnd == menu.hwnd) {
+                self.context_menu = None;
+            }
+        }
+        if let Some(ref ren) = self.renaming_space {
+            if self.virtual_spaces.get(ren.space_id).is_none() {
+                self.renaming_space = None;
+            }
+        }
+        if let Some(ref mut picker) = self.add_picker {
+            if self.virtual_spaces.get(picker.space_id).is_none() {
+                self.add_picker = None;
+            } else {
+                let live_set: HashSet<isize> = self.all_windows.iter().map(|w| w.hwnd).collect();
+                picker.selected.retain(|h| live_set.contains(h));
+            }
+        }
         self.rebuild_visible_groups(true);
     }
 
-    /// Rebuilds visible desktop groups & flat HWND index list according to `self.desktop_filter`.
+    /// Rebuilds visible desktop/space groups & flat HWND index list according to `self.view_filter`.
     fn rebuild_visible_groups(&mut self, pick_smart_initial: bool) {
+        let mut groups = Vec::new();
+        let mut flat_hwnds = Vec::new();
+        let mut flat_idx = 0usize;
+
+        if let ViewFilter::VirtualSpace(space_id) = self.view_filter {
+            if let Some(space) = self.virtual_spaces.get(space_id) {
+                let space_title = SharedString::from(space.name.clone());
+                let space_windows = self
+                    .virtual_spaces
+                    .ordered_windows_for_space(space_id, &self.all_windows);
+                let mut cards = Vec::with_capacity(space_windows.len());
+                for info in space_windows {
+                    let icon = self.cached_icon(&info);
+                    let (monogram, accent_color) =
+                        monogram_and_color(&info.process_name, &info.title);
+                    flat_hwnds.push(info.hwnd);
+                    cards.push(WindowCard {
+                        flat_index: flat_idx,
+                        info,
+                        icon,
+                        monogram,
+                        accent_color,
+                    });
+                    flat_idx += 1;
+                }
+                groups.push(DesktopGroup {
+                    title: space_title,
+                    desktop_id: None,
+                    virtual_space_id: Some(space_id),
+                    is_current: true,
+                    cards,
+                });
+            }
+            self.total_window_count = flat_hwnds.len();
+            self.groups = groups;
+            self.flat_hwnds = flat_hwnds;
+            if pick_smart_initial {
+                self.selected_flat = self.pick_initial_selection();
+            } else if self.flat_hwnds.is_empty() {
+                self.selected_flat = 0;
+            } else {
+                self.selected_flat = self.selected_flat.min(self.flat_hwnds.len() - 1);
+            }
+            return;
+        }
+
         let desktops = self.desktops.clone();
         let windows = self.window_order.ordered(&self.all_windows);
-        let filter = self.desktop_filter;
+        let filter = match self.view_filter {
+            ViewFilter::NativeDesktop(did) => Some(did),
+            ViewFilter::All | ViewFilter::VirtualSpace(_) => None,
+        };
 
         let mut pinned_windows = Vec::new();
         let mut by_desktop: Vec<Vec<WindowInfo>> = vec![Vec::new(); desktops.len()];
@@ -773,10 +1562,6 @@ impl SwitcherView {
             }
         }
 
-        let mut groups = Vec::new();
-        let mut flat_hwnds = Vec::new();
-        let mut flat_idx = 0usize;
-
         if filter.is_none() && !pinned_windows.is_empty() {
             let mut cards = Vec::with_capacity(pinned_windows.len());
             for info in pinned_windows.clone() {
@@ -795,6 +1580,7 @@ impl SwitcherView {
             groups.push(DesktopGroup {
                 title: SharedString::from("所有桌面"),
                 desktop_id: None,
+                virtual_space_id: None,
                 is_current: false,
                 cards,
             });
@@ -845,6 +1631,7 @@ impl SwitcherView {
             groups.push(DesktopGroup {
                 title: label_shared,
                 desktop_id: Some(d_info.id),
+                virtual_space_id: None,
                 is_current: d_info.is_current,
                 cards,
             });
@@ -868,6 +1655,7 @@ impl SwitcherView {
             groups.push(DesktopGroup {
                 title: SharedString::from("其他"),
                 desktop_id: None,
+                virtual_space_id: None,
                 is_current: false,
                 cards,
             });
@@ -885,21 +1673,26 @@ impl SwitcherView {
         }
     }
 
-    fn tab_order_index(&self, filter: Option<DesktopId>) -> usize {
+    fn tab_order_index(&self, filter: ViewFilter) -> usize {
         match filter {
-            None => 0,
-            Some(did) => self
+            ViewFilter::All => 0,
+            ViewFilter::NativeDesktop(did) => self
                 .desktops
                 .iter()
                 .position(|d| d.id == did)
                 .map(|i| i + 1)
                 .unwrap_or(0),
+            ViewFilter::VirtualSpace(sid) => self
+                .virtual_spaces
+                .index_of(sid)
+                .map(|i| 1 + self.desktops.len() + i)
+                .unwrap_or(1 + self.desktops.len()),
         }
     }
 
-    fn set_desktop_filter(
+    fn set_view_filter(
         &mut self,
-        new_filter: Option<DesktopId>,
+        new_filter: ViewFilter,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -907,16 +1700,21 @@ impl SwitcherView {
             return;
         }
         self.disarm_hold_mode();
-        if self.desktop_filter == new_filter {
+        self.context_menu = None;
+        self.add_picker = None;
+        if self.renaming_space.is_some() {
+            self.commit_renaming_space(cx);
+        }
+        if self.view_filter == new_filter {
             return;
         }
 
         let animate = self.config.tab_transition_enabled() && self.visible;
-        let old_idx = self.tab_order_index(self.desktop_filter);
+        let old_idx = self.tab_order_index(self.view_filter);
         let new_idx = self.tab_order_index(new_filter);
         let slide_dir = if new_idx >= old_idx { 1.0 } else { -1.0 };
 
-        // Snapshot current cards' on-screen bounds BEFORE mutating desktop_filter/groups
+        // Snapshot current cards' on-screen bounds BEFORE mutating view_filter/groups
         let old_cards_snapshot: Vec<LeavingCardSnapshot> = if animate {
             let (cols, preview_w, preview_h, tile_outer_w, grid_total_w) =
                 self.fixed_grid_geometry();
@@ -971,7 +1769,7 @@ impl SwitcherView {
             Vec::new()
         };
 
-        self.desktop_filter = new_filter;
+        self.view_filter = new_filter;
         self.scroll_y = 0.0;
         self.scroll_target_y = 0.0;
         self.scroll_last_tick = None;
@@ -1002,8 +1800,6 @@ impl SwitcherView {
                 .filter(|h| !old_set.contains(h))
                 .collect();
 
-            // Keep both entering/shared AND currently leaving DWM thumbnails alive during fade-out,
-            // while pruning any older interrupted transition leftovers.
             let mut keep_hwnds: Vec<isize> =
                 Vec::with_capacity(self.flat_hwnds.len() + leaving_cards.len());
             keep_hwnds.extend_from_slice(&self.flat_hwnds);
@@ -1031,11 +1827,911 @@ impl SwitcherView {
             });
         } else {
             self.tab_anim = None;
-            // Immediately synchronize DWM thumbnails so filtered-out desktops release their surfaces (zero ghosts)
             self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
             window.refresh();
         }
         cx.notify();
+    }
+
+    fn persist_virtual_spaces(&self) {
+        if let Err(e) = self.virtual_spaces.save() {
+            append_log(&format!("VIRTUAL_SPACES SAVE ERROR: {e}"));
+        }
+    }
+
+    fn create_virtual_space(&mut self, cx: &mut Context<Self>) -> SpaceId {
+        self.disarm_hold_mode();
+        self.clear_space_popups();
+        let id = self.virtual_spaces.create_space(None);
+        let name = self
+            .virtual_spaces
+            .get(id)
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        self.persist_virtual_spaces();
+        self.transient_toast = Some((SharedString::from(format!("已新建「{name}」")), Instant::now()));
+        append_log(&format!("CREATE_VIRTUAL_SPACE id={} name='{}'", id.0, name));
+        cx.notify();
+        id
+    }
+
+    fn create_virtual_space_with_window(
+        &mut self,
+        target_hwnd: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(win) = self
+            .all_windows
+            .iter()
+            .find(|w| w.hwnd == target_hwnd)
+            .cloned()
+        else {
+            return;
+        };
+        self.disarm_hold_mode();
+        self.clear_space_popups();
+        let id = self.virtual_spaces.create_space(None);
+        let _ = self.virtual_spaces.add_window(id, &win, &self.all_windows);
+        let name = self
+            .virtual_spaces
+            .get(id)
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        self.persist_virtual_spaces();
+        self.transient_toast = Some((
+            SharedString::from(format!("已放入新空间「{name}」")),
+            Instant::now(),
+        ));
+        append_log(&format!(
+            "CREATE_VIRTUAL_SPACE_WITH_WIN id={} name='{}' hwnd=0x{:X}",
+            id.0, name, target_hwnd
+        ));
+        window.refresh();
+        cx.notify();
+    }
+
+    fn add_window_to_virtual_space(
+        &mut self,
+        space_id: SpaceId,
+        target_hwnd: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(win) = self
+            .all_windows
+            .iter()
+            .find(|w| w.hwnd == target_hwnd)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(space_name) = self.virtual_spaces.get(space_id).map(|s| s.name.clone()) else {
+            return;
+        };
+        self.disarm_hold_mode();
+        self.armed_delete = None;
+        let outcome = self
+            .virtual_spaces
+            .add_window(space_id, &win, &self.all_windows);
+        match outcome {
+            AddWindowOutcome::Added => {
+                self.persist_virtual_spaces();
+                if self.view_filter == ViewFilter::VirtualSpace(space_id) {
+                    self.rebuild_visible_groups(false);
+                    self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
+                    self.clamp_scroll();
+                }
+                self.transient_toast = Some((
+                    SharedString::from(format!("已放入「{space_name}」")),
+                    Instant::now(),
+                ));
+                append_log(&format!(
+                    "VIRTUAL_SPACE_ADD space={} name='{}' hwnd=0x{:X} proc='{}'",
+                    space_id.0, space_name, target_hwnd, win.process_name
+                ));
+            }
+            AddWindowOutcome::AlreadyPresent => {
+                self.transient_toast = Some((
+                    SharedString::from(format!("已在「{space_name}」中")),
+                    Instant::now(),
+                ));
+            }
+        }
+        window.refresh();
+        cx.notify();
+    }
+
+    fn remove_window_from_virtual_space(
+        &mut self,
+        space_id: SpaceId,
+        target_hwnd: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(space_name) = self.virtual_spaces.get(space_id).map(|s| s.name.clone()) else {
+            return;
+        };
+        let pid = self
+            .all_windows
+            .iter()
+            .find(|w| w.hwnd == target_hwnd)
+            .map(|w| w.pid)
+            .unwrap_or(0);
+        self.disarm_hold_mode();
+        self.armed_delete = None;
+        if self.virtual_spaces.remove_window(space_id, target_hwnd, pid) {
+            self.persist_virtual_spaces();
+            if self.view_filter == ViewFilter::VirtualSpace(space_id) {
+                self.hovered_flat = None;
+                self.selection_anim = None;
+                self.tab_anim = None;
+                self.rebuild_visible_groups(false);
+                self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
+                self.clamp_scroll();
+            }
+            self.transient_toast = Some((
+                SharedString::from(format!("已移出「{space_name}」")),
+                Instant::now(),
+            ));
+            append_log(&format!(
+                "VIRTUAL_SPACE_REMOVE space={} name='{}' hwnd=0x{:X}",
+                space_id.0, space_name, target_hwnd
+            ));
+            window.refresh();
+            cx.notify();
+        }
+    }
+
+    fn toggle_window_in_virtual_space(
+        &mut self,
+        space_id: SpaceId,
+        target_hwnd: isize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let already = self
+            .virtual_spaces
+            .get(space_id)
+            .is_some_and(|s| s.contains_hwnd(target_hwnd));
+        if already {
+            self.remove_window_from_virtual_space(space_id, target_hwnd, window, cx);
+        } else {
+            self.add_window_to_virtual_space(space_id, target_hwnd, window, cx);
+        }
+    }
+
+    fn remove_virtual_space_by_id(
+        &mut self,
+        space_id: SpaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.disarm_hold_mode();
+        self.clear_space_popups();
+        let Some(removed_name) = self.virtual_spaces.delete_space(space_id) else {
+            return;
+        };
+        self.persist_virtual_spaces();
+        if self.view_filter == ViewFilter::VirtualSpace(space_id) {
+            self.view_filter = ViewFilter::All;
+            self.scroll_y = 0.0;
+            self.scroll_target_y = 0.0;
+            self.scroll_last_tick = None;
+            self.tab_anim = None;
+            self.selection_anim = None;
+            self.hovered_flat = None;
+            self.rebuild_visible_groups(true);
+            self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
+            self.clamp_scroll();
+        }
+        self.transient_toast = Some((
+            SharedString::from(format!("已删除「{removed_name}」")),
+            Instant::now(),
+        ));
+        append_log(&format!(
+            "DELETE_VIRTUAL_SPACE id={} name='{}'",
+            space_id.0, removed_name
+        ));
+        window.refresh();
+        cx.notify();
+    }
+
+    fn start_renaming_space(
+        &mut self,
+        space_id: SpaceId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(current_name) = self.virtual_spaces.get(space_id).map(|s| s.name.clone()) else {
+            return;
+        };
+        self.disarm_hold_mode();
+        self.armed_delete = None;
+        self.context_menu = None;
+        self.renaming_space = Some(RenameSpaceState {
+            space_id,
+            text: current_name,
+            marked_range: None,
+            select_all: true,
+        });
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
+    fn commit_renaming_space(&mut self, cx: &mut Context<Self>) {
+        let Some(state) = self.renaming_space.take() else {
+            return;
+        };
+        if self.virtual_spaces.rename_space(state.space_id, &state.text) {
+            self.persist_virtual_spaces();
+            if self.view_filter == ViewFilter::VirtualSpace(state.space_id) {
+                self.rebuild_visible_groups(false);
+            }
+        }
+        cx.notify();
+    }
+
+    fn cancel_renaming_space(&mut self, cx: &mut Context<Self>) {
+        if self.renaming_space.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn picker_viewport_h(&self) -> f32 {
+        let win_h = self.viewport_height_px.get().max(320.0) + TOP_SPACES_BAR_H;
+        (win_h - 210.0).clamp(160.0, PICKER_LIST_MAX_H)
+    }
+
+    fn picker_candidate_windows(&self, space_id: SpaceId) -> Vec<WindowInfo> {
+        let Some(space) = self.virtual_spaces.get(space_id) else {
+            return Vec::new();
+        };
+        self.window_order
+            .ordered(&self.all_windows)
+            .into_iter()
+            .filter(|w| !space.contains_hwnd(w.hwnd))
+            .collect()
+    }
+
+    fn picker_filtered_windows(&self, space_id: SpaceId, query: &str) -> Vec<WindowInfo> {
+        let q = query.trim().to_lowercase();
+        self.picker_candidate_windows(space_id)
+            .into_iter()
+            .filter(|w| picker_matches_query(w, &q))
+            .collect()
+    }
+
+    fn open_add_picker(&mut self, space_id: SpaceId, window: &mut Window, cx: &mut Context<Self>) {
+        if self.virtual_spaces.get(space_id).is_none() {
+            return;
+        }
+        self.disarm_hold_mode();
+        self.armed_delete = None;
+        self.context_menu = None;
+        if self.renaming_space.is_some() {
+            self.commit_renaming_space(cx);
+        }
+        self.add_picker = Some(AddWindowPickerState::new(space_id));
+        window.focus(&self.focus_handle);
+        cx.notify();
+    }
+
+    fn close_add_picker(&mut self, cx: &mut Context<Self>) {
+        if self.add_picker.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn add_windows_to_virtual_space(
+        &mut self,
+        space_id: SpaceId,
+        target_hwnds: &[isize],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(space_name) = self.virtual_spaces.get(space_id).map(|s| s.name.clone()) else {
+            return;
+        };
+        let mut added_count = 0usize;
+        for &hwnd in target_hwnds {
+            if let Some(win) = self.all_windows.iter().find(|w| w.hwnd == hwnd).cloned() {
+                if self
+                    .virtual_spaces
+                    .add_window(space_id, &win, &self.all_windows)
+                    == AddWindowOutcome::Added
+                {
+                    added_count += 1;
+                }
+            }
+        }
+        if added_count > 0 {
+            self.persist_virtual_spaces();
+            if self.view_filter == ViewFilter::VirtualSpace(space_id) {
+                self.tab_anim = None;
+                self.selection_anim = None;
+                self.hovered_flat = None;
+                self.rebuild_visible_groups(false);
+                self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
+                self.clamp_scroll();
+            }
+            let toast = if added_count == 1 {
+                format!("已放入「{space_name}」")
+            } else {
+                format!("已放入 {added_count} 个窗口到「{space_name}」")
+            };
+            self.transient_toast = Some((SharedString::from(toast), Instant::now()));
+            append_log(&format!(
+                "VIRTUAL_SPACE_ADD_BATCH space={} name='{}' added={}",
+                space_id.0, space_name, added_count
+            ));
+            window.refresh();
+            cx.notify();
+        }
+    }
+
+    fn commit_add_picker(
+        &mut self,
+        extra_hwnd: Option<isize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut picker) = self.add_picker.take() else {
+            return;
+        };
+        if let Some(hwnd) = extra_hwnd {
+            picker.selected.insert(hwnd);
+        }
+        let all_candidates: Vec<isize> = self
+            .picker_candidate_windows(picker.space_id)
+            .into_iter()
+            .map(|w| w.hwnd)
+            .collect();
+        let filtered_candidates: Vec<isize> = self
+            .picker_filtered_windows(picker.space_id, &picker.query)
+            .into_iter()
+            .map(|w| w.hwnd)
+            .collect();
+        let hwnds = picker.resolve_commit_hwnds(&all_candidates, &filtered_candidates);
+        if !hwnds.is_empty() {
+            self.add_windows_to_virtual_space(picker.space_id, &hwnds, window, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    fn render_add_window_picker(
+        &mut self,
+        viewport_w_logical: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::Stateful<gpui::Div>> {
+        let picker = self.add_picker.clone()?;
+        let space_name = self
+            .virtual_spaces
+            .get(picker.space_id)
+            .map(|s| s.name.clone())?;
+
+        let all_candidates = self.picker_candidate_windows(picker.space_id);
+        let q_lower = picker.query.trim().to_lowercase();
+        let filtered: Vec<WindowInfo> = all_candidates
+            .iter()
+            .filter(|w| picker_matches_query(w, &q_lower))
+            .cloned()
+            .collect();
+        let filtered_hwnds: Vec<isize> = filtered.iter().map(|w| w.hwnd).collect();
+
+        let list_h = self.picker_viewport_h();
+        if let Some(ref mut p) = self.add_picker {
+            p.clamp_focus_and_scroll(filtered.len(), list_h);
+        }
+        let picker = self.add_picker.clone()?;
+        let selected_count = picker.selected.len();
+        let can_commit = selected_count > 0 || !filtered.is_empty();
+        let show_desktop_badge = self.desktops.len() > 1;
+
+        let desktop_labels: HashMap<DesktopId, String> = self
+            .desktops
+            .iter()
+            .enumerate()
+            .map(|(idx, d)| {
+                let name = d
+                    .custom_name
+                    .clone()
+                    .unwrap_or_else(|| format!("桌面 {}", idx + 1));
+                (d.id, name)
+            })
+            .collect();
+
+        let mut rows = Vec::with_capacity(filtered.len());
+        for (row_idx, win) in filtered.iter().enumerate() {
+            let row_hwnd = win.hwnd;
+            let is_checked = picker.selected.contains(&row_hwnd);
+            let is_focused = row_idx == picker.focused_idx;
+            let icon = self.cached_icon(win);
+            let (monogram, accent_color) = monogram_and_color(&win.process_name, &win.title);
+            let title = if win.title.trim().is_empty() {
+                win.process_name.clone()
+            } else {
+                win.title.clone()
+            };
+            let desktop_badge = if show_desktop_badge {
+                if win.is_pinned {
+                    Some("所有桌面".to_string())
+                } else {
+                    win.desktop_id
+                        .and_then(|did| desktop_labels.get(&did).cloned())
+                }
+            } else {
+                None
+            };
+            let visible_for_shift = filtered_hwnds.clone();
+
+            let icon_el = if let Some(render_img) = icon {
+                div()
+                    .size(px(20.0))
+                    .flex_shrink_0()
+                    .child(img(render_img).size(px(20.0)).rounded(px(4.0)))
+            } else {
+                div()
+                    .size(px(20.0))
+                    .flex_shrink_0()
+                    .rounded(px(5.0))
+                    .bg(rgb(accent_color))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(rgb(0xFFFFFF))
+                    .child(monogram)
+            };
+
+            let row = div()
+                .id(("add-picker-row", row_idx))
+                .h(px(PICKER_ROW_H))
+                .w_full()
+                .px(px(10.0))
+                .rounded(px(9.0))
+                .cursor_pointer()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
+                .bg(if is_checked {
+                    rgba(0xA78BFA2B)
+                } else if is_focused {
+                    rgba(0xFFFFFF0D)
+                } else {
+                    rgba(0x00000000)
+                })
+                .border_1()
+                .border_color(if is_focused {
+                    rgba(0xC4B5FD99)
+                } else if is_checked {
+                    rgba(0xA78BFA38)
+                } else {
+                    rgba(0x00000000)
+                })
+                .hover(|s| {
+                    s.bg(if is_checked {
+                        rgba(0xA78BFA38)
+                    } else {
+                        rgba(0xFFFFFF12)
+                    })
+                })
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        if let Some(ref mut p) = this.add_picker {
+                            p.toggle_hwnd(row_hwnd, row_idx);
+                        }
+                        cx.notify();
+                    }),
+                )
+                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    let (ctrl_held, shift_held) = match event {
+                        ClickEvent::Mouse(m) => (
+                            m.down.modifiers.control || m.up.modifiers.control,
+                            m.down.modifiers.shift || m.up.modifiers.shift,
+                        ),
+                        ClickEvent::Keyboard(_) => (false, false),
+                    };
+                    if ctrl_held {
+                        if let Some(ref mut p) = this.add_picker {
+                            p.toggle_hwnd(row_hwnd, row_idx);
+                        }
+                        cx.notify();
+                    } else if shift_held {
+                        if let Some(ref mut p) = this.add_picker {
+                            p.range_select(&visible_for_shift, row_idx);
+                        }
+                        cx.notify();
+                    } else if event.click_count() >= 2 {
+                        this.commit_add_picker(Some(row_hwnd), window, cx);
+                    } else {
+                        if let Some(ref mut p) = this.add_picker {
+                            p.single_select(row_hwnd, row_idx);
+                        }
+                        cx.notify();
+                    }
+                }))
+                .child(
+                    div()
+                        .id(("add-picker-cb", row_idx))
+                        .p(px(4.0))
+                        .m(px(-4.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            cx.stop_propagation();
+                            if let Some(ref mut p) = this.add_picker {
+                                p.toggle_hwnd(row_hwnd, row_idx);
+                            }
+                            cx.notify();
+                        }))
+                        .child(check_mark_dot(is_checked)),
+                )
+                .child(icon_el)
+                .child(
+                    div()
+                        .min_w_0()
+                        .flex_1()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_xs()
+                        .font_weight(if is_checked || is_focused {
+                            gpui::FontWeight::SEMIBOLD
+                        } else {
+                            gpui::FontWeight::MEDIUM
+                        })
+                        .text_color(if is_checked || is_focused {
+                            rgba(0xFFFFFFFA)
+                        } else {
+                            rgba(0xFFFFFFD6)
+                        })
+                        .child(title),
+                )
+                .when_some(desktop_badge, |el, badge| {
+                    el.child(
+                        div()
+                            .flex_shrink_0()
+                            .px(px(7.0))
+                            .py(px(2.0))
+                            .rounded_full()
+                            .bg(rgba(0xFFFFFF0D))
+                            .text_xs()
+                            .text_color(rgba(0xFFFFFF6E))
+                            .child(badge),
+                    )
+                });
+
+            rows.push(row);
+        }
+
+        let content_h = AddWindowPickerState::list_content_height(filtered.len());
+        let max_scroll = (content_h - list_h).max(0.0);
+        let show_sb = max_scroll > 1.0;
+        let sb_ratio = (list_h / content_h.max(1.0)).clamp(0.12, 1.0);
+        let sb_h = (list_h * sb_ratio).max(26.0);
+        let sb_top = if max_scroll > 0.0 {
+            (picker.scroll_y / max_scroll) * (list_h - sb_h).max(0.0)
+        } else {
+            0.0
+        };
+
+        let modal_w = (viewport_w_logical - 48.0).clamp(340.0, 520.0);
+        let entity_for_ime = cx.entity();
+        let focus_for_ime = self.focus_handle.clone();
+        let query_empty = picker.query.is_empty();
+        let is_composing = picker.marked_range.is_some();
+
+        let search_box = div()
+            .id("add-picker-search")
+            .relative()
+            .w(px(196.0))
+            .h(px(28.0))
+            .px(px(10.0))
+            .rounded_full()
+            .cursor_text()
+            .bg(if picker.search_focused {
+                rgba(0xA78BFA26)
+            } else {
+                rgba(0xFFFFFF0D)
+            })
+            .border_1()
+            .border_color(if picker.search_focused {
+                rgba(0xC4B5FDAA)
+            } else {
+                rgba(0xFFFFFF1A)
+            })
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.0))
+            .on_click(cx.listener(|this, _, window, cx| {
+                cx.stop_propagation();
+                if let Some(ref mut p) = this.add_picker {
+                    p.search_focused = true;
+                }
+                window.focus(&this.focus_handle);
+                cx.notify();
+            }))
+            .child(search_icon(picker.search_focused))
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .child(
+                        div()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .when(is_composing, |el| {
+                                el.border_b_1().border_color(rgba(0xE9D5FFCC))
+                            })
+                            .text_xs()
+                            .text_color(if query_empty {
+                                rgba(0xFFFFFF4D)
+                            } else {
+                                rgba(0xFFFFFFF2)
+                            })
+                            .child(if query_empty && !picker.search_focused {
+                                "搜索".to_string()
+                            } else {
+                                picker.query.clone()
+                            }),
+                    )
+                    .when(picker.search_focused, |el| {
+                        el.child(
+                            div()
+                                .ml(px(1.0))
+                                .w(px(1.5))
+                                .h(px(12.0))
+                                .rounded(px(1.0))
+                                .bg(rgba(0xFFFFFFEE)),
+                        )
+                    }),
+            )
+            .when(!query_empty, |el| {
+                el.child(
+                    div()
+                        .id("add-picker-search-clear")
+                        .size(px(16.0))
+                        .rounded_full()
+                        .cursor_pointer()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .hover(|s| s.bg(rgba(0xFFFFFF22)))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            cx.stop_propagation();
+                            if let Some(ref mut p) = this.add_picker {
+                                p.query.clear();
+                                p.marked_range = None;
+                                p.focused_idx = 0;
+                                p.scroll_y = 0.0;
+                            }
+                            cx.notify();
+                        }))
+                        .child(div().text_xs().text_color(rgba(0xFFFFFFAA)).child("×")),
+                )
+            })
+            .when(picker.search_focused, |el| {
+                el.child(
+                    canvas(
+                        |bounds, _, _| bounds,
+                        move |bounds, _, window, cx| {
+                            window.handle_input(
+                                &focus_for_ime,
+                                ElementInputHandler::new(bounds, entity_for_ime.clone()),
+                                cx,
+                            );
+                        },
+                    )
+                    .absolute()
+                    .inset_0()
+                    .size_full(),
+                )
+            });
+
+        let add_btn_label = if selected_count > 0 {
+            format!("添加 ({selected_count})")
+        } else {
+            "添加".to_string()
+        };
+
+        let modal = div()
+            .id("add-picker-modal")
+            .w(px(modal_w))
+            .rounded(px(16.0))
+            .bg(rgba(0x131024F4))
+            .border_1()
+            .border_color(rgba(0xA78BFA44))
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+            .on_click(|_, _, cx| cx.stop_propagation())
+            // Header
+            .child(
+                div()
+                    .h(px(48.0))
+                    .px(px(16.0))
+                    .border_b_1()
+                    .border_color(rgba(0xA78BFA24))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .gap(px(12.0))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(virtual_space_icon(true))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(rgba(0xFFFFFFFA))
+                                    .child(space_name),
+                            ),
+                    )
+                    .child(search_box),
+            )
+            // Scrollable window list
+            .child(
+                div()
+                    .relative()
+                    .w_full()
+                    .h(px(list_h))
+                    .overflow_hidden()
+                    .px(px(10.0))
+                    .py(px(8.0))
+                    .child(if rows.is_empty() {
+                        div()
+                            .size_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_xs()
+                            .text_color(rgba(0xFFFFFF66))
+                            .child(if all_candidates.is_empty() {
+                                "所有窗口均已在当前空间中"
+                            } else {
+                                "无匹配窗口"
+                            })
+                    } else {
+                        div()
+                            .relative()
+                            .top(px(-picker.scroll_y))
+                            .w_full()
+                            .flex()
+                            .flex_col()
+                            .gap(px(PICKER_ROW_GAP))
+                            .children(rows)
+                    })
+                    .when(show_sb, |el| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .top(px(sb_top + 6.0))
+                                .right(px(4.0))
+                                .w(px(3.5))
+                                .h(px((sb_h - 12.0).max(20.0)))
+                                .rounded_full()
+                                .bg(rgba(0xC4B5FD48)),
+                        )
+                    }),
+            )
+            // Footer
+            .child(
+                div()
+                    .h(px(48.0))
+                    .px(px(14.0))
+                    .border_t_1()
+                    .border_color(rgba(0xA78BFA24))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(rgba(0xD8B4FEDE))
+                            .when(selected_count > 0, |el| {
+                                el.child(format!("已选 {selected_count}"))
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .id("add-picker-cancel")
+                                    .h(px(28.0))
+                                    .px(px(14.0))
+                                    .rounded_full()
+                                    .cursor_pointer()
+                                    .bg(rgba(0xFFFFFF10))
+                                    .hover(|s| s.bg(rgba(0xFFFFFF1F)))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(rgba(0xFFFFFFD0))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        this.close_add_picker(cx);
+                                    }))
+                                    .child("取消"),
+                            )
+                            .child(
+                                div()
+                                    .id("add-picker-confirm")
+                                    .h(px(28.0))
+                                    .px(px(16.0))
+                                    .rounded_full()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .when(can_commit, |el| {
+                                        el.cursor_pointer()
+                                            .bg(rgba(0x8B5CF6E0))
+                                            .hover(|s| s.bg(rgba(0x9333EAF5)))
+                                            .text_color(rgba(0xFFFFFFFA))
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                this.commit_add_picker(None, window, cx);
+                                            }))
+                                    })
+                                    .when(!can_commit, |el| {
+                                        el.bg(rgba(0xFFFFFF0D)).text_color(rgba(0xFFFFFF44))
+                                    })
+                                    .child(add_btn_label),
+                            ),
+                    ),
+            );
+
+        Some(
+            div()
+                .id("add-picker-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(rgba(0x05070DB0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.close_add_picker(cx);
+                }))
+                .child(modal),
+        )
     }
 
     fn create_new_desktop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1077,14 +2773,31 @@ impl SwitcherView {
         }
     }
 
-    /// If a desktop tab is currently armed as a trash-can button, cancels it and returns `true`.
-    fn dismiss_armed_delete(&mut self, cx: &mut Context<Self>) -> bool {
-        if self.armed_delete_desktop.take().is_some() {
-            cx.notify();
-            true
-        } else {
-            false
+    /// Dismisses any open picker, card context menu, inline space rename, or armed trash state.
+    /// Returns `true` if something was open and consumed the click/key.
+    fn dismiss_space_popups(&mut self, commit_rename: bool, cx: &mut Context<Self>) -> bool {
+        let mut consumed = false;
+        if self.add_picker.take().is_some() {
+            consumed = true;
         }
+        if self.context_menu.take().is_some() {
+            consumed = true;
+        }
+        if self.renaming_space.is_some() {
+            if commit_rename {
+                self.commit_renaming_space(cx);
+            } else {
+                self.cancel_renaming_space(cx);
+            }
+            consumed = true;
+        }
+        if self.armed_delete.take().is_some() {
+            consumed = true;
+        }
+        if consumed {
+            cx.notify();
+        }
+        consumed
     }
 
     fn remove_desktop_by_id(
@@ -1094,7 +2807,7 @@ impl SwitcherView {
         cx: &mut Context<Self>,
     ) {
         self.disarm_hold_mode();
-        self.armed_delete_desktop = None;
+        self.clear_space_popups();
         if self.desktops.len() <= 1 {
             self.transient_toast = Some((
                 SharedString::from("至少需要保留 1 个虚拟桌面"),
@@ -1129,8 +2842,8 @@ impl SwitcherView {
 
         match self.vdm.remove_desktop(desktop_id, fallback_id) {
             Ok(()) => {
-                if self.desktop_filter == Some(desktop_id) {
-                    self.desktop_filter = None;
+                if self.view_filter == ViewFilter::NativeDesktop(desktop_id) {
+                    self.view_filter = ViewFilter::All;
                     self.scroll_y = 0.0;
                     self.scroll_target_y = 0.0;
                     self.scroll_last_tick = None;
@@ -1276,21 +2989,24 @@ impl SwitcherView {
             let group_header_top = y;
             y += GROUP_HEADER_H;
 
-            if group.cards.is_empty() {
+            let visual_count = group.cards.len() + usize::from(group.virtual_space_id.is_some());
+            if visual_count == 0 {
                 y += EMPTY_GROUP_H;
                 continue;
             }
 
-            let rows = group.cards.len().div_ceil(cols);
+            let rows = visual_count.div_ceil(cols);
             for r in 0..rows {
                 let row_top = y;
                 let row_bottom = row_top + item_h;
                 let start = r * cols;
-                let end = (start + cols).min(group.cards.len());
-                for card in &group.cards[start..end] {
-                    if card.flat_index == self.selected_flat {
-                        let top = if r == 0 { group_header_top } else { row_top };
-                        selected_range = Some((top, row_bottom));
+                if start < group.cards.len() {
+                    let end = (start + cols).min(group.cards.len());
+                    for card in &group.cards[start..end] {
+                        if card.flat_index == self.selected_flat {
+                            let top = if r == 0 { group_header_top } else { row_top };
+                            selected_range = Some((top, row_bottom));
+                        }
                     }
                 }
                 y = row_bottom;
@@ -1339,37 +3055,40 @@ impl SwitcherView {
             }
             y += GROUP_HEADER_H;
 
-            if group.cards.is_empty() {
+            let visual_count = group.cards.len() + usize::from(group.virtual_space_id.is_some());
+            if visual_count == 0 {
                 y += EMPTY_GROUP_H;
                 continue;
             }
 
-            let rows = group.cards.len().div_ceil(cols);
+            let rows = visual_count.div_ceil(cols);
             for r in 0..rows {
                 let row_top = y;
                 let start = r * cols;
-                let end = (start + cols).min(group.cards.len());
-                for (c, card) in group.cards[start..end].iter().enumerate() {
-                    let item_left = grid_left + (c as f32) * (tile_outer_w + COL_GAP);
-                    let ring_content_y = optical_top_pad + row_top;
-                    let ring_content_bounds = Bounds {
-                        origin: point(px(item_left), px(ring_content_y)),
-                        size: size(px(tile_outer_w), px(ring_h)),
-                    };
-                    let thumb_window_bounds = Bounds {
-                        origin: point(
-                            px(item_left + TOTAL_RING_PAD),
-                            px(vp_origin_y + ring_content_y - scroll_y + TOTAL_RING_PAD),
-                        ),
-                        size: size(px(preview_w), px(preview_h)),
-                    };
-                    map.insert(
-                        card.flat_index,
-                        CardLayoutRect {
-                            ring_content_bounds,
-                            thumb_window_bounds,
-                        },
-                    );
+                if start < group.cards.len() {
+                    let end = (start + cols).min(group.cards.len());
+                    for (c, card) in group.cards[start..end].iter().enumerate() {
+                        let item_left = grid_left + (c as f32) * (tile_outer_w + COL_GAP);
+                        let ring_content_y = optical_top_pad + row_top;
+                        let ring_content_bounds = Bounds {
+                            origin: point(px(item_left), px(ring_content_y)),
+                            size: size(px(tile_outer_w), px(ring_h)),
+                        };
+                        let thumb_window_bounds = Bounds {
+                            origin: point(
+                                px(item_left + TOTAL_RING_PAD),
+                                px(vp_origin_y + ring_content_y - scroll_y + TOTAL_RING_PAD),
+                            ),
+                            size: size(px(preview_w), px(preview_h)),
+                        };
+                        map.insert(
+                            card.flat_index,
+                            CardLayoutRect {
+                                ring_content_bounds,
+                                thumb_window_bounds,
+                            },
+                        );
+                    }
                 }
                 y = row_top + item_h;
                 if r + 1 < rows {
@@ -1640,7 +3359,7 @@ impl SwitcherView {
         self.scroll_y = self.scroll_target_y;
         self.scroll_last_tick = None;
         self.disarm_hold_mode();
-        self.armed_delete_desktop = None;
+        self.clear_space_popups();
         self.hovered_flat = None;
 
         let mut target_info = self
@@ -1959,7 +3678,7 @@ impl SwitcherView {
         self.scroll_y = self.scroll_target_y;
         self.scroll_last_tick = None;
         self.disarm_hold_mode();
-        self.armed_delete_desktop = None;
+        self.clear_space_popups();
         self.hovered_flat = None;
 
         let cur_idx = self.desktops.iter().position(|d| d.is_current).unwrap_or(0);
@@ -2040,7 +3759,7 @@ impl SwitcherView {
         self.hold_active = false;
         self.hold_navigated = false;
         self.hovered_flat = None;
-        self.armed_delete_desktop = None;
+        self.clear_space_popups();
         self.sync_visibility_to_host();
 
         match exit.kind {
@@ -2165,7 +3884,7 @@ impl SwitcherView {
 
         // Cancel hold-to-jump so releasing the launch modifier afterwards does not jump to a neighbor window
         self.disarm_hold_mode();
-        self.armed_delete_desktop = None;
+        self.clear_space_popups();
 
         match force_quit_window(target_hwnd, same_pid_count) {
             Ok(report) => {
@@ -2272,18 +3991,262 @@ impl SwitcherView {
             return;
         }
 
+        // Add-window modal picker inside a virtual space
+        if let Some((space_id, query, search_focused)) = self
+            .add_picker
+            .as_ref()
+            .map(|p| (p.space_id, p.query.clone(), p.search_focused))
+        {
+            let filtered_hwnds: Vec<isize> = self
+                .picker_filtered_windows(space_id, &query)
+                .into_iter()
+                .map(|w| w.hwnd)
+                .collect();
+            let list_h = self.picker_viewport_h();
+
+            match key {
+                "escape" => {
+                    cx.stop_propagation();
+                    if search_focused {
+                        if let Some(ref mut picker) = self.add_picker {
+                            if !picker.query.is_empty() {
+                                picker.query.clear();
+                                picker.marked_range = None;
+                                picker.focused_idx = 0;
+                                picker.scroll_y = 0.0;
+                            } else {
+                                picker.search_focused = false;
+                            }
+                        }
+                        cx.notify();
+                    } else {
+                        self.close_add_picker(cx);
+                    }
+                    return;
+                }
+                "enter" => {
+                    cx.stop_propagation();
+                    self.commit_add_picker(None, window, cx);
+                    return;
+                }
+                "up" => {
+                    cx.stop_propagation();
+                    if let Some(ref mut picker) = self.add_picker {
+                        if picker.search_focused {
+                            picker.search_focused = false;
+                            picker.clamp_focus_and_scroll(filtered_hwnds.len(), list_h);
+                        } else {
+                            picker.move_focus(-1, filtered_hwnds.len(), list_h);
+                        }
+                    }
+                    cx.notify();
+                    return;
+                }
+                "down" => {
+                    cx.stop_propagation();
+                    if let Some(ref mut picker) = self.add_picker {
+                        if picker.search_focused {
+                            picker.search_focused = false;
+                            picker.clamp_focus_and_scroll(filtered_hwnds.len(), list_h);
+                        } else {
+                            picker.move_focus(1, filtered_hwnds.len(), list_h);
+                        }
+                    }
+                    cx.notify();
+                    return;
+                }
+                "home" if !search_focused => {
+                    cx.stop_propagation();
+                    if let Some(ref mut picker) = self.add_picker {
+                        picker.focused_idx = 0;
+                        picker.ensure_focused_visible(filtered_hwnds.len(), list_h);
+                    }
+                    cx.notify();
+                    return;
+                }
+                "end" if !search_focused => {
+                    cx.stop_propagation();
+                    if let Some(ref mut picker) = self.add_picker {
+                        if !filtered_hwnds.is_empty() {
+                            picker.focused_idx = filtered_hwnds.len() - 1;
+                            picker.ensure_focused_visible(filtered_hwnds.len(), list_h);
+                        }
+                    }
+                    cx.notify();
+                    return;
+                }
+                "f" if mods.control => {
+                    cx.stop_propagation();
+                    if let Some(ref mut picker) = self.add_picker {
+                        picker.search_focused = true;
+                    }
+                    cx.notify();
+                    return;
+                }
+                _ => {}
+            }
+
+            if search_focused {
+                match key {
+                    "backspace" => {
+                        cx.stop_propagation();
+                        if let Some(ref mut picker) = self.add_picker {
+                            if mods.control {
+                                picker.query.clear();
+                            } else {
+                                picker.query.pop();
+                            }
+                            picker.marked_range = None;
+                            picker.focused_idx = 0;
+                            picker.scroll_y = 0.0;
+                        }
+                        cx.notify();
+                    }
+                    "v" if mods.control => {
+                        cx.stop_propagation();
+                        if let Some(clip) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                            let clean: String = clip.chars().filter(|c| !c.is_control()).collect();
+                            if let Some(ref mut picker) = self.add_picker {
+                                picker.query.push_str(&clean);
+                                picker.marked_range = None;
+                                picker.clamp_query();
+                                picker.focused_idx = 0;
+                                picker.scroll_y = 0.0;
+                            }
+                            cx.notify();
+                        }
+                    }
+                    "tab" => {
+                        cx.stop_propagation();
+                        if let Some(ref mut picker) = self.add_picker {
+                            picker.search_focused = false;
+                        }
+                        cx.notify();
+                    }
+                    _ => {
+                        // Leave unhandled so GPUI translates WM_CHAR / IME into EntityInputHandler!
+                    }
+                }
+            } else {
+                cx.stop_propagation();
+                match key {
+                    "space" => {
+                        if let Some(ref mut picker) = self.add_picker {
+                            picker.clamp_focus_and_scroll(filtered_hwnds.len(), list_h);
+                            if picker.toggle_focused(&filtered_hwnds) {
+                                cx.notify();
+                            }
+                        }
+                    }
+                    "tab" => {
+                        let delta = if shift { -1 } else { 1 };
+                        if let Some(ref mut picker) = self.add_picker {
+                            picker.move_focus(delta, filtered_hwnds.len(), list_h);
+                        }
+                        cx.notify();
+                    }
+                    "a" if mods.control => {
+                        if let Some(ref mut picker) = self.add_picker {
+                            picker.select_all_visible(&filtered_hwnds);
+                        }
+                        cx.notify();
+                    }
+                    "/" => {
+                        if let Some(ref mut picker) = self.add_picker {
+                            picker.search_focused = true;
+                        }
+                        cx.notify();
+                    }
+                    _ => {}
+                }
+            }
+            return;
+        }
+
+        // Inline rename mode for a soft virtual space (supports ASCII + full Windows IME via EntityInputHandler)
+        if self.renaming_space.is_some() {
+            match key {
+                "enter" => {
+                    cx.stop_propagation();
+                    self.commit_renaming_space(cx);
+                }
+                "escape" => {
+                    cx.stop_propagation();
+                    self.cancel_renaming_space(cx);
+                }
+                "backspace" => {
+                    cx.stop_propagation();
+                    if let Some(ref mut state) = self.renaming_space {
+                        if state.select_all {
+                            state.text.clear();
+                            state.select_all = false;
+                        } else {
+                            state.text.pop();
+                        }
+                        state.marked_range = None;
+                        cx.notify();
+                    }
+                }
+                "delete" => {
+                    cx.stop_propagation();
+                    if let Some(ref mut state) = self.renaming_space {
+                        if state.select_all {
+                            state.text.clear();
+                            state.select_all = false;
+                            state.marked_range = None;
+                            cx.notify();
+                        }
+                    }
+                }
+                "a" if mods.control => {
+                    cx.stop_propagation();
+                    if let Some(ref mut state) = self.renaming_space {
+                        state.select_all = true;
+                        cx.notify();
+                    }
+                }
+                "v" if mods.control => {
+                    cx.stop_propagation();
+                    if let Some(clip) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                        let clean: String = clip.chars().filter(|c| !c.is_control()).collect();
+                        if let Some(ref mut state) = self.renaming_space {
+                            if state.select_all {
+                                state.text.clear();
+                                state.select_all = false;
+                            }
+                            state.text.push_str(&clean);
+                            state.marked_range = None;
+                            state.clamp_name();
+                            cx.notify();
+                        }
+                    }
+                }
+                "left" | "right" | "home" | "end" => {
+                    cx.stop_propagation();
+                    if let Some(ref mut state) = self.renaming_space {
+                        state.select_all = false;
+                        cx.notify();
+                    }
+                }
+                _ => {
+                    // Leave unhandled so GPUI runs TranslateMessage -> WM_CHAR / IME composition!
+                }
+            }
+            return;
+        }
+
         let (cols, _, _, _, _) = self.fixed_grid_geometry();
         let sizes = self.group_sizes();
 
         if key == "escape" {
             cx.stop_propagation();
-            if self.dismiss_armed_delete(cx) {
+            if self.dismiss_space_popups(false, cx) {
                 return;
             }
             self.hide(cx);
             return;
         }
-        if self.armed_delete_desktop.take().is_some() {
+        if self.armed_delete.take().is_some() || self.context_menu.take().is_some() {
             cx.notify();
         }
 
@@ -2306,8 +4269,71 @@ impl SwitcherView {
                 cx.stop_propagation();
                 if let Some(&hwnd) = self.flat_hwnds.get(self.selected_flat) {
                     self.activate_window(hwnd, window, cx);
-                } else if let Some(did) = self.desktop_filter {
+                } else if let ViewFilter::NativeDesktop(did) = self.view_filter {
                     self.switch_to_desktop_only(did, window, cx);
+                }
+            }
+            "backspace" => {
+                if let ViewFilter::VirtualSpace(sid) = self.view_filter {
+                    cx.stop_propagation();
+                    let target_idx = self.hovered_flat.unwrap_or(self.selected_flat);
+                    if let Some(&hwnd) = self.flat_hwnds.get(target_idx) {
+                        self.remove_window_from_virtual_space(sid, hwnd, window, cx);
+                    }
+                }
+            }
+            "f2" => {
+                if let ViewFilter::VirtualSpace(sid) = self.view_filter {
+                    cx.stop_propagation();
+                    self.start_renaming_space(sid, window, cx);
+                }
+            }
+            "a" if !mods.control && !mods.alt && !mods.shift => {
+                if let ViewFilter::VirtualSpace(sid) = self.view_filter {
+                    cx.stop_propagation();
+                    self.open_add_picker(sid, window, cx);
+                }
+            }
+            "[" => {
+                cx.stop_propagation();
+                let mut tabs = Vec::with_capacity(
+                    1 + self.desktops.len() + self.virtual_spaces.spaces().len(),
+                );
+                tabs.push(ViewFilter::All);
+                for d in &self.desktops {
+                    tabs.push(ViewFilter::NativeDesktop(d.id));
+                }
+                for s in self.virtual_spaces.spaces() {
+                    tabs.push(ViewFilter::VirtualSpace(s.id));
+                }
+                if tabs.len() > 1 {
+                    let cur = tabs
+                        .iter()
+                        .position(|&f| f == self.view_filter)
+                        .unwrap_or(0);
+                    let prev = if cur == 0 { tabs.len() - 1 } else { cur - 1 };
+                    self.set_view_filter(tabs[prev], window, cx);
+                }
+            }
+            "]" => {
+                cx.stop_propagation();
+                let mut tabs = Vec::with_capacity(
+                    1 + self.desktops.len() + self.virtual_spaces.spaces().len(),
+                );
+                tabs.push(ViewFilter::All);
+                for d in &self.desktops {
+                    tabs.push(ViewFilter::NativeDesktop(d.id));
+                }
+                for s in self.virtual_spaces.spaces() {
+                    tabs.push(ViewFilter::VirtualSpace(s.id));
+                }
+                if tabs.len() > 1 {
+                    let cur = tabs
+                        .iter()
+                        .position(|&f| f == self.view_filter)
+                        .unwrap_or(0);
+                    let next = (cur + 1) % tabs.len();
+                    self.set_view_filter(tabs[next], window, cx);
                 }
             }
             "right" => {
@@ -2449,15 +4475,20 @@ impl SwitcherView {
                 window.refresh();
                 cx.notify();
             }
-            // Number keys: 0 = 全部, 1..9 = filter Desktop 1..9
+            // Number keys: 0 = 全部, 1..9 = filter Native Desktop 1..9, Ctrl+1..9 = filter Virtual Space 1..9
             "0" => {
-                self.set_desktop_filter(None, window, cx);
+                self.set_view_filter(ViewFilter::All, window, cx);
             }
             "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
                 if let Ok(n) = key.parse::<usize>() {
-                    if let Some(d) = self.desktops.get(n - 1) {
+                    if mods.control {
+                        if let Some(s) = self.virtual_spaces.spaces().get(n - 1) {
+                            let sid = s.id;
+                            self.set_view_filter(ViewFilter::VirtualSpace(sid), window, cx);
+                        }
+                    } else if let Some(d) = self.desktops.get(n - 1) {
                         let did = d.id;
-                        self.set_desktop_filter(Some(did), window, cx);
+                        self.set_view_filter(ViewFilter::NativeDesktop(did), window, cx);
                     }
                 }
             }
@@ -2473,6 +4504,27 @@ impl SwitcherView {
     ) {
         if self.exit_anim.is_some() {
             return;
+        }
+        if let Some((space_id, query)) = self
+            .add_picker
+            .as_ref()
+            .map(|p| (p.space_id, p.query.clone()))
+        {
+            let count = self.picker_filtered_windows(space_id, &query).len();
+            let list_h = self.picker_viewport_h();
+            let delta_y = match event.delta {
+                ScrollDelta::Lines(pt) => -pt.y * 54.0,
+                ScrollDelta::Pixels(pt) => -f32::from(pt.y),
+            };
+            if let Some(ref mut picker) = self.add_picker {
+                picker.scroll_y += delta_y;
+                picker.clamp_focus_and_scroll(count, list_h);
+            }
+            cx.notify();
+            return;
+        }
+        if self.context_menu.take().is_some() {
+            cx.notify();
         }
         let delta_y = match event.delta {
             ScrollDelta::Lines(pt) => -pt.y * 64.0,
@@ -2908,9 +4960,13 @@ impl Render for SwitcherView {
             Self::schedule_next_frame(window, cx);
         }
 
-        // === TOP FLOATING APPLE SPACES BAR: [ 全部 ] [ 桌面 1 ] [ 桌面 2 ] ... [ + ] ===
+        // === TOP FLOATING DUAL-CAPSULE SPACES BAR ===
+        // Left capsule: Windows native virtual desktops ([ 全部 ] [ 桌面 1 ] ... | [ + ])
+        // Right capsule: WinDeck logical virtual spaces ([ ⊞ ] [ 空间 1 ] ... | [ + ])
+        let is_dragging_window = cx.has_active_drag();
         let mut space_pills = Vec::with_capacity(self.desktops.len() + 3);
-        let all_selected = override_active_desktop.is_none() && self.desktop_filter.is_none();
+        let all_selected =
+            override_active_desktop.is_none() && self.view_filter == ViewFilter::All;
 
         // 1. [ 全部 ] pill
         space_pills.push(
@@ -2938,10 +4994,10 @@ impl Render for SwitcherView {
                 })
                 .on_click(cx.listener(|this, _, window, cx| {
                     cx.stop_propagation();
-                    if this.dismiss_armed_delete(cx) {
+                    if this.dismiss_space_popups(true, cx) {
                         return;
                     }
-                    this.set_desktop_filter(None, window, cx);
+                    this.set_view_filter(ViewFilter::All, window, cx);
                 }))
                 .child(
                     div()
@@ -2960,9 +5016,7 @@ impl Render for SwitcherView {
                 ),
         );
 
-        // 2. [ 桌面 1 ] [ 桌面 2 ] ... pills
-        //    Left click = filter, Left double-click = switch directly
-        //    Right click = morph pill into red trash button; Left click trash = close; click anywhere else = cancel
+        // 2. [ 桌面 1 ] [ 桌面 2 ] ... native OS desktop pills
         for (d_idx, d_info) in self.desktops.iter().enumerate() {
             let did = d_info.id;
             let is_cur = match override_active_desktop {
@@ -2971,9 +5025,9 @@ impl Render for SwitcherView {
             };
             let is_filtered = match override_active_desktop {
                 Some(over_did) => over_did == did,
-                None => self.desktop_filter == Some(did),
+                None => self.view_filter == ViewFilter::NativeDesktop(did),
             };
-            let is_armed_delete = self.armed_delete_desktop == Some(did);
+            let is_armed_delete = self.armed_delete == Some(ArmedDelete::NativeDesktop(did));
             let label = d_info
                 .custom_name
                 .clone()
@@ -2995,30 +5049,34 @@ impl Render for SwitcherView {
                     MouseButton::Right,
                     cx.listener(move |this, _, _, cx| {
                         cx.stop_propagation();
+                        this.context_menu = None;
+                        if this.renaming_space.is_some() {
+                            this.commit_renaming_space(cx);
+                        }
                         if this.desktops.len() <= 1 {
-                            this.armed_delete_desktop = None;
+                            this.armed_delete = None;
                             this.transient_toast = Some((
                                 SharedString::from("至少需要保留 1 个虚拟桌面"),
                                 Instant::now(),
                             ));
-                        } else if this.armed_delete_desktop == Some(did) {
-                            this.armed_delete_desktop = None;
+                        } else if this.armed_delete == Some(ArmedDelete::NativeDesktop(did)) {
+                            this.armed_delete = None;
                         } else {
-                            this.armed_delete_desktop = Some(did);
+                            this.armed_delete = Some(ArmedDelete::NativeDesktop(did));
                         }
                         cx.notify();
                     }),
                 )
                 .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
                     cx.stop_propagation();
-                    if this.armed_delete_desktop == Some(did) {
+                    if this.armed_delete == Some(ArmedDelete::NativeDesktop(did)) {
                         this.remove_desktop_by_id(did, window, cx);
-                    } else if this.dismiss_armed_delete(cx) {
-                        // Clicking any other pill cancels the armed trash state
+                    } else if this.dismiss_space_popups(true, cx) {
+                        // Clicking any other pill cancels popups / armed trash
                     } else if event.click_count() >= 2 {
                         this.switch_to_desktop_only(did, window, cx);
                     } else {
-                        this.set_desktop_filter(Some(did), window, cx);
+                        this.set_view_filter(ViewFilter::NativeDesktop(did), window, cx);
                     }
                 }));
 
@@ -3088,7 +5146,7 @@ impl Render for SwitcherView {
                 .hover(|s| s.bg(rgba(0xFFFFFF28)))
                 .on_click(cx.listener(|this, _, window, cx| {
                     cx.stop_propagation();
-                    if this.dismiss_armed_delete(cx) {
+                    if this.dismiss_space_popups(true, cx) {
                         return;
                     }
                     this.create_new_desktop(window, cx);
@@ -3102,12 +5160,270 @@ impl Render for SwitcherView {
                 ),
         );
 
+        // === RIGHT CAPSULE: WINDECK LOGICAL VIRTUAL SPACES ===
+        let in_virtual_space = matches!(self.view_filter, ViewFilter::VirtualSpace(_))
+            && override_active_desktop.is_none();
+        let soft_spaces = self.virtual_spaces.spaces().to_vec();
+        let mut virtual_space_pills = Vec::with_capacity(soft_spaces.len() + 3);
+        virtual_space_pills.push(
+            div()
+                .id("virtual-spaces-glyph")
+                .pl(px(5.0))
+                .pr(px(2.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(virtual_space_icon(in_virtual_space || is_dragging_window)),
+        );
+
+        let view_entity = cx.entity();
+        let focus_for_ime = self.focus_handle.clone();
+
+        for (s_idx, space) in soft_spaces.iter().enumerate() {
+            let sid = space.id;
+            let is_filtered = override_active_desktop.is_none()
+                && self.view_filter == ViewFilter::VirtualSpace(sid);
+            let is_armed_delete = self.armed_delete == Some(ArmedDelete::VirtualSpace(sid));
+            let live_count = self.virtual_spaces.live_count(sid, &self.all_windows);
+            let rename_match = self
+                .renaming_space
+                .as_ref()
+                .filter(|r| r.space_id == sid)
+                .cloned();
+
+            if let Some(ren) = rename_match {
+                let entity_for_ime = view_entity.clone();
+                let focus_handle_ime = focus_for_ime.clone();
+                let display_text = ren.text.clone();
+                let is_all_selected = ren.select_all && !display_text.is_empty();
+                let is_composing = ren.marked_range.is_some();
+
+                let edit_pill = div()
+                    .id(("vspace-rename", s_idx))
+                    .relative()
+                    .h(px(24.0))
+                    .min_w(px(74.0))
+                    .max_w(px(196.0))
+                    .px(px(11.0))
+                    .rounded_full()
+                    .bg(rgba(0xA78BFA38))
+                    .border_1()
+                    .border_color(rgba(0xD8B4FEEE))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(1.0))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(
+                        div()
+                            .max_w(px(164.0))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .rounded(px(3.0))
+                            .when(is_all_selected, |el| el.bg(rgba(0xA78BFA66)).px(px(2.0)))
+                            .when(is_composing, |el| {
+                                el.border_b_1().border_color(rgba(0xE9D5FFCC))
+                            })
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(rgba(0xFFFFFFFA))
+                            .child(display_text),
+                    )
+                    .when(!is_all_selected, |el| {
+                        el.child(
+                            div()
+                                .w(px(1.5))
+                                .h(px(12.0))
+                                .rounded(px(1.0))
+                                .bg(rgba(0xFFFFFFEE)),
+                        )
+                    })
+                    .child(
+                        canvas(
+                            |bounds, _, _| bounds,
+                            move |bounds, _, window, cx| {
+                                window.handle_input(
+                                    &focus_handle_ime,
+                                    ElementInputHandler::new(bounds, entity_for_ime.clone()),
+                                    cx,
+                                );
+                            },
+                        )
+                        .absolute()
+                        .inset_0()
+                        .size_full(),
+                    );
+                virtual_space_pills.push(edit_pill);
+                continue;
+            }
+
+            let pill = div()
+                .id(("vspace-pill", s_idx))
+                .h(px(24.0))
+                .min_w(px(54.0))
+                .max_w(px(176.0))
+                .px(px(12.0))
+                .rounded_full()
+                .cursor_pointer()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_center()
+                .gap(px(5.0))
+                .drag_over::<DraggedWindow>(|s, _, _, _| {
+                    s.bg(rgba(0xA78BFA66))
+                        .border_1()
+                        .border_color(rgba(0xE9D5FFEE))
+                })
+                .on_drop(cx.listener(move |this, dragged: &DraggedWindow, window, cx| {
+                    this.context_menu = None;
+                    this.add_window_to_virtual_space(sid, dragged.hwnd, window, cx);
+                }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.context_menu = None;
+                        if this.renaming_space.is_some() {
+                            this.commit_renaming_space(cx);
+                        }
+                        if this.armed_delete == Some(ArmedDelete::VirtualSpace(sid)) {
+                            this.armed_delete = None;
+                        } else {
+                            this.armed_delete = Some(ArmedDelete::VirtualSpace(sid));
+                        }
+                        cx.notify();
+                    }),
+                )
+                .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+                    cx.stop_propagation();
+                    if this.armed_delete == Some(ArmedDelete::VirtualSpace(sid)) {
+                        this.remove_virtual_space_by_id(sid, window, cx);
+                    } else if this.dismiss_space_popups(true, cx) {
+                        // Dismiss open popup / rename / armed trash first
+                    } else if event.click_count() >= 2 {
+                        this.start_renaming_space(sid, window, cx);
+                    } else {
+                        this.set_view_filter(ViewFilter::VirtualSpace(sid), window, cx);
+                    }
+                }));
+
+            let pill = if is_armed_delete {
+                pill.bg(rgba(0xFF453AD8))
+                    .border_1()
+                    .border_color(rgba(0xFFFFFF38))
+                    .hover(|s| s.bg(rgba(0xFF453AF5)).border_color(rgba(0xFFFFFF66)))
+                    .child(trash_icon())
+            } else {
+                pill.bg(if is_filtered {
+                    rgba(0xA78BFA3D)
+                } else {
+                    rgba(0x00000000)
+                })
+                .when(is_filtered, |el| {
+                    el.border_1().border_color(rgba(0xC4B5FD66))
+                })
+                .hover(|s| {
+                    s.bg(if is_filtered {
+                        rgba(0xA78BFA4F)
+                    } else {
+                        rgba(0xA78BFA24)
+                    })
+                })
+                .child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_xs()
+                        .font_weight(if is_filtered {
+                            gpui::FontWeight::SEMIBOLD
+                        } else {
+                            gpui::FontWeight::MEDIUM
+                        })
+                        .text_color(if is_filtered {
+                            rgba(0xFFFFFFFA)
+                        } else if live_count > 0 {
+                            rgba(0xF3E8FFDD)
+                        } else {
+                            rgba(0xE9D5FF88)
+                        })
+                        .child(space.name.clone()),
+                )
+                .when(live_count > 0, |el| {
+                    el.child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::MEDIUM)
+                            .text_color(if is_filtered {
+                                rgba(0xE9D5FFE8)
+                            } else {
+                                rgba(0xC4B5FD99)
+                            })
+                            .child(live_count.to_string()),
+                    )
+                })
+            };
+
+            virtual_space_pills.push(pill);
+        }
+
+        if !soft_spaces.is_empty() {
+            virtual_space_pills.push(
+                div()
+                    .id("vspace-bar-sep")
+                    .w(px(1.0))
+                    .h(px(14.0))
+                    .mx(px(2.0))
+                    .bg(rgba(0xA78BFA36)),
+            );
+        }
+        virtual_space_pills.push(
+            div()
+                .id("vspace-pill-add")
+                .size(px(24.0))
+                .rounded_full()
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(rgba(0xA78BFA20))
+                .hover(|s| s.bg(rgba(0xA78BFA42)))
+                .drag_over::<DraggedWindow>(|s, _, _, _| {
+                    s.bg(rgba(0xA78BFA78))
+                        .border_1()
+                        .border_color(rgba(0xE9D5FFEE))
+                })
+                .on_drop(cx.listener(|this, dragged: &DraggedWindow, window, cx| {
+                    this.create_virtual_space_with_window(dragged.hwnd, window, cx);
+                }))
+                .on_click(cx.listener(|this, _, _, cx| {
+                    cx.stop_propagation();
+                    if this.dismiss_space_popups(true, cx) {
+                        return;
+                    }
+                    this.create_virtual_space(cx);
+                }))
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgba(0xF3E8FFEE))
+                        .child("+"),
+                ),
+        );
+
         // === FIXED-SIZE UNIFORM MISSION CONTROL GROUPS ===
         let show_group_labels = self.groups.len() > 1;
         let mut group_elements = Vec::with_capacity(self.groups.len());
 
         for (g_idx, group) in self.groups.iter().enumerate() {
             let desktop_id = group.desktop_id;
+            let group_vspace_id = group.virtual_space_id;
 
             let header = div()
                 .id(("desktop-label", g_idx))
@@ -3121,7 +5437,7 @@ impl Render for SwitcherView {
                         .hover(|s| s.opacity(1.0))
                         .on_click(cx.listener(move |this, _, window, cx| {
                             cx.stop_propagation();
-                            if this.dismiss_armed_delete(cx) {
+                            if this.dismiss_space_popups(true, cx) {
                                 return;
                             }
                             this.switch_to_desktop_only(did, window, cx);
@@ -3153,7 +5469,7 @@ impl Render for SwitcherView {
                 .when(g_idx > 0, |el| el.mt(px(GROUP_TOP_GAP)))
                 .child(header);
 
-            if group.cards.is_empty() {
+            if group.cards.is_empty() && group_vspace_id.is_none() {
                 section = section.child(
                     div()
                         .id(("empty-space", g_idx))
@@ -3170,14 +5486,14 @@ impl Render for SwitcherView {
                                 .hover(|s| s.bg(rgba(0xFFFFFF1A)).text_color(rgba(0xFFFFFFD0)))
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     cx.stop_propagation();
-                                    if this.dismiss_armed_delete(cx) {
+                                    if this.dismiss_space_popups(true, cx) {
                                         return;
                                     }
                                     this.switch_to_desktop_only(did, window, cx);
                                 }))
                         })
                         .when(chrome_opacity < 0.999, |el| el.opacity(chrome_opacity))
-                        .child(if self.desktop_filter.is_some() {
+                        .child(if matches!(self.view_filter, ViewFilter::NativeDesktop(_)) {
                             "空白桌面 · 点击或按 Enter 切换到此桌面"
                         } else {
                             "空白桌面"
@@ -3185,8 +5501,56 @@ impl Render for SwitcherView {
                 );
             } else {
                 let mut rows_col = div().flex().flex_col().gap(px(ROW_GAP));
+                let total_chunks = group.cards.chunks(cols).len();
+                let mut add_tile = group_vspace_id.map(|sid| {
+                    let below_spacer = if label_pos.is_embedded() {
+                        0.0
+                    } else {
+                        BELOW_LABEL_GAP + BELOW_LABEL_H
+                    };
+                    div()
+                        .id(("vspace-add-tile", g_idx))
+                        .w(px(tile_outer_w))
+                        .flex_shrink_0()
+                        .h(px(item_total_h))
+                        .pb(px(below_spacer))
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .when(chrome_opacity < 0.999, |el| el.opacity(chrome_opacity))
+                        .child(
+                            div()
+                                .id(("vspace-add-btn", g_idx))
+                                .w(px(preview_w))
+                                .h(px(preview_h))
+                                .rounded(px(8.0))
+                                .cursor_pointer()
+                                .bg(rgba(0xA78BFA0E))
+                                .border_1()
+                                .border_color(rgba(0xA78BFA33))
+                                .hover(|s| {
+                                    s.bg(rgba(0xA78BFA20))
+                                        .border_color(rgba(0xC4B5FD88))
+                                })
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    if this.exit_anim.is_some() || cx.has_active_drag() {
+                                        return;
+                                    }
+                                    if this.dismiss_space_popups(true, cx) {
+                                        return;
+                                    }
+                                    this.open_add_picker(sid, window, cx);
+                                }))
+                                .child(large_plus_icon()),
+                        )
+                });
 
-                for row_chunk in group.cards.chunks(cols) {
+                for (chunk_idx, row_chunk) in group.cards.chunks(cols).enumerate() {
                     let mut row_el = div().flex().flex_row().gap(px(COL_GAP)).w_full();
 
                     for card in row_chunk {
@@ -3505,6 +5869,70 @@ impl Render for SwitcherView {
                             LabelPosition::Below => (thumb_pane, Some(label_pill)),
                         };
 
+                        // Inside a soft virtual space, show a quiet hover-only top-right `×` to remove from this space (never closes the real window).
+                        let thumb_pane = if let Some(sid) = group_vspace_id {
+                            if is_hovered && !is_exiting && !is_dragging_window {
+                                thumb_pane.child(
+                                    div()
+                                        .id(("vspace-card-remove", card_flat_index))
+                                        .absolute()
+                                        .top(px(8.0))
+                                        .right(px(8.0))
+                                        .size(px(22.0))
+                                        .rounded_full()
+                                        .cursor_pointer()
+                                        .bg(rgba(0x0B0F18CC))
+                                        .border_1()
+                                        .border_color(rgba(0xFFFFFF2E))
+                                        .hover(|s| {
+                                            s.bg(rgba(0xFF453AE8))
+                                                .border_color(rgba(0xFFFFFF55))
+                                        })
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .on_mouse_down(MouseButton::Right, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.remove_window_from_virtual_space(
+                                                sid,
+                                                target_hwnd,
+                                                window,
+                                                cx,
+                                            );
+                                        }))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(gpui::FontWeight::MEDIUM)
+                                                .text_color(rgba(0xFFFFFFEE))
+                                                .child("×"),
+                                        ),
+                                )
+                            } else {
+                                thumb_pane
+                            }
+                        } else {
+                            thumb_pane
+                        };
+
+                        let drag_payload = DraggedWindow {
+                            hwnd: target_hwnd,
+                            title: SharedString::from(if card.info.title.trim().is_empty() {
+                                card.info.process_name.clone()
+                            } else {
+                                card.info.title.clone()
+                            }),
+                            icon: card.icon.clone(),
+                            monogram: card.monogram.clone(),
+                            accent_color: card.accent_color,
+                        };
+
                         let mut item_el = div()
                             .id(("mission-item", card_flat_index))
                             .when(card_dx != 0.0 || card_dy != 0.0, |el| {
@@ -3519,6 +5947,14 @@ impl Render for SwitcherView {
                             .items_center()
                             .justify_center()
                             .cursor_pointer()
+                            .when(!is_exiting, |el| {
+                                el.on_drag(drag_payload, |dragged, cursor_offset, _, cx| {
+                                    cx.new(|_| DraggedWindowGhost {
+                                        data: dragged.clone(),
+                                        cursor_offset,
+                                    })
+                                })
+                            })
                             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
                                 if this.exit_anim.is_some() {
                                     return;
@@ -3530,12 +5966,31 @@ impl Render for SwitcherView {
                                 }
                                 cx.notify();
                             }))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    if this.exit_anim.is_some() {
+                                        return;
+                                    }
+                                    this.disarm_hold_mode();
+                                    this.armed_delete = None;
+                                    if this.renaming_space.is_some() {
+                                        this.commit_renaming_space(cx);
+                                    }
+                                    this.context_menu = Some(CardContextMenu {
+                                        hwnd: target_hwnd,
+                                        position: event.position,
+                                    });
+                                    cx.notify();
+                                }),
+                            )
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
-                                if this.exit_anim.is_some() {
+                                if this.exit_anim.is_some() || cx.has_active_drag() {
                                     return;
                                 }
-                                if this.dismiss_armed_delete(cx) {
+                                if this.dismiss_space_popups(true, cx) {
                                     return;
                                 }
                                 this.selected_flat = card_flat_index;
@@ -3586,7 +6041,24 @@ impl Render for SwitcherView {
                         row_el = row_el.child(item_el);
                     }
 
+                    if chunk_idx + 1 == total_chunks && row_chunk.len() < cols {
+                        if let Some(tile) = add_tile.take() {
+                            row_el = row_el.child(tile);
+                        }
+                    }
+
                     rows_col = rows_col.child(row_el);
+                }
+
+                if let Some(tile) = add_tile.take() {
+                    rows_col = rows_col.child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap(px(COL_GAP))
+                            .w_full()
+                            .child(tile),
+                    );
                 }
 
                 section = section.child(rows_col);
@@ -3617,6 +6089,7 @@ impl Render for SwitcherView {
 
         let root = div()
             .id("windeck-mission-control")
+            .relative()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
@@ -3626,6 +6099,14 @@ impl Render for SwitcherView {
             .bg(rgba(0x00000001))
             .text_color(rgb(0xFFFFFF));
 
+        let context_menu_snapshot = self.context_menu.clone();
+        let total_win_h_logical = view_h + TOP_SPACES_BAR_H;
+        let add_picker_overlay = if !self.update_dialog_open && !self.settings_open {
+            self.render_add_window_picker(viewport_w_logical, cx)
+        } else {
+            None
+        };
+
         let root = if self.update_dialog_open {
             root.child(self.render_update_dialog(cx))
         } else if self.settings_open {
@@ -3634,30 +6115,32 @@ impl Render for SwitcherView {
             root.on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, _, _, cx| {
-                    this.dismiss_armed_delete(cx);
+                    this.dismiss_space_popups(true, cx);
                 }),
             )
             .on_click(cx.listener(|this, _, _, cx| {
-                if this.exit_anim.is_some() {
+                if cx.has_active_drag() || this.exit_anim.is_some() {
                     return;
                 }
-                if this.dismiss_armed_delete(cx) {
+                if this.dismiss_space_popups(true, cx) {
                     return;
                 }
                 this.hide(cx);
             }))
-            // === TOP FLOATING APPLE SPACES BAR ===
+            // === TOP FLOATING DUAL-CAPSULE SPACES BAR ===
             .child(
                 div()
                     .h(px(TOP_SPACES_BAR_H))
                     .flex_shrink_0()
                     .w_full()
+                    .px(px(16.0))
                     .pt(px(18.0))
                     .pb(px(8.0))
                     .flex()
                     .flex_row()
                     .items_center()
                     .justify_center()
+                    .gap(px(10.0))
                     .when(spaces_bar_opacity < 0.999, |el| {
                         el.opacity(spaces_bar_opacity)
                     })
@@ -3676,9 +6159,36 @@ impl Render for SwitcherView {
                             .gap(px(4.0))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 cx.stop_propagation();
-                                this.dismiss_armed_delete(cx);
+                                this.dismiss_space_popups(true, cx);
                             }))
                             .children(space_pills),
+                    )
+                    .child(
+                        div()
+                            .id("virtual-space-bar-capsule")
+                            .px(px(6.0))
+                            .py(px(4.0))
+                            .rounded_full()
+                            .bg(if is_dragging_window {
+                                rgba(0x1E183899)
+                            } else {
+                                rgba(0x16122A7A)
+                            })
+                            .border_1()
+                            .border_color(if is_dragging_window {
+                                rgba(0xC4B5FD99)
+                            } else {
+                                rgba(0xA78BFA38)
+                            })
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(4.0))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.dismiss_space_popups(true, cx);
+                            }))
+                            .children(virtual_space_pills),
                     ),
             )
             // === FIXED-SIZE MISSION CONTROL CANVAS ===
@@ -4030,9 +6540,137 @@ impl Render for SwitcherView {
                 self.render_settings_trigger(cx)
                     .when(chrome_opacity < 0.999, |el| el.opacity(chrome_opacity)),
             )
+            // === RIGHT-CLICK CARD POPOVER (PUT INTO / REMOVE FROM VIRTUAL SPACES) ===
+            .when_some(context_menu_snapshot, |el, menu| {
+                let menu_hwnd = menu.hwnd;
+                let menu_w = 196.0_f32;
+                let spaces = self.virtual_spaces.spaces();
+                let est_rows = spaces.len() + 1;
+                let est_h = (est_rows as f32) * 32.0 + 22.0;
+                let raw_x = f32::from(menu.position.x);
+                let raw_y = f32::from(menu.position.y);
+                let left_x = raw_x.clamp(12.0, (viewport_w_logical - menu_w - 12.0).max(12.0));
+                let top_y = raw_y.clamp(
+                    TOP_SPACES_BAR_H + 4.0,
+                    (total_win_h_logical - est_h - 14.0).max(TOP_SPACES_BAR_H + 4.0),
+                );
+
+                let mut menu_box = div()
+                    .id("card-vspace-popover")
+                    .absolute()
+                    .left(px(left_x))
+                    .top(px(top_y))
+                    .w(px(menu_w))
+                    .p(px(6.0))
+                    .rounded(px(12.0))
+                    .bg(rgba(0x131024F2))
+                    .border_1()
+                    .border_color(rgba(0xA78BFA44))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                    .on_click(|_, _, cx| cx.stop_propagation());
+
+                for (idx, space) in spaces.iter().enumerate() {
+                    let sid = space.id;
+                    let in_space = space.contains_hwnd(menu_hwnd);
+                    menu_box = menu_box.child(
+                        div()
+                            .id(("card-menu-space", idx))
+                            .h(px(30.0))
+                            .px(px(9.0))
+                            .rounded(px(7.0))
+                            .cursor_pointer()
+                            .flex()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(8.0))
+                            .hover(|s| s.bg(rgba(0xA78BFA2E)))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.toggle_window_in_virtual_space(sid, menu_hwnd, window, cx);
+                            }))
+                            .child(check_mark_dot(in_space))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .flex_1()
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .text_xs()
+                                    .font_weight(if in_space {
+                                        gpui::FontWeight::SEMIBOLD
+                                    } else {
+                                        gpui::FontWeight::MEDIUM
+                                    })
+                                    .text_color(if in_space {
+                                        rgba(0xFFFFFFFA)
+                                    } else {
+                                        rgba(0xFFFFFFCC)
+                                    })
+                                    .child(space.name.clone()),
+                            ),
+                    );
+                }
+
+                if !spaces.is_empty() {
+                    menu_box = menu_box.child(
+                        div()
+                            .w_full()
+                            .h(px(1.0))
+                            .my(px(3.0))
+                            .bg(rgba(0xA78BFA28)),
+                    );
+                }
+
+                menu_box = menu_box.child(
+                    div()
+                        .id("card-menu-new-space")
+                        .h(px(30.0))
+                        .px(px(9.0))
+                        .rounded(px(7.0))
+                        .cursor_pointer()
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .hover(|s| s.bg(rgba(0xA78BFA2E)))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.create_virtual_space_with_window(menu_hwnd, window, cx);
+                        }))
+                        .child(
+                            div()
+                                .size(px(14.0))
+                                .flex_shrink_0()
+                                .rounded(px(4.0))
+                                .bg(rgba(0xA78BFA33))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(rgba(0xE9D5FFFF))
+                                .child("+"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(rgba(0xE9D5FFEE))
+                                .child("新建空间并放入"),
+                        ),
+                );
+
+                el.child(menu_box)
+            })
         };
 
         root
+            .when_some(add_picker_overlay, |el, overlay| el.child(overlay))
             .when_some(active_toast, |el, msg| {
                 el.child(
                     div()
@@ -4101,5 +6739,69 @@ mod tests {
             assert!(is_window_alive_with_pid(raw, real_pid));
             assert!(!is_window_alive_with_pid(raw, real_pid.wrapping_add(1)));
         }
+    }
+
+    #[test]
+    fn utf16_utf8_offset_conversions_preserve_char_boundaries_for_cjk_and_emoji() {
+        let s = "工作A🚀1";
+        // '工'(3B, 1 u16), '作'(3B, 1 u16), 'A'(1B, 1 u16), '🚀'(4B, 2 u16), '1'(1B, 1 u16)
+        assert_eq!(utf16_offset_to_utf8(s, 0), 0);
+        assert_eq!(utf16_offset_to_utf8(s, 1), 3);
+        assert_eq!(utf16_offset_to_utf8(s, 2), 6);
+        assert_eq!(utf16_offset_to_utf8(s, 3), 7);
+        assert_eq!(utf16_offset_to_utf8(s, 5), 11);
+        assert_eq!(utf16_offset_to_utf8(s, 6), s.len());
+        assert_eq!(utf16_offset_to_utf8(s, 99), s.len());
+
+        assert_eq!(utf8_offset_to_utf16(s, 0), 0);
+        assert_eq!(utf8_offset_to_utf16(s, 6), 2);
+        assert_eq!(utf8_offset_to_utf16(s, 11), 5);
+        assert_eq!(utf8_offset_to_utf16(s, s.len()), 6);
+    }
+
+    #[test]
+    fn add_picker_supports_ctrl_right_space_shift_and_preserves_order_across_filter() {
+        let all = vec![101, 102, 103, 104, 105];
+        let mut picker = AddWindowPickerState::new(SpaceId(1));
+
+        // 1. Plain single click on index 0 selects 101, then Ctrl/Right toggle adds 103
+        picker.single_select(101, 0);
+        picker.toggle_hwnd(103, 2);
+        assert_eq!(picker.resolve_commit_hwnds(&all, &all), vec![101, 103]);
+
+        // 2. Move focus down to index 3 (104) and press Space to toggle multi-select
+        picker.move_focus(1, all.len(), 120.0);
+        assert_eq!(picker.focused_idx, 3);
+        assert!(picker.toggle_focused(&all));
+        assert_eq!(picker.resolve_commit_hwnds(&all, &all), vec![101, 103, 104]);
+
+        // 3. Space again on index 3 unchecks 104
+        assert!(picker.toggle_focused(&all));
+        assert_eq!(picker.resolve_commit_hwnds(&all, &all), vec![101, 103]);
+
+        // 4. Filter down to [105], select 105 too -> committing preserves earlier 101 & 103 in candidate order
+        let filtered = vec![105];
+        picker.toggle_hwnd(105, 0);
+        assert_eq!(
+            picker.resolve_commit_hwnds(&all, &filtered),
+            vec![101, 103, 105]
+        );
+
+        // 5. Shift range select on full list from anchor 1..=3
+        picker.selected.clear();
+        picker.single_select(102, 1);
+        picker.range_select(&all, 3);
+        assert_eq!(picker.resolve_commit_hwnds(&all, &all), vec![102, 103, 104]);
+
+        // 6. When nothing is explicitly checked, Enter commits the focused row
+        picker.selected.clear();
+        picker.focused_idx = 4;
+        assert_eq!(picker.resolve_commit_hwnds(&all, &all), vec![105]);
+
+        // 7. Ctrl+A toggles select-all / clear-all cleanly
+        picker.select_all_visible(&all);
+        assert_eq!(picker.resolve_commit_hwnds(&all, &all), all);
+        picker.select_all_visible(&all);
+        assert!(picker.selected.is_empty());
     }
 }

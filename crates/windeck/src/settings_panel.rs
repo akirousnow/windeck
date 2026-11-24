@@ -270,7 +270,7 @@ impl SwitcherView {
         }
         self.disarm_hold_mode();
         self.clear_all_animations(false);
-        self.armed_delete_desktop = None;
+        self.clear_space_popups();
         // Clear live DWM thumbnails while in Settings so Layer 1 exposes pure, unobstructed Gaussian blur
         self.thumbs.borrow_mut().unregister_all();
         self.settings_open = true;

@@ -6202,6 +6202,7 @@ dependencies = [
  "gpui",
  "image",
  "raw-window-handle",
+ "serde_json",
  "smallvec",
  "win_platform",
  "windows 0.61.3",

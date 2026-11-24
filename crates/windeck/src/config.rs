@@ -363,6 +363,10 @@ pub fn config_file_path() -> PathBuf {
     config_dir().join("config.toml")
 }
 
+pub fn virtual_spaces_file_path() -> PathBuf {
+    config_dir().join("virtual_spaces.json")
+}
+
 pub fn log_file_path() -> PathBuf {
     config_dir().join("windeck.log")
 }
