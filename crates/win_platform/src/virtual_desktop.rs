@@ -7,6 +7,7 @@ use std::thread;
 use anyhow::{Context, Result, anyhow};
 use windows::Win32::Foundation::HWND;
 use windows::Win32::Graphics::Gdi::HMONITOR;
+use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 use windows::Win32::System::Com::{
     CLSCTX_ALL, CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
     CoUninitialize, IServiceProvider,
@@ -509,6 +510,46 @@ impl InternalVdm {
         };
         hr.ok()
     }
+
+    unsafe fn can_view_move_desktops(&self, view: *mut c_void) -> windows_core::Result<bool> {
+        let mut can_move = 0i32;
+        let hr = match self {
+            InternalVdm::Win11_24H2(v) => unsafe { v.can_view_move_desktops(view, &mut can_move) },
+            InternalVdm::Win11_23H2Late(v) => unsafe {
+                v.can_view_move_desktops(view, &mut can_move)
+            },
+            InternalVdm::Win11_23H2Early(v) => unsafe {
+                v.can_view_move_desktops(view, &mut can_move)
+            },
+            InternalVdm::Win11_21H2(v) => unsafe { v.can_view_move_desktops(view, &mut can_move) },
+            InternalVdm::Win10(v) => unsafe { v.can_view_move_desktops(view, &mut can_move) },
+        };
+        hr.ok()?;
+        Ok(can_move != 0)
+    }
+
+    unsafe fn move_view_to_desktop(
+        &self,
+        view: *mut c_void,
+        desktop: &ComVirtualDesktop,
+    ) -> windows_core::Result<()> {
+        let hr = match self {
+            InternalVdm::Win11_24H2(v) => unsafe {
+                v.move_view_to_desktop(view, desktop.as_raw())
+            },
+            InternalVdm::Win11_23H2Late(v) => unsafe {
+                v.move_view_to_desktop(view, desktop.as_raw())
+            },
+            InternalVdm::Win11_23H2Early(v) => unsafe {
+                v.move_view_to_desktop(view, desktop.as_raw())
+            },
+            InternalVdm::Win11_21H2(v) => unsafe {
+                v.move_view_to_desktop(view, desktop.as_raw())
+            },
+            InternalVdm::Win10(v) => unsafe { v.move_view_to_desktop(view, desktop.as_raw()) },
+        };
+        hr.ok()
+    }
 }
 
 fn has_24h2_2605_vtable() -> bool {
@@ -893,6 +934,96 @@ impl ComSession {
         }
         Err(anyhow!("RemoveDesktop failed after reconnect retry"))
     }
+
+    fn move_window_to_desktop(&mut self, raw_hwnd: isize, target_id: DesktopId) -> Result<()> {
+        if raw_hwnd == 0 {
+            return Err(anyhow!("无效窗口句柄"));
+        }
+        let hwnd = HWND(raw_hwnd as *mut c_void);
+        if !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+            return Err(anyhow!("窗口已关闭"));
+        }
+
+        for attempt in 0..2 {
+            if let (Some(internal), Some(app_views)) = (&self.internal, &self.app_views) {
+                let mut raw_view: *mut c_void = std::ptr::null_mut();
+                let view_hr = unsafe { app_views.get_view_for_hwnd(hwnd, &mut raw_view) };
+                if let Err(e) = view_hr.ok() {
+                    if attempt == 0 && is_rpc_disconnect(&e) {
+                        *self = ComSession::connect();
+                        continue;
+                    }
+                    // Fall through to official IVirtualDesktopManager fallback below.
+                } else if !raw_view.is_null() {
+                    let view = unsafe { IApplicationView::from_raw(raw_view) };
+
+                    if let Ok(false) = unsafe { internal.can_view_move_desktops(view.as_raw()) } {
+                        return Err(anyhow!("该系统窗口不支持跨虚拟桌面移动"));
+                    }
+
+                    // If currently pinned across all desktops, unpin first so the move places it exclusively on target_id.
+                    if let Some(ref pinned) = self.pinned_apps {
+                        let mut is_pinned = BOOL(0);
+                        if unsafe { pinned.is_view_pinned(view.as_raw(), &mut is_pinned) }.is_ok()
+                            && is_pinned.as_bool()
+                        {
+                            let _ = unsafe { pinned.unpin_view(view.as_raw()) };
+                        }
+                    }
+
+                    let list = match self.list_com_desktops() {
+                        Ok((list, _)) => list,
+                        Err(e) if attempt == 0 && is_rpc_disconnect(&e) => {
+                            *self = ComSession::connect();
+                            continue;
+                        }
+                        Err(e) => {
+                            return Err(anyhow!("获取虚拟桌面列表失败：{e}"));
+                        }
+                    };
+
+                    let mut reconnected = false;
+                    let mut found = false;
+                    for desktop in &list {
+                        if unsafe { desktop.get_id() }.ok() == Some(target_id) {
+                            found = true;
+                            match unsafe { internal.move_view_to_desktop(view.as_raw(), desktop) } {
+                                Ok(()) => return Ok(()),
+                                Err(e) if attempt == 0 && is_rpc_disconnect(&e) => {
+                                    *self = ComSession::connect();
+                                    reconnected = true;
+                                    break;
+                                }
+                                Err(e) => return Err(anyhow!("移动窗口到目标桌面失败：{e}")),
+                            }
+                        }
+                    }
+                    if reconnected {
+                        continue;
+                    }
+                    if !found {
+                        return Err(anyhow!("目标桌面 {} 不存在", target_id));
+                    }
+                }
+            }
+
+            // Fallback: official IVirtualDesktopManager (works for same-process or supported windows)
+            if let Some(ref official) = self.official {
+                match unsafe { official.MoveWindowToDesktop(hwnd, &target_id.0) } {
+                    Ok(()) => return Ok(()),
+                    Err(e) if attempt == 0 && is_rpc_disconnect(&e) => {
+                        *self = ComSession::connect();
+                        continue;
+                    }
+                    Err(e) => return Err(anyhow!("MoveWindowToDesktop 失败：{e}")),
+                }
+            }
+
+            return Err(anyhow!("当前系统不支持跨虚拟桌面移动窗口"));
+        }
+
+        Err(anyhow!("移动窗口在 COM 重连后仍然失败"))
+    }
 }
 
 enum Command {
@@ -901,6 +1032,7 @@ enum Command {
     SwitchToDesktop(DesktopId, mpsc::Sender<Result<()>>),
     CreateDesktop(mpsc::Sender<Result<DesktopId>>),
     RemoveDesktop(DesktopId, DesktopId, mpsc::Sender<Result<()>>),
+    MoveWindowToDesktop(isize, DesktopId, mpsc::Sender<Result<()>>),
     Reconnect(mpsc::Sender<ComProbeStatus>),
     Shutdown,
 }
@@ -943,6 +1075,9 @@ impl VirtualDesktopClient {
                         }
                         Command::RemoveDesktop(destroy_id, fallback_id, reply) => {
                             let _ = reply.send(session.remove_desktop(destroy_id, fallback_id));
+                        }
+                        Command::MoveWindowToDesktop(hwnd, target_id, reply) => {
+                            let _ = reply.send(session.move_window_to_desktop(hwnd, target_id));
                         }
                         Command::Reconnect(reply) => {
                             session = ComSession::connect();
@@ -1007,6 +1142,14 @@ impl VirtualDesktopClient {
         rx.recv().context("recv remove_desktop")?
     }
 
+    pub fn move_window_to_desktop(&self, hwnd: isize, target_id: DesktopId) -> Result<()> {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(Command::MoveWindowToDesktop(hwnd, target_id, tx))
+            .map_err(|_| anyhow!("vdm worker stopped"))?;
+        rx.recv().context("recv move_window_to_desktop")?
+    }
+
     pub fn reconnect(&self) -> Result<ComProbeStatus> {
         let (tx, rx) = mpsc::channel();
         self.tx
@@ -1022,5 +1165,18 @@ impl Drop for VirtualDesktopClient {
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn move_window_to_desktop_rejects_invalid_hwnd_safely() {
+        let client = VirtualDesktopClient::new().expect("start VDM STA worker");
+        let dummy_desktop = DesktopId(GUID::zeroed());
+        assert!(client.move_window_to_desktop(0, dummy_desktop).is_err());
+        assert!(client.move_window_to_desktop(0x7FFF_1234, dummy_desktop).is_err());
     }
 }

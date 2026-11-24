@@ -2,6 +2,7 @@
 
 mod animation;
 mod config;
+mod genie;
 mod nav;
 mod settings_panel;
 mod switcher_view;

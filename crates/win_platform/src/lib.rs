@@ -2,6 +2,7 @@ pub mod dwm_thumb;
 pub mod os_version;
 pub mod overlay_win;
 pub mod process_metrics;
+pub mod screen_capture;
 pub mod shell_host;
 pub mod updater;
 pub mod virtual_desktop;
@@ -20,6 +21,7 @@ pub use overlay_win::{
 pub use process_metrics::{
     ProcessResourceSnapshot, capture_process_resources, current_session_desktop_names,
 };
+pub use screen_capture::{CapturedBitmap, capture_screen_rect_bgra, capture_window_bgra};
 pub use shell_host::{
     HoldNavDirection, HotkeySpec, PrimaryModifier, ShellEvent, ShellHost, SingleInstanceGuard,
     is_autostart_enabled, notify_existing_instance, set_autostart_enabled,

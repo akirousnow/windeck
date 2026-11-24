@@ -7,21 +7,22 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    App, Bounds, ClickEvent, Context, ElementInputHandler, EntityInputHandler, FocusHandle,
-    Focusable, KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, RenderImage, ScrollDelta,
-    ScrollWheelEvent, SharedString, UTF16Selection, Window, WindowBackgroundAppearance, canvas,
-    div, img, point, prelude::*, px, rgb, rgba, size,
+    App, Bounds, ClickEvent, Context, Corners, ElementInputHandler, EntityInputHandler,
+    FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, Pixels, Point, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString,
+    UTF16Selection, Window, WindowBackgroundAppearance, canvas, div, img, point, prelude::*, px,
+    rgb, rgba, size,
 };
 use smallvec::smallvec;
 use win_platform::{
-    DesktopId, DwmTransitionSuppressGuard, ForceQuitOutcome, HoldNavDirection, IconBgra,
-    MonitorInfo, PreRestoreResult, ReleaseInfo, ShellHost, SingleInstanceGuard,
+    CapturedBitmap, DesktopId, DwmTransitionSuppressGuard, ForceQuitOutcome, HoldNavDirection,
+    IconBgra, MonitorInfo, PreRestoreResult, ReleaseInfo, ShellHost, SingleInstanceGuard,
     ThumbnailHostWindow, VirtualDesktopClient, VirtualDesktopInfo, WindowInfo,
-    activate_window_foreground, configure_borderless_immersive, enumerate_monitors,
-    enumerate_windows, extract_window_icon, force_quit_window, hide_layered_overlay,
-    inspect_layered_overlay_state, pin_layered_z_order, pre_restore_minimized_window,
-    query_window_and_client_sizes, refresh_window_geometry, show_and_focus_layered_overlay,
-    switch_desktop_and_wait, switch_to_window,
+    activate_window_foreground, capture_screen_rect_bgra, capture_window_bgra,
+    configure_borderless_immersive, enumerate_monitors, enumerate_windows, extract_window_icon,
+    force_quit_window, hide_layered_overlay, inspect_layered_overlay_state, pin_layered_z_order,
+    pre_restore_minimized_window, query_window_and_client_sizes, refresh_window_geometry,
+    show_and_focus_layered_overlay, switch_desktop_and_wait, switch_to_window,
 };
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -36,6 +37,11 @@ use crate::animation::{
     scale_rect_around_center,
 };
 use crate::config::{AppConfig, LabelPosition, PreviewFit, append_log};
+use crate::genie::{
+    FunnelMouth, GENIE_CAPTURE_MAX_W, GENIE_STRIP_COUNT, GenieDirection, GeniePhase,
+    GenieTransferAnim, RectF, bitmap_to_full_render_image, bitmap_to_strip_render_image,
+    sample_genie_strips, synthesize_fallback_card_bitmap,
+};
 use crate::nav::{NavDirection, navigate};
 use crate::thumb_manager::ThumbnailManager;
 use crate::update_dialog::UpdateStatus;
@@ -59,6 +65,128 @@ const BELOW_LABEL_H: f32 = 26.0;
 const ROW_GAP: f32 = 22.0;
 const COL_GAP: f32 = 24.0;
 const EMPTY_GROUP_H: f32 = 38.0;
+const DRAG_THRESHOLD_PX: f32 = 6.0;
+const DRAG_CARD_SCALE: f32 = 0.78;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropTarget {
+    TopPill(DesktopId),
+    CreateNewDesktop,
+    DesktopGroup(DesktopId),
+    VirtualSpacePill(SpaceId),
+    CreateNewVirtualSpace,
+}
+
+impl DropTarget {
+    fn is_virtual_space(self) -> bool {
+        matches!(
+            self,
+            DropTarget::VirtualSpacePill(_) | DropTarget::CreateNewVirtualSpace
+        )
+    }
+}
+
+struct PendingDrag {
+    hwnd: isize,
+    flat_index: usize,
+    source_desktop_id: Option<DesktopId>,
+    is_pinned: bool,
+    was_current_tab: bool,
+    press_pos: Point<Pixels>,
+    card_bounds: Bounds<Pixels>,
+    grab_offset: Point<Pixels>,
+    icon: Option<Arc<RenderImage>>,
+    accent_color: u32,
+}
+
+struct ActiveDrag {
+    hwnd: isize,
+    source_desktop_id: Option<DesktopId>,
+    is_pinned: bool,
+    was_current_tab: bool,
+    origin_bounds: Bounds<Pixels>,
+    grab_offset: Point<Pixels>,
+    cursor_pos: Point<Pixels>,
+    target: Option<DropTarget>,
+    icon: Option<Arc<RenderImage>>,
+    captured: CapturedBitmap,
+    full_image: Arc<RenderImage>,
+}
+
+impl ActiveDrag {
+    fn floating_rect(&self) -> RectF {
+        let orig = RectF::from_bounds(self.origin_bounds);
+        let w = orig.width() * DRAG_CARD_SCALE;
+        let h = orig.height() * DRAG_CARD_SCALE;
+        let rel_x = (f32::from(self.grab_offset.x) / orig.width().max(1.0)).clamp(0.15, 0.85);
+        let rel_y = (f32::from(self.grab_offset.y) / orig.height().max(1.0)).clamp(0.15, 0.85);
+        let cx = f32::from(self.cursor_pos.x);
+        let cy = f32::from(self.cursor_pos.y);
+        let left = cx - w * rel_x;
+        // Keep the floating card strictly below the top Spaces bar so pills remain unobstructed
+        // while aiming and upward Genie suck-in always has a clean vertical funnel span.
+        let top = (cy - h * rel_y).max(TOP_SPACES_BAR_H + 2.0);
+        RectF {
+            left,
+            top,
+            right: left + w,
+            bottom: top + h,
+        }
+    }
+}
+
+fn bitmap_has_visible_pixels(bmp: &CapturedBitmap) -> bool {
+    let total_px = (bmp.width as usize) * (bmp.height as usize);
+    if total_px == 0 || bmp.bgra.len() < total_px * 4 {
+        return false;
+    }
+    let step = (total_px / 256).max(1);
+    let mut i = 0;
+    while i < total_px {
+        let off = i * 4;
+        if bmp.bgra[off] != 0 || bmp.bgra[off + 1] != 0 || bmp.bgra[off + 2] != 0 {
+            return true;
+        }
+        i += step;
+    }
+    false
+}
+
+/// Smooth FLIP reflow for remaining cards after a dragged window leaves its source desktop group.
+struct ReflowAnim {
+    started_at: Instant,
+    duration: Duration,
+    use_spring: bool,
+    from_bounds: HashMap<isize, Bounds<Pixels>>,
+}
+
+impl ReflowAnim {
+    fn raw_progress(&self, now: Instant) -> f32 {
+        let dur = self.duration.as_secs_f32();
+        if dur <= 0.0001 {
+            return 1.0;
+        }
+        (now.saturating_duration_since(self.started_at).as_secs_f32() / dur).clamp(0.0, 1.0)
+    }
+
+    fn is_finished(&self, now: Instant) -> bool {
+        self.raw_progress(now) >= 1.0
+    }
+
+    fn eased(&self, now: Instant) -> f32 {
+        TransitionProfile::ease_position(self.use_spring, self.raw_progress(now))
+    }
+}
+
+fn bounds_contains_padded(b: Bounds<Pixels>, p: Point<Pixels>, pad_x: f32, pad_y: f32) -> bool {
+    let x = f32::from(p.x);
+    let y = f32::from(p.y);
+    let left = f32::from(b.origin.x) - pad_x;
+    let top = f32::from(b.origin.y) - pad_y;
+    let right = f32::from(b.origin.x + b.size.width) + pad_x;
+    let bottom = f32::from(b.origin.y + b.size.height) + pad_y;
+    x >= left && x <= right && y >= top && y <= bottom
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ViewFilter {
@@ -310,71 +438,6 @@ fn utf8_offset_to_utf16(text: &str, utf8_offset: usize) -> usize {
         .take_while(|&(i, _)| i < clamped)
         .map(|(_, ch)| ch.len_utf16())
         .sum()
-}
-
-#[derive(Clone)]
-struct DraggedWindow {
-    hwnd: isize,
-    title: SharedString,
-    icon: Option<Arc<RenderImage>>,
-    monogram: SharedString,
-    accent_color: u32,
-}
-
-struct DraggedWindowGhost {
-    data: DraggedWindow,
-    cursor_offset: Point<Pixels>,
-}
-
-impl Render for DraggedWindowGhost {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        let icon_el = if let Some(ref render_img) = self.data.icon {
-            div()
-                .size(px(16.0))
-                .flex_shrink_0()
-                .child(img(render_img.clone()).size(px(16.0)).rounded(px(3.0)))
-        } else {
-            div()
-                .size(px(16.0))
-                .flex_shrink_0()
-                .rounded(px(4.0))
-                .bg(rgb(self.data.accent_color))
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_xs()
-                .font_weight(gpui::FontWeight::BOLD)
-                .text_color(rgb(0xFFFFFF))
-                .child(self.data.monogram.clone())
-        };
-
-        div()
-            .ml(self.cursor_offset.x + px(12.0))
-            .mt(self.cursor_offset.y - px(14.0))
-            .max_w(px(236.0))
-            .h(px(30.0))
-            .px(px(11.0))
-            .rounded_full()
-            .bg(rgba(0x16122AE8))
-            .border_1()
-            .border_color(rgba(0xA78BFA99))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap(px(7.0))
-            .child(icon_el)
-            .child(
-                div()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .whitespace_nowrap()
-                    .text_ellipsis()
-                    .text_xs()
-                    .font_weight(gpui::FontWeight::MEDIUM)
-                    .text_color(rgba(0xFFFFFFFA))
-                    .child(self.data.title.clone()),
-            )
-    }
 }
 
 #[derive(Clone)]
@@ -672,6 +735,12 @@ pub struct SwitcherView {
     pub(crate) overlay_scale: f32,
     viewport_clip: Rc<RefCell<Option<Bounds<Pixels>>>>,
     last_thumb_bounds: Rc<RefCell<HashMap<isize, Bounds<Pixels>>>>,
+    pill_bounds: Rc<RefCell<HashMap<DesktopId, Bounds<Pixels>>>>,
+    add_pill_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    vspace_pill_bounds: Rc<RefCell<HashMap<SpaceId, Bounds<Pixels>>>>,
+    vspace_add_pill_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
+    group_bounds: Rc<RefCell<HashMap<DesktopId, Bounds<Pixels>>>>,
+    preview_box_bounds: Rc<RefCell<Option<Bounds<Pixels>>>>,
     pub(crate) viewport_width_px: Rc<Cell<f32>>,
     pub(crate) viewport_height_px: Rc<Cell<f32>>,
     icon_cache: HashMap<String, Option<Arc<RenderImage>>>,
@@ -679,6 +748,12 @@ pub struct SwitcherView {
     tab_anim: Option<TabTransition>,
     selection_anim: Option<SelectionTransition>,
     exit_anim: Option<ExitTransition>,
+    pending_drag: Option<PendingDrag>,
+    active_drag: Option<ActiveDrag>,
+    drag_scroll_last_tick: Option<Instant>,
+    genie_anim: Option<GenieTransferAnim>,
+    reflow_anim: Option<ReflowAnim>,
+    pending_drop_images: Rc<RefCell<Vec<Arc<RenderImage>>>>,
     last_open_ms: f64,
     last_enum_ms: f64,
     total_window_count: usize,
@@ -1005,6 +1080,12 @@ impl SwitcherView {
             overlay_scale: 1.0,
             viewport_clip: Rc::new(RefCell::new(None)),
             last_thumb_bounds: Rc::new(RefCell::new(HashMap::new())),
+            pill_bounds: Rc::new(RefCell::new(HashMap::new())),
+            add_pill_bounds: Rc::new(RefCell::new(None)),
+            vspace_pill_bounds: Rc::new(RefCell::new(HashMap::new())),
+            vspace_add_pill_bounds: Rc::new(RefCell::new(None)),
+            group_bounds: Rc::new(RefCell::new(HashMap::new())),
+            preview_box_bounds: Rc::new(RefCell::new(None)),
             viewport_width_px: Rc::new(Cell::new(2560.0)),
             viewport_height_px: Rc::new(Cell::new(1380.0)),
             icon_cache: HashMap::new(),
@@ -1012,6 +1093,12 @@ impl SwitcherView {
             tab_anim: None,
             selection_anim: None,
             exit_anim: None,
+            pending_drag: None,
+            active_drag: None,
+            drag_scroll_last_tick: None,
+            genie_anim: None,
+            reflow_anim: None,
+            pending_drop_images: Rc::new(RefCell::new(Vec::new())),
             last_open_ms: 0.0,
             last_enum_ms: 0.0,
             total_window_count: 0,
@@ -1050,10 +1137,30 @@ impl SwitcherView {
         window.on_next_frame(move |_, app| app.notify(entity));
     }
 
+    fn queue_drop_image(&self, img: Arc<RenderImage>) {
+        self.pending_drop_images.borrow_mut().push(img);
+    }
+
+    pub(crate) fn clear_drag_and_genie(&mut self) {
+        self.pending_drag = None;
+        self.drag_scroll_last_tick = None;
+        self.preview_box_bounds.borrow_mut().take();
+        if let Some(drag) = self.active_drag.take() {
+            self.queue_drop_image(drag.full_image);
+        }
+        if let Some(anim) = self.genie_anim.take() {
+            for img in anim.into_images() {
+                self.queue_drop_image(img);
+            }
+        }
+        self.reflow_anim = None;
+    }
+
     pub(crate) fn clear_all_animations(&mut self, prune_thumbs: bool) {
         self.tab_anim = None;
         self.selection_anim = None;
         self.exit_anim = None;
+        self.clear_drag_and_genie();
         self.scroll_y = self.scroll_target_y;
         self.scroll_last_tick = None;
         if prune_thumbs {
@@ -1071,6 +1178,7 @@ impl SwitcherView {
             || self.suppress_blur_hide
             || self.is_downloading_update()
             || self.exit_anim.is_some()
+            || self.active_drag.is_some()
         {
             return;
         }
@@ -1192,6 +1300,12 @@ impl SwitcherView {
         self.clear_all_animations(false);
         self.thumbs.borrow_mut().unregister_all();
         self.last_thumb_bounds.borrow_mut().clear();
+        self.pill_bounds.borrow_mut().clear();
+        *self.add_pill_bounds.borrow_mut() = None;
+        self.vspace_pill_bounds.borrow_mut().clear();
+        *self.vspace_add_pill_bounds.borrow_mut() = None;
+        self.group_bounds.borrow_mut().clear();
+        *self.preview_box_bounds.borrow_mut() = None;
         hide_layered_overlay(self.gpui_hwnd, self.thumb_host.hwnd());
         self.visible = false;
         self.shown_at = None;
@@ -1455,6 +1569,15 @@ impl SwitcherView {
         }
 
         self.desktops = desktops;
+        self.pill_bounds
+            .borrow_mut()
+            .retain(|did, _| self.desktops.iter().any(|d| d.id == *did));
+        self.vspace_pill_bounds
+            .borrow_mut()
+            .retain(|sid, _| self.virtual_spaces.get(*sid).is_some());
+        self.group_bounds
+            .borrow_mut()
+            .retain(|did, _| self.desktops.iter().any(|d| d.id == *did));
         self.monitors = monitors;
         self.all_windows = windows;
         self.window_order.sync(
@@ -1769,6 +1892,8 @@ impl SwitcherView {
             Vec::new()
         };
 
+        let prev_selected_hwnd = self.flat_hwnds.get(self.selected_flat).copied();
+        self.clear_drag_and_genie();
         self.view_filter = new_filter;
         self.scroll_y = 0.0;
         self.scroll_target_y = 0.0;
@@ -1777,6 +1902,11 @@ impl SwitcherView {
         self.hovered_flat = None;
         self.selected_flat = 0;
         self.rebuild_visible_groups(false);
+        if let Some(prev_hwnd) = prev_selected_hwnd {
+            if let Some(idx) = self.flat_hwnds.iter().position(|&h| h == prev_hwnd) {
+                self.selected_flat = idx;
+            }
+        }
 
         if animate && (!old_cards_snapshot.is_empty() || !self.flat_hwnds.is_empty()) {
             let new_set: HashSet<isize> = self.flat_hwnds.iter().copied().collect();
@@ -2736,6 +2866,7 @@ impl SwitcherView {
 
     fn create_new_desktop(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.disarm_hold_mode();
+        self.clear_drag_and_genie();
         match self.vdm.create_desktop() {
             Ok(new_id) => {
                 self.refresh_snapshot();
@@ -2807,6 +2938,7 @@ impl SwitcherView {
         cx: &mut Context<Self>,
     ) {
         self.disarm_hold_mode();
+        self.clear_drag_and_genie();
         self.clear_space_popups();
         if self.desktops.len() <= 1 {
             self.transient_toast = Some((
@@ -2972,6 +3104,15 @@ impl SwitcherView {
         }
     }
 
+    fn preview_desktop_id(&self) -> Option<DesktopId> {
+        let drag = self.active_drag.as_ref()?;
+        match drag.target? {
+            DropTarget::DesktopGroup(did) => Some(did),
+            DropTarget::TopPill(did) if self.view_filter == ViewFilter::All => Some(did),
+            _ => None,
+        }
+    }
+
     fn compute_layout_metrics(
         &self,
         cols: usize,
@@ -2979,6 +3120,7 @@ impl SwitcherView {
     ) -> (f32, Option<(f32, f32)>) {
         let cols = cols.max(1);
         let item_h = preview_h + self.extra_item_h();
+        let preview_did = self.preview_desktop_id();
         let mut y = CONTENT_PAD_TOP;
         let mut selected_range = None;
 
@@ -2989,19 +3131,22 @@ impl SwitcherView {
             let group_header_top = y;
             y += GROUP_HEADER_H;
 
-            let visual_count = group.cards.len() + usize::from(group.virtual_space_id.is_some());
-            if visual_count == 0 {
+            let has_preview = group.desktop_id.is_some() && group.desktop_id == preview_did;
+            let has_add_tile = group.virtual_space_id.is_some();
+            let total_slots =
+                group.cards.len() + usize::from(has_preview) + usize::from(has_add_tile);
+            if total_slots == 0 {
                 y += EMPTY_GROUP_H;
                 continue;
             }
 
-            let rows = visual_count.div_ceil(cols);
+            let rows = total_slots.div_ceil(cols);
             for r in 0..rows {
                 let row_top = y;
                 let row_bottom = row_top + item_h;
                 let start = r * cols;
-                if start < group.cards.len() {
-                    let end = (start + cols).min(group.cards.len());
+                let end = (start + cols).min(group.cards.len());
+                if start < end {
                     for card in &group.cards[start..end] {
                         if card.flat_index == self.selected_flat {
                             let top = if r == 0 { group_header_top } else { row_top };
@@ -3046,6 +3191,7 @@ impl SwitcherView {
         let item_h = preview_h + self.extra_item_h();
         let ring_h = preview_h + TOTAL_RING_PAD * 2.0;
 
+        let preview_did = self.preview_desktop_id();
         let mut map = HashMap::with_capacity(self.flat_hwnds.len());
         let mut y = CONTENT_PAD_TOP;
 
@@ -3055,7 +3201,10 @@ impl SwitcherView {
             }
             y += GROUP_HEADER_H;
 
-            let visual_count = group.cards.len() + usize::from(group.virtual_space_id.is_some());
+            let has_preview = group.desktop_id.is_some() && group.desktop_id == preview_did;
+            let has_add_tile = group.virtual_space_id.is_some();
+            let visual_count =
+                group.cards.len() + usize::from(has_preview) + usize::from(has_add_tile);
             if visual_count == 0 {
                 y += EMPTY_GROUP_H;
                 continue;
@@ -3356,6 +3505,7 @@ impl SwitcherView {
         // Animated Scene C exit path: preempt Scene A/B cleanly, keep overlay visible as curtain.
         self.tab_anim = None;
         self.selection_anim = None;
+        self.clear_drag_and_genie();
         self.scroll_y = self.scroll_target_y;
         self.scroll_last_tick = None;
         self.disarm_hold_mode();
@@ -3675,6 +3825,7 @@ impl SwitcherView {
         // Animated Scene C desktop switch: immediately preempt any click-1 TabTransition
         self.tab_anim = None;
         self.selection_anim = None;
+        self.clear_drag_and_genie();
         self.scroll_y = self.scroll_target_y;
         self.scroll_last_tick = None;
         self.disarm_hold_mode();
@@ -4240,10 +4391,17 @@ impl SwitcherView {
 
         if key == "escape" {
             cx.stop_propagation();
+            if self.active_drag.is_some() || self.pending_drag.is_some() {
+                self.cancel_active_drag(cx);
+                return;
+            }
             if self.dismiss_space_popups(false, cx) {
                 return;
             }
             self.hide(cx);
+            return;
+        }
+        if self.active_drag.is_some() {
             return;
         }
         if self.armed_delete.take().is_some() || self.context_menu.take().is_some() {
@@ -4496,6 +4654,904 @@ impl SwitcherView {
         }
     }
 
+    fn snapshot_current_thumb_bounds(&self) -> HashMap<isize, Bounds<Pixels>> {
+        let (cols, preview_w, preview_h, tile_outer_w, grid_total_w) = self.fixed_grid_geometry();
+        let (total_h, _) = self.compute_layout_metrics(cols, preview_h);
+        let view_h = self.viewport_height_px.get().max(100.0);
+        let max_scroll = (total_h - view_h).max(0.0);
+        let optical_top_pad = Self::compute_optical_top_pad(max_scroll, total_h, view_h);
+        let vp_origin_y = self
+            .viewport_clip
+            .borrow()
+            .map(|b| f32::from(b.origin.y))
+            .unwrap_or(TOP_SPACES_BAR_H);
+        let computed = self.compute_card_layout_rects(
+            cols,
+            preview_w,
+            preview_h,
+            tile_outer_w,
+            grid_total_w,
+            optical_top_pad,
+            self.scroll_y,
+            vp_origin_y,
+        );
+        let cached = self.last_thumb_bounds.borrow();
+        let mut out = HashMap::with_capacity(self.flat_hwnds.len());
+        for g in &self.groups {
+            for card in &g.cards {
+                let hwnd = card.info.hwnd;
+                if let Some(&b) = cached.get(&hwnd) {
+                    out.insert(hwnd, b);
+                } else if let Some(layout) = computed.get(&card.flat_index) {
+                    out.insert(hwnd, layout.thumb_window_bounds);
+                }
+            }
+        }
+        out
+    }
+
+    fn resolve_card_thumb_bounds(&self, hwnd: isize, scroll_y: f32) -> Option<Bounds<Pixels>> {
+        let flat_idx = self.flat_hwnds.iter().position(|&h| h == hwnd)?;
+        let (cols, preview_w, preview_h, tile_outer_w, grid_total_w) = self.fixed_grid_geometry();
+        let (total_h, _) = self.compute_layout_metrics(cols, preview_h);
+        let view_h = self.viewport_height_px.get().max(100.0);
+        let max_scroll = (total_h - view_h).max(0.0);
+        let optical_top_pad = Self::compute_optical_top_pad(max_scroll, total_h, view_h);
+        let vp_origin_y = self
+            .viewport_clip
+            .borrow()
+            .map(|b| f32::from(b.origin.y))
+            .unwrap_or(TOP_SPACES_BAR_H);
+        let layouts = self.compute_card_layout_rects(
+            cols,
+            preview_w,
+            preview_h,
+            tile_outer_w,
+            grid_total_w,
+            optical_top_pad,
+            scroll_y,
+            vp_origin_y,
+        );
+        layouts.get(&flat_idx).map(|r| r.thumb_window_bounds)
+    }
+
+    fn capture_card_bitmap_for_drag(
+        &self,
+        hwnd: isize,
+        card_bounds: Bounds<Pixels>,
+        accent_color: u32,
+        window: &Window,
+    ) -> CapturedBitmap {
+        let sf = window.scale_factor().max(self.overlay_scale).max(1.0);
+        let card_w = f32::from(card_bounds.size.width).max(64.0);
+        let card_h = f32::from(card_bounds.size.height).max(40.0);
+
+        let is_unclipped_in_viewport = self.viewport_clip.borrow().is_none_or(|vp| {
+            let vp_top = f32::from(vp.origin.y) - 2.0;
+            let vp_bot = f32::from(vp.origin.y + vp.size.height) + 2.0;
+            let c_top = f32::from(card_bounds.origin.y);
+            let c_bot = c_top + card_h;
+            c_top >= vp_top && c_bot <= vp_bot
+        });
+
+        // Tier 1: Ultra-fast DWM desktop composition capture of the exact live card pixels (< 0.5ms).
+        if is_unclipped_in_viewport
+            && self.overlay_phys_rect.right > self.overlay_phys_rect.left
+            && self.overlay_phys_rect.bottom > self.overlay_phys_rect.top
+        {
+            let phys_rc = RECT {
+                left: self.overlay_phys_rect.left
+                    + (f32::from(card_bounds.origin.x) * sf).round() as i32,
+                top: self.overlay_phys_rect.top
+                    + (f32::from(card_bounds.origin.y) * sf).round() as i32,
+                right: self.overlay_phys_rect.left
+                    + (f32::from(card_bounds.origin.x + card_bounds.size.width) * sf).round()
+                        as i32,
+                bottom: self.overlay_phys_rect.top
+                    + (f32::from(card_bounds.origin.y + card_bounds.size.height) * sf).round()
+                        as i32,
+            };
+            if let Some(bmp) = capture_screen_rect_bgra(phys_rc, GENIE_CAPTURE_MAX_W) {
+                if bitmap_has_visible_pixels(&bmp) {
+                    return bmp;
+                }
+            }
+        }
+
+        // Tier 2: Direct PrintWindow capture fallback (works when card is partially clipped or screen BitBlt is blocked).
+        let target_w = (card_w.round() as u32).clamp(64, GENIE_CAPTURE_MAX_W);
+        let target_h = ((card_h * (target_w as f32 / card_w)).round() as u32).clamp(40, 320);
+        if let Some(bmp) = capture_window_bgra(
+            hwnd,
+            target_w,
+            target_h,
+            self.config.preview_fit == PreviewFit::Cover,
+        ) {
+            if bitmap_has_visible_pixels(&bmp) {
+                return bmp;
+            }
+        }
+
+        // Tier 3: Sleek pure-Rust frosted fallback so Genie distortion never fails.
+        synthesize_fallback_card_bitmap(target_w, target_h, accent_color)
+    }
+
+    fn resolve_drop_target(
+        &self,
+        pos: Point<Pixels>,
+        hwnd: isize,
+        source_desktop_id: Option<DesktopId>,
+        is_pinned: bool,
+    ) -> Option<DropTarget> {
+        let can_target_desktop =
+            |did: DesktopId| is_pinned || source_desktop_id != Some(did);
+
+        // 1. Top left capsule: Windows native desktop pills `[ 桌面 X ]` (generous vertical magnetic hit pad).
+        {
+            let pills = self.pill_bounds.borrow();
+            for d in &self.desktops {
+                if let Some(&b) = pills.get(&d.id) {
+                    if bounds_contains_padded(b, pos, 4.0, 14.0) {
+                        return can_target_desktop(d.id).then_some(DropTarget::TopPill(d.id));
+                    }
+                }
+            }
+        }
+
+        // 2. Top left capsule: native `[ + ]` pill (create new OS virtual desktop + move window into it).
+        if let Some(add_b) = *self.add_pill_bounds.borrow() {
+            if bounds_contains_padded(add_b, pos, 6.0, 14.0) {
+                return Some(DropTarget::CreateNewDesktop);
+            }
+        }
+
+        // 3. Top right capsule: WinDeck soft virtual space pills `[ 空间 X ]` (project without moving OS desktop).
+        {
+            let v_pills = self.vspace_pill_bounds.borrow();
+            for space in self.virtual_spaces.spaces() {
+                if let Some(&b) = v_pills.get(&space.id) {
+                    if bounds_contains_padded(b, pos, 4.0, 14.0) {
+                        return (!space.contains_hwnd(hwnd))
+                            .then_some(DropTarget::VirtualSpacePill(space.id));
+                    }
+                }
+            }
+        }
+
+        // 4. Top right capsule: WinDeck soft virtual space `[ + ]` pill (create new soft space + project window).
+        if let Some(v_add_b) = *self.vspace_add_pill_bounds.borrow() {
+            if bounds_contains_padded(v_add_b, pos, 6.0, 14.0) {
+                return Some(DropTarget::CreateNewVirtualSpace);
+            }
+        }
+
+        // 5. Visible native desktop groups inside the scrollable Mission Control canvas.
+        let in_canvas = self.viewport_clip.borrow().is_none_or(|vp| {
+            let y = f32::from(pos.y);
+            y >= f32::from(vp.origin.y) && y <= f32::from(vp.origin.y + vp.size.height)
+        });
+        if in_canvas {
+            let groups_b = self.group_bounds.borrow();
+            for group in &self.groups {
+                let Some(did) = group.desktop_id else {
+                    continue;
+                };
+                if let Some(&b) = groups_b.get(&did) {
+                    if bounds_contains_padded(b, pos, 28.0, 12.0) {
+                        return can_target_desktop(did).then_some(DropTarget::DesktopGroup(did));
+                    }
+                }
+            }
+        }
+
+        None
+    }
+
+    fn begin_card_press(
+        &mut self,
+        card_flat_index: usize,
+        hwnd: isize,
+        source_desktop_id: Option<DesktopId>,
+        is_pinned: bool,
+        icon: Option<Arc<RenderImage>>,
+        accent_color: u32,
+        press_pos: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.exit_anim.is_some()
+            || self.settings_open
+            || self.update_dialog_open
+            || self.add_picker.is_some()
+        {
+            return;
+        }
+        // Finish any in-flight Genie animation cleanly before starting a new interaction.
+        if self.genie_anim.is_some() {
+            self.clear_drag_and_genie();
+        }
+        self.disarm_hold_mode();
+
+        let card_bounds = self
+            .last_thumb_bounds
+            .borrow()
+            .get(&hwnd)
+            .copied()
+            .or_else(|| self.resolve_card_thumb_bounds(hwnd, self.scroll_y))
+            .unwrap_or_else(|| {
+                let (_, pw, ph, _, _) = self.fixed_grid_geometry();
+                Bounds {
+                    origin: point(press_pos.x - px(pw * 0.5), press_pos.y - px(ph * 0.5)),
+                    size: size(px(pw), px(ph)),
+                }
+            });
+
+        let grab_offset = point(
+            press_pos.x - card_bounds.origin.x,
+            press_pos.y - card_bounds.origin.y,
+        );
+
+        self.pending_drag = Some(PendingDrag {
+            hwnd,
+            flat_index: card_flat_index,
+            source_desktop_id,
+            is_pinned,
+            was_current_tab: card_flat_index == self.selected_flat,
+            press_pos,
+            card_bounds,
+            grab_offset,
+            icon,
+            accent_color,
+        });
+        cx.notify();
+    }
+
+    fn cancel_active_drag(&mut self, cx: &mut Context<Self>) {
+        self.pending_drag = None;
+        self.drag_scroll_last_tick = None;
+        self.preview_box_bounds.borrow_mut().take();
+        let Some(drag) = self.active_drag.take() else {
+            return;
+        };
+        if self.config.transition_effect.is_enabled() {
+            let release_rect = drag.floating_rect();
+            let to_rect = self
+                .resolve_card_thumb_bounds(drag.hwnd, self.scroll_y)
+                .map(RectF::from_bounds)
+                .unwrap_or_else(|| RectF::from_bounds(drag.origin_bounds));
+            self.genie_anim = Some(GenieTransferAnim {
+                hwnd: drag.hwnd,
+                target_desktop_id: None,
+                auto_switch_filter: false,
+                play_suck_out: false,
+                suck_out_from_pill: false,
+                phase: GeniePhase::CancelReturn {
+                    from_rect: release_rect,
+                    to_rect,
+                    duration: Duration::from_millis(190),
+                },
+                phase_started_at: Instant::now(),
+                full_image: drag.full_image,
+                strip_image: None,
+                num_strips: 0,
+                pill_pulse_desktop: None,
+                pill_pulse_space: None,
+                is_virtual_space_transfer: false,
+            });
+        } else {
+            self.queue_drop_image(drag.full_image);
+        }
+        cx.notify();
+    }
+
+    fn on_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.visible
+            || self.exit_anim.is_some()
+            || self.settings_open
+            || self.update_dialog_open
+            || self.add_picker.is_some()
+        {
+            return;
+        }
+
+        // If the left button is no longer held while tracking a drag (e.g. OS swallowed mouse-up),
+        // cancel cleanly so the card never gets stuck floating.
+        if event.pressed_button != Some(MouseButton::Left) {
+            if self.active_drag.is_some() {
+                self.cancel_active_drag(cx);
+            } else {
+                self.pending_drag = None;
+            }
+            return;
+        }
+
+        if let Some(ref mut drag) = self.active_drag {
+            drag.cursor_pos = event.position;
+            let drag_hwnd = drag.hwnd;
+            let src_did = drag.source_desktop_id;
+            let is_pinned = drag.is_pinned;
+            let new_target =
+                self.resolve_drop_target(event.position, drag_hwnd, src_did, is_pinned);
+            if let Some(ref mut d) = self.active_drag {
+                if d.target != new_target {
+                    d.target = new_target;
+                    self.preview_box_bounds.borrow_mut().take();
+                }
+            }
+            cx.notify();
+            return;
+        }
+
+        if let Some(ref pending) = self.pending_drag {
+            let dx = f32::from(event.position.x - pending.press_pos.x);
+            let dy = f32::from(event.position.y - pending.press_pos.y);
+            if dx.hypot(dy) < DRAG_THRESHOLD_PX {
+                return;
+            }
+            let pending = self.pending_drag.take().unwrap();
+            self.clear_space_popups();
+            self.hovered_flat = None;
+
+            let captured = self.capture_card_bitmap_for_drag(
+                pending.hwnd,
+                pending.card_bounds,
+                pending.accent_color,
+                window,
+            );
+            let Some(full_image) = bitmap_to_full_render_image(&captured) else {
+                return;
+            };
+
+            // Hide original live DWM thumbnail immediately once card lifts off into drag ghost.
+            self.thumbs.borrow_mut().hide_thumbnail(pending.hwnd);
+
+            let target = self.resolve_drop_target(
+                event.position,
+                pending.hwnd,
+                pending.source_desktop_id,
+                pending.is_pinned,
+            );
+            self.active_drag = Some(ActiveDrag {
+                hwnd: pending.hwnd,
+                source_desktop_id: pending.source_desktop_id,
+                is_pinned: pending.is_pinned,
+                was_current_tab: pending.was_current_tab,
+                origin_bounds: pending.card_bounds,
+                grab_offset: pending.grab_offset,
+                cursor_pos: event.position,
+                target,
+                icon: pending.icon,
+                captured,
+                full_image,
+            });
+            cx.notify();
+        }
+    }
+
+    fn on_capture_mouse_up(
+        &mut self,
+        event: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.button != MouseButton::Left {
+            return;
+        }
+        if self.pending_drag.is_none() && self.active_drag.is_none() {
+            return;
+        }
+        // Intercept release in Capture phase so releasing a drag never triggers underlying pill/root clicks.
+        cx.stop_propagation();
+
+        if let Some(pending) = self.pending_drag.take() {
+            if self.exit_anim.is_some() {
+                return;
+            }
+            if self.dismiss_space_popups(true, cx) {
+                return;
+            }
+            self.selected_flat = pending.flat_index;
+            self.activate_window(pending.hwnd, window, cx);
+            return;
+        }
+
+        if let Some(mut drag) = self.active_drag.take() {
+            self.drag_scroll_last_tick = None;
+            drag.cursor_pos = event.position;
+            let final_target = self
+                .resolve_drop_target(
+                    event.position,
+                    drag.hwnd,
+                    drag.source_desktop_id,
+                    drag.is_pinned,
+                )
+                .or(drag.target);
+            let preview_rect_snapshot = self.preview_box_bounds.borrow_mut().take();
+
+            match final_target {
+                Some(target) if target.is_virtual_space() => {
+                    self.commit_drop_to_virtual_space(drag, target, window, cx);
+                }
+                Some(target) => {
+                    self.commit_drop_to_desktop(drag, target, preview_rect_snapshot, window, cx);
+                }
+                None => {
+                    // Put drag back transiently so cancel_active_drag launches smooth return animation.
+                    self.active_drag = Some(drag);
+                    self.cancel_active_drag(cx);
+                }
+            }
+        }
+    }
+
+    fn on_mouse_up_out_left(
+        &mut self,
+        _event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active_drag.is_some() || self.pending_drag.is_some() {
+            self.cancel_active_drag(cx);
+        }
+    }
+
+    /// Drops a dragged card onto a WinDeck soft virtual space pill (or soft-space `+` pill).
+    /// Adds a projection & auto-homing rule WITHOUT moving the window off its real Windows desktop,
+    /// and plays a violet Genie Suck-In directly into the target soft-space pill while the original
+    /// card stays live in place.
+    fn commit_drop_to_virtual_space(
+        &mut self,
+        drag: ActiveDrag,
+        target: DropTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(win) = self.all_windows.iter().find(|w| w.hwnd == drag.hwnd).cloned() else {
+            self.queue_drop_image(drag.full_image);
+            return;
+        };
+
+        let release_rect = drag.floating_rect();
+        let v_add_snapshot = *self.vspace_add_pill_bounds.borrow();
+
+        let (space_id, created_new) = match target {
+            DropTarget::VirtualSpacePill(sid) => (sid, false),
+            DropTarget::CreateNewVirtualSpace => (self.virtual_spaces.create_space(None), true),
+            _ => {
+                self.queue_drop_image(drag.full_image);
+                return;
+            }
+        };
+
+        let Some(space_name) = self.virtual_spaces.get(space_id).map(|s| s.name.clone()) else {
+            self.queue_drop_image(drag.full_image);
+            return;
+        };
+
+        let outcome = self
+            .virtual_spaces
+            .add_window(space_id, &win, &self.all_windows);
+        self.persist_virtual_spaces();
+
+        if self.view_filter == ViewFilter::VirtualSpace(space_id) {
+            self.rebuild_visible_groups(false);
+            self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
+            self.clamp_scroll();
+        }
+
+        let toast = if created_new {
+            format!("已放入新空间「{space_name}」")
+        } else if outcome == AddWindowOutcome::Added {
+            format!("已放入「{space_name}」")
+        } else {
+            format!("已在「{space_name}」中")
+        };
+        self.transient_toast = Some((SharedString::from(toast), Instant::now()));
+        append_log(&format!(
+            "DRAG_PROJECT_VSPACE hwnd=0x{:X} space={} name='{}' created_new={} outcome={:?}",
+            drag.hwnd, space_id.0, space_name, created_new, outcome
+        ));
+
+        if !self.config.transition_effect.is_enabled() {
+            self.queue_drop_image(drag.full_image);
+            window.refresh();
+            cx.notify();
+            return;
+        }
+
+        let mouth = match target {
+            DropTarget::VirtualSpacePill(sid) => self
+                .vspace_pill_bounds
+                .borrow()
+                .get(&sid)
+                .copied()
+                .map(FunnelMouth::from_top_pill)
+                .unwrap_or(FunnelMouth {
+                    left: release_rect.center_x() - 18.0,
+                    right: release_rect.center_x() + 18.0,
+                    y: TOP_SPACES_BAR_H - 12.0,
+                }),
+            DropTarget::CreateNewVirtualSpace => v_add_snapshot
+                .or_else(|| self.vspace_pill_bounds.borrow().get(&space_id).copied())
+                .map(FunnelMouth::from_top_pill)
+                .unwrap_or(FunnelMouth {
+                    left: release_rect.center_x() - 18.0,
+                    right: release_rect.center_x() + 18.0,
+                    y: TOP_SPACES_BAR_H - 12.0,
+                }),
+            _ => FunnelMouth {
+                left: release_rect.center_x() - 18.0,
+                right: release_rect.center_x() + 18.0,
+                y: TOP_SPACES_BAR_H - 12.0,
+            },
+        };
+
+        let (strip_image, num_strips) =
+            match bitmap_to_strip_render_image(&drag.captured, GENIE_STRIP_COUNT) {
+                Some((img, count)) => (Some(img), count),
+                None => (None, 0),
+            };
+
+        self.genie_anim = Some(GenieTransferAnim {
+            hwnd: drag.hwnd,
+            target_desktop_id: None,
+            auto_switch_filter: false,
+            play_suck_out: false,
+            suck_out_from_pill: true,
+            phase: GeniePhase::SuckIn {
+                from_rect: release_rect,
+                mouth,
+                duration: Duration::from_millis(255),
+            },
+            phase_started_at: Instant::now(),
+            full_image: drag.full_image,
+            strip_image,
+            num_strips,
+            pill_pulse_desktop: None,
+            pill_pulse_space: Some(space_id),
+            is_virtual_space_transfer: true,
+        });
+        cx.notify();
+    }
+
+    fn commit_drop_to_desktop(
+        &mut self,
+        drag: ActiveDrag,
+        target: DropTarget,
+        preview_rect_snapshot: Option<Bounds<Pixels>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Guard against Explorer transient focus bump during virtual desktop COM mutation.
+        self.shown_at = Some(Instant::now());
+
+        let release_rect = drag.floating_rect();
+        let add_pill_snapshot = *self.add_pill_bounds.borrow();
+
+        // 1. Resolve (or create) target virtual desktop.
+        let (target_did, created_new) = match target {
+            DropTarget::TopPill(did) | DropTarget::DesktopGroup(did) => (did, false),
+            DropTarget::CreateNewDesktop => match self.vdm.create_desktop() {
+                Ok(new_id) => {
+                    if let Ok(fresh_desktops) = self.vdm.get_desktops() {
+                        self.desktops = fresh_desktops;
+                    }
+                    (new_id, true)
+                }
+                Err(e) => {
+                    self.transient_toast = Some((
+                        SharedString::from(format!("新建桌面失败：{e}")),
+                        Instant::now(),
+                    ));
+                    append_log(&format!("DRAG CREATE_DESKTOP ERROR: {e:#}"));
+                    self.active_drag = Some(drag);
+                    self.cancel_active_drag(cx);
+                    return;
+                }
+            },
+            DropTarget::VirtualSpacePill(_) | DropTarget::CreateNewVirtualSpace => {
+                self.commit_drop_to_virtual_space(drag, target, window, cx);
+                return;
+            }
+        };
+
+        // 2. Move the real Windows HWND to the destination virtual desktop via COM.
+        if let Err(e) = self.vdm.move_window_to_desktop(drag.hwnd, target_did) {
+            self.transient_toast = Some((
+                SharedString::from(format!("移动窗口失败：{e}")),
+                Instant::now(),
+            ));
+            append_log(&format!(
+                "DRAG MOVE_WINDOW ERROR hwnd=0x{:X} target={target_did}: {e:#}",
+                drag.hwnd
+            ));
+            self.active_drag = Some(drag);
+            self.cancel_active_drag(cx);
+            return;
+        }
+
+        // 3. Snapshot sibling card rects BEFORE mutating groups for smooth FLIP gap-closing.
+        let prev_sibling_bounds = self.snapshot_current_thumb_bounds();
+        let prev_selected_hwnd = self.flat_hwnds.get(self.selected_flat).copied();
+
+        // 4. Optimistically update local window & stable order snapshot so layout updates immediately.
+        let target_desktop_idx = self.desktops.iter().position(|d| d.id == target_did);
+        for w in &mut self.all_windows {
+            if w.hwnd == drag.hwnd {
+                w.desktop_id = Some(target_did);
+                w.desktop_index = target_desktop_idx;
+                w.is_pinned = false;
+            }
+        }
+        self.window_order.sync(
+            &self.all_windows,
+            &self.desktops,
+            is_window_alive_with_pid,
+        );
+
+        let auto_switch_filter = drag.was_current_tab
+            && matches!(self.view_filter, ViewFilter::NativeDesktop(fid) if fid != target_did);
+
+        let animate = self.config.transition_effect.is_enabled();
+
+        if !animate {
+            if auto_switch_filter {
+                self.view_filter = ViewFilter::NativeDesktop(target_did);
+                self.scroll_y = 0.0;
+                self.scroll_target_y = 0.0;
+                self.scroll_last_tick = None;
+            }
+            self.rebuild_visible_groups(false);
+            if drag.was_current_tab {
+                if let Some(idx) = self.flat_hwnds.iter().position(|&h| h == drag.hwnd) {
+                    self.selected_flat = idx;
+                    self.ensure_selected_visible();
+                }
+            } else if let Some(prev_hwnd) = prev_selected_hwnd {
+                if let Some(idx) = self.flat_hwnds.iter().position(|&h| h == prev_hwnd) {
+                    self.selected_flat = idx;
+                }
+            }
+            self.queue_drop_image(drag.full_image);
+            self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
+            self.clamp_scroll();
+            window.refresh();
+            cx.notify();
+            return;
+        }
+
+        // Rebuild current view right away (in single-desktop mode, dragged card disappears from
+        // source desktop while remaining siblings FLIP-reflow smoothly; auto-switch runs right
+        // after Stage 1 Suck-In finishes so you watch it suck into the pill, then switch & suck out!).
+        self.rebuild_visible_groups(false);
+        if drag.was_current_tab && !auto_switch_filter {
+            if let Some(idx) = self.flat_hwnds.iter().position(|&h| h == drag.hwnd) {
+                self.selected_flat = idx;
+                self.ensure_selected_visible();
+            }
+        } else if let Some(prev_hwnd) = prev_selected_hwnd {
+            if let Some(idx) = self.flat_hwnds.iter().position(|&h| h == prev_hwnd) {
+                self.selected_flat = idx;
+            }
+        }
+        self.clamp_scroll();
+
+        // Keep moved window registered in DWM but hidden until Genie completes.
+        {
+            let mut thumbs = self.thumbs.borrow_mut();
+            thumbs.ensure_targets(&self.flat_hwnds);
+            thumbs.hide_thumbnail(drag.hwnd);
+        }
+
+        // Launch FLIP reflow for siblings that shifted when the dragged card vacated its slot.
+        let mut reflow_from = prev_sibling_bounds;
+        reflow_from.remove(&drag.hwnd);
+        if !reflow_from.is_empty() {
+            let profile = TransitionProfile::from_effect(self.config.transition_effect);
+            self.reflow_anim = Some(ReflowAnim {
+                started_at: Instant::now(),
+                duration: Duration::from_millis(215),
+                use_spring: profile.use_spring,
+                from_bounds: reflow_from,
+            });
+        }
+
+        // 5. Determine funnel portal mouth & Stage 1/Stage 2 plan.
+        let suck_out_from_pill = matches!(
+            target,
+            DropTarget::TopPill(_) | DropTarget::CreateNewDesktop
+        );
+        let dest_slot_now = self.resolve_card_thumb_bounds(drag.hwnd, self.scroll_target_y);
+
+        let mouth = match target {
+            DropTarget::TopPill(did) => self
+                .pill_bounds
+                .borrow()
+                .get(&did)
+                .copied()
+                .map(FunnelMouth::from_top_pill)
+                .unwrap_or(FunnelMouth {
+                    left: release_rect.center_x() - 18.0,
+                    right: release_rect.center_x() + 18.0,
+                    y: TOP_SPACES_BAR_H - 12.0,
+                }),
+            DropTarget::CreateNewDesktop => add_pill_snapshot
+                .or_else(|| self.pill_bounds.borrow().get(&target_did).copied())
+                .map(FunnelMouth::from_top_pill)
+                .unwrap_or(FunnelMouth {
+                    left: release_rect.center_x() - 18.0,
+                    right: release_rect.center_x() + 18.0,
+                    y: TOP_SPACES_BAR_H - 12.0,
+                }),
+            DropTarget::DesktopGroup(_) => {
+                // Prefer the live post-move destination slot (`dest_slot_now`) so if the source
+                // desktop above collapsed a row, Suck-In and Suck-Out meet at the exact live rim.
+                let anchor_box = dest_slot_now
+                    .or(preview_rect_snapshot)
+                    .map(RectF::from_bounds)
+                    .unwrap_or(release_rect);
+                FunnelMouth::for_group_preview_box(release_rect, anchor_box)
+            }
+            DropTarget::VirtualSpacePill(_) | DropTarget::CreateNewVirtualSpace => unreachable!(),
+        };
+
+        let dest_visible_in_all_view = if self.view_filter == ViewFilter::All {
+            if drag.was_current_tab {
+                true
+            } else if let Some(db) = dest_slot_now {
+                self.viewport_clip.borrow().is_none_or(|vp| {
+                    let vp_top = f32::from(vp.origin.y) - 40.0;
+                    let vp_bot = f32::from(vp.origin.y + vp.size.height) + 40.0;
+                    let d_top = f32::from(db.origin.y);
+                    let d_bot = d_top + f32::from(db.size.height);
+                    d_bot >= vp_top && d_top <= vp_bot
+                })
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
+        let play_suck_out = auto_switch_filter || dest_visible_in_all_view;
+        let suck_in_duration = if !play_suck_out {
+            Duration::from_millis(290)
+        } else if suck_out_from_pill {
+            Duration::from_millis(235)
+        } else {
+            Duration::from_millis(205)
+        };
+
+        let (strip_image, num_strips) =
+            match bitmap_to_strip_render_image(&drag.captured, GENIE_STRIP_COUNT) {
+                Some((img, count)) => (Some(img), count),
+                None => (None, 0),
+            };
+
+        append_log(&format!(
+            "DRAG_MOVE hwnd=0x{:X} target={} created_new={} via={:?} was_current={} auto_switch={} suck_out={}",
+            drag.hwnd,
+            target_did,
+            created_new,
+            target,
+            drag.was_current_tab,
+            auto_switch_filter,
+            play_suck_out,
+        ));
+
+        self.genie_anim = Some(GenieTransferAnim {
+            hwnd: drag.hwnd,
+            target_desktop_id: Some(target_did),
+            auto_switch_filter,
+            play_suck_out,
+            suck_out_from_pill,
+            phase: GeniePhase::SuckIn {
+                from_rect: release_rect,
+                mouth,
+                duration: suck_in_duration,
+            },
+            phase_started_at: Instant::now(),
+            full_image: drag.full_image,
+            strip_image,
+            num_strips,
+            pill_pulse_desktop: Some(target_did),
+            pill_pulse_space: None,
+            is_virtual_space_transfer: false,
+        });
+        cx.notify();
+    }
+
+    fn advance_genie_phase(&mut self, now: Instant) {
+        let should_advance = self
+            .genie_anim
+            .as_ref()
+            .is_some_and(|anim| anim.is_phase_finished(now));
+        if !should_advance {
+            return;
+        }
+
+        let Some(mut anim) = self.genie_anim.take() else {
+            return;
+        };
+
+        match anim.phase {
+            GeniePhase::SuckIn { mouth, .. } => {
+                if anim.auto_switch_filter {
+                    if let Some(target_did) = anim.target_desktop_id {
+                        self.view_filter = ViewFilter::NativeDesktop(target_did);
+                        self.scroll_y = 0.0;
+                        self.scroll_target_y = 0.0;
+                        self.scroll_last_tick = None;
+                        self.tab_anim = None;
+                        self.reflow_anim = None;
+                        self.selection_anim = None;
+                        self.rebuild_visible_groups(false);
+                        if let Some(idx) = self.flat_hwnds.iter().position(|&h| h == anim.hwnd) {
+                            self.selected_flat = idx;
+                        }
+                        {
+                            let mut thumbs = self.thumbs.borrow_mut();
+                            thumbs.sync_targets(&self.flat_hwnds);
+                            thumbs.hide_thumbnail(anim.hwnd);
+                        }
+                    }
+                }
+
+                if anim.play_suck_out && anim.strip_image.is_some() {
+                    if let Some(dest_bounds) =
+                        self.resolve_card_thumb_bounds(anim.hwnd, self.scroll_y)
+                    {
+                        let dest_rect = RectF::from_bounds(dest_bounds);
+                        let suck_out_mouth = if anim.suck_out_from_pill {
+                            anim.target_desktop_id
+                                .and_then(|did| self.pill_bounds.borrow().get(&did).copied())
+                                .map(FunnelMouth::from_top_pill)
+                                .unwrap_or(mouth)
+                        } else {
+                            // Keep portal anchored cleanly on the exact edge of destination slot even if scrolled.
+                            let half_w = (dest_rect.width() * 0.065).clamp(14.0, 24.0);
+                            let use_bottom = (mouth.y - dest_rect.bottom).abs()
+                                < (mouth.y - dest_rect.top).abs();
+                            FunnelMouth {
+                                left: dest_rect.center_x() - half_w,
+                                right: dest_rect.center_x() + half_w,
+                                y: if use_bottom {
+                                    dest_rect.bottom
+                                } else {
+                                    dest_rect.top
+                                },
+                            }
+                        };
+                        anim.phase = GeniePhase::SuckOut {
+                            mouth: suck_out_mouth,
+                            to_rect: dest_rect,
+                            duration: Duration::from_millis(250),
+                        };
+                        anim.phase_started_at = now;
+                        self.genie_anim = Some(anim);
+                        return;
+                    }
+                }
+
+                // Stage 1 only (or destination offscreen): finish cleanly & drop GPU textures.
+                for img in anim.into_images() {
+                    self.queue_drop_image(img);
+                }
+                self.thumbs.borrow_mut().retain_targets(&self.flat_hwnds);
+            }
+            GeniePhase::SuckOut { .. } | GeniePhase::CancelReturn { .. } => {
+                for img in anim.into_images() {
+                    self.queue_drop_image(img);
+                }
+                self.thumbs.borrow_mut().retain_targets(&self.flat_hwnds);
+            }
+        }
+    }
+
     fn on_scroll_wheel(
         &mut self,
         event: &ScrollWheelEvent,
@@ -4537,6 +5593,16 @@ impl SwitcherView {
             self.scroll_last_tick = None;
         } else if (self.scroll_target_y - self.scroll_y).abs() >= 0.45 {
             self.scroll_last_tick.get_or_insert_with(Instant::now);
+        }
+        if let Some(ref drag) = self.active_drag {
+            let pos = drag.cursor_pos;
+            let drag_hwnd = drag.hwnd;
+            let src_did = drag.source_desktop_id;
+            let is_pinned = drag.is_pinned;
+            let new_target = self.resolve_drop_target(pos, drag_hwnd, src_did, is_pinned);
+            if let Some(ref mut d) = self.active_drag {
+                d.target = new_target;
+            }
         }
         cx.notify();
     }
@@ -4635,6 +5701,14 @@ impl Render for SwitcherView {
             self.thumbs.borrow_mut().retain_targets(&self.flat_hwnds);
         }
 
+        // Complete sibling FLIP reflow once elapsed.
+        if self.reflow_anim.as_ref().is_some_and(|ra| ra.is_finished(now)) {
+            self.reflow_anim = None;
+        }
+
+        // Advance pixel-level Genie funnel transfer (Suck-In -> optional filter switch -> Suck-Out -> done).
+        self.advance_genie_phase(now);
+
         let (cols, preview_w, preview_h, tile_outer_w, grid_total_w) = self.fixed_grid_geometry();
         let item_total_h = preview_h + self.extra_item_h();
         let label_pos = self.config.label_position;
@@ -4643,6 +5717,44 @@ impl Render for SwitcherView {
         let (total_content_h, _) = self.compute_layout_metrics(cols, preview_h);
         let view_h = self.viewport_height_px.get().max(100.0);
         let max_scroll = (total_content_h - view_h).max(0.0);
+
+        // Edge auto-scroll while dragging near the top or bottom of a scrollable canvas.
+        let mut drag_auto_scrolling = false;
+        if let Some(ref drag) = self.active_drag {
+            if max_scroll > 1.0 && !self.settings_open && !self.update_dialog_open {
+                let vp_top = self
+                    .viewport_clip
+                    .borrow()
+                    .map(|b| f32::from(b.origin.y))
+                    .unwrap_or(TOP_SPACES_BAR_H);
+                let vp_bot = vp_top + view_h;
+                let cy = f32::from(drag.cursor_pos.y);
+                let scroll_dir = if cy > vp_bot - 56.0 && self.scroll_target_y < max_scroll - 0.5 {
+                    ((cy - (vp_bot - 56.0)) / 56.0).clamp(0.15, 1.0)
+                } else if cy >= vp_top && cy < vp_top + 42.0 && self.scroll_target_y > 0.5 {
+                    -(((vp_top + 42.0) - cy) / 42.0).clamp(0.15, 1.0)
+                } else {
+                    0.0
+                };
+                if scroll_dir.abs() > 0.01 {
+                    let dt = self
+                        .drag_scroll_last_tick
+                        .map(|last| now.saturating_duration_since(last).as_secs_f32().clamp(0.0, 0.05))
+                        .unwrap_or(1.0 / 60.0);
+                    self.drag_scroll_last_tick = Some(now);
+                    self.scroll_target_y = (self.scroll_target_y + scroll_dir * 540.0 * dt).clamp(0.0, max_scroll);
+                    self.scroll_y = self.scroll_target_y;
+                    drag_auto_scrolling = true;
+                } else {
+                    self.drag_scroll_last_tick = None;
+                }
+            } else {
+                self.drag_scroll_last_tick = None;
+            }
+        } else {
+            self.drag_scroll_last_tick = None;
+        }
+
         self.scroll_target_y = self.scroll_target_y.clamp(0.0, max_scroll);
         if self.scroll_y > max_scroll {
             self.scroll_y = max_scroll;
@@ -4679,20 +5791,22 @@ impl Render for SwitcherView {
             .map(|b| f32::from(b.origin.y))
             .unwrap_or(TOP_SPACES_BAR_H);
 
-        let card_layouts = if self.tab_anim.is_some() || self.selection_anim.is_some() {
-            Some(self.compute_card_layout_rects(
-                cols,
-                preview_w,
-                preview_h,
-                tile_outer_w,
-                grid_total_w,
-                optical_top_pad,
-                scroll_y,
-                vp_origin_y,
-            ))
-        } else {
-            None
-        };
+        let card_layouts =
+            if self.tab_anim.is_some() || self.selection_anim.is_some() || self.reflow_anim.is_some()
+            {
+                Some(self.compute_card_layout_rects(
+                    cols,
+                    preview_w,
+                    preview_h,
+                    tile_outer_w,
+                    grid_total_w,
+                    optical_top_pad,
+                    scroll_y,
+                    vp_origin_y,
+                ))
+            } else {
+                None
+            };
 
         // Advance Scene B floating focus ring.
         let floating_focus_rect: Option<Bounds<Pixels>> = if let Some(sel) = self.selection_anim {
@@ -4941,11 +6055,37 @@ impl Render for SwitcherView {
         let viewport_h_cell = self.viewport_height_px.clone();
         let viewport_w_cell = self.viewport_width_px.clone();
         let last_thumb_bounds_rc = self.last_thumb_bounds.clone();
+        let pill_bounds_rc = self.pill_bounds.clone();
+        let add_pill_bounds_rc = self.add_pill_bounds.clone();
+        let vspace_pill_bounds_rc = self.vspace_pill_bounds.clone();
+        let vspace_add_pill_bounds_rc = self.vspace_add_pill_bounds.clone();
+        let group_bounds_rc = self.group_bounds.clone();
+        let preview_box_bounds_rc = self.preview_box_bounds.clone();
+        let drop_images_rc = self.pending_drop_images.clone();
         let thumbs_rc = self.thumbs.clone();
         let is_visible = self.visible;
         let is_exiting = self.exit_anim.is_some();
         let selected_flat = self.selected_flat;
         let hovered_flat = self.hovered_flat;
+
+        let active_drag_hwnd = self.active_drag.as_ref().map(|d| d.hwnd);
+        let active_drag_target = self.active_drag.as_ref().and_then(|d| d.target);
+        let active_drag_icon = self.active_drag.as_ref().and_then(|d| d.icon.clone());
+        let preview_did = self.preview_desktop_id();
+        let genie_hwnd = self.genie_anim.as_ref().map(|g| g.hwnd);
+        let genie_hides_slot = self
+            .genie_anim
+            .as_ref()
+            .is_some_and(|g| !g.is_virtual_space_transfer);
+        let genie_is_transfer = self.genie_anim.as_ref().is_some_and(|g| {
+            !matches!(g.phase, GeniePhase::CancelReturn { .. })
+                && !g.is_virtual_space_transfer
+                && g.play_suck_out
+        });
+        let genie_suck_out_t = self.genie_anim.as_ref().and_then(|g| {
+            matches!(g.phase, GeniePhase::SuckOut { .. }).then(|| g.phase_progress(now))
+        });
+        let reflow_eased = self.reflow_anim.as_ref().map(|ra| ra.eased(now)).unwrap_or(1.0);
 
         // Request next vsync frame ONLY while an animation is actively running (zero idle CPU).
         let exit_still_running = self.exit_anim.as_ref().is_some_and(|e| !e.finishing);
@@ -4954,6 +6094,9 @@ impl Render for SwitcherView {
             && !self.update_dialog_open
             && (self.tab_anim.is_some()
                 || self.selection_anim.is_some()
+                || self.genie_anim.is_some()
+                || self.reflow_anim.is_some()
+                || drag_auto_scrolling
                 || exit_still_running
                 || scroll_animating);
         if any_anim_active {
@@ -4963,7 +6106,7 @@ impl Render for SwitcherView {
         // === TOP FLOATING DUAL-CAPSULE SPACES BAR ===
         // Left capsule: Windows native virtual desktops ([ 全部 ] [ 桌面 1 ] ... | [ + ])
         // Right capsule: WinDeck logical virtual spaces ([ ⊞ ] [ 空间 1 ] ... | [ + ])
-        let is_dragging_window = cx.has_active_drag();
+        let is_dragging_window = self.active_drag.is_some();
         let mut space_pills = Vec::with_capacity(self.desktops.len() + 3);
         let all_selected =
             override_active_desktop.is_none() && self.view_filter == ViewFilter::All;
@@ -5028,13 +6171,22 @@ impl Render for SwitcherView {
                 None => self.view_filter == ViewFilter::NativeDesktop(did),
             };
             let is_armed_delete = self.armed_delete == Some(ArmedDelete::NativeDesktop(did));
+            let is_drag_over_pill = active_drag_target == Some(DropTarget::TopPill(did));
+            let is_drag_over_group = active_drag_target == Some(DropTarget::DesktopGroup(did));
+            let pill_pulse = self
+                .genie_anim
+                .as_ref()
+                .map(|g| g.pill_pulse_strength(did, now))
+                .unwrap_or(0.0);
             let label = d_info
                 .custom_name
                 .clone()
                 .unwrap_or_else(|| format!("桌面 {}", d_idx + 1));
 
+            let pill_bounds_for_pill = pill_bounds_rc.clone();
             let pill = div()
                 .id(("space-pill", d_idx))
+                .relative()
                 .h(px(24.0))
                 .min_w(px(58.0))
                 .px(px(14.0))
@@ -5045,6 +6197,17 @@ impl Render for SwitcherView {
                 .items_center()
                 .justify_center()
                 .gap(px(5.0))
+                .child(
+                    canvas(
+                        move |bounds, _, _| {
+                            pill_bounds_for_pill.borrow_mut().insert(did, bounds);
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .inset_0()
+                    .size_full(),
+                )
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, _, _, cx| {
@@ -5087,44 +6250,69 @@ impl Render for SwitcherView {
                     .hover(|s| s.bg(rgba(0xFF453AF5)).border_color(rgba(0xFFFFFF66)))
                     .child(trash_icon())
             } else {
-                pill.bg(if is_filtered {
+                let bg_color = if is_drag_over_pill {
+                    rgba(0x0A84FF6E)
+                } else if pill_pulse > 0.02 {
+                    let a = ((0x2E as f32) + pill_pulse * 92.0).round().clamp(0.0, 255.0) as u32;
+                    rgba(0x0A84FF00 | a)
+                } else if is_drag_over_group {
+                    rgba(0x0A84FF38)
+                } else if is_filtered {
                     rgba(0xFFFFFF2E)
                 } else {
                     rgba(0x00000000)
-                })
-                .hover(|s| {
-                    s.bg(if is_filtered {
-                        rgba(0xFFFFFF38)
-                    } else {
-                        rgba(0xFFFFFF18)
+                };
+                let pill = pill
+                    .bg(bg_color)
+                    .when(is_drag_over_pill || pill_pulse > 0.02 || is_drag_over_group, |el| {
+                        let border_col = if is_drag_over_pill {
+                            rgba(0x64D2FFEE)
+                        } else if pill_pulse > 0.02 {
+                            let a = (pill_pulse * 235.0).round().clamp(30.0, 255.0) as u32;
+                            rgba(0x64D2FF00 | a)
+                        } else {
+                            rgba(0x0A84FF88)
+                        };
+                        el.border_1().border_color(border_col)
                     })
-                })
-                .when(is_cur, |el| {
-                    el.child(div().size(px(5.0)).rounded_full().bg(rgb(0x0A84FF)))
-                })
-                .child(
-                    div()
-                        .text_xs()
-                        .font_weight(if is_filtered || is_cur {
-                            gpui::FontWeight::SEMIBOLD
+                    .hover(|s| {
+                        s.bg(if is_drag_over_pill {
+                            rgba(0x0A84FF78)
+                        } else if is_filtered {
+                            rgba(0xFFFFFF38)
                         } else {
-                            gpui::FontWeight::MEDIUM
+                            rgba(0xFFFFFF18)
                         })
-                        .text_color(if is_filtered {
-                            rgba(0xFFFFFFFA)
-                        } else if is_cur {
-                            rgba(0xFFFFFFDC)
-                        } else {
-                            rgba(0xFFFFFF99)
-                        })
-                        .child(label),
-                )
+                    })
+                    .when(is_cur, |el| {
+                        el.child(div().size(px(5.0)).rounded_full().bg(rgb(0x0A84FF)))
+                    })
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(if is_filtered || is_cur || is_drag_over_pill || pill_pulse > 0.1 {
+                                gpui::FontWeight::SEMIBOLD
+                            } else {
+                                gpui::FontWeight::MEDIUM
+                            })
+                            .text_color(if is_filtered || is_drag_over_pill || pill_pulse > 0.1 {
+                                rgba(0xFFFFFFFA)
+                            } else if is_cur {
+                                rgba(0xFFFFFFDC)
+                            } else {
+                                rgba(0xFFFFFF99)
+                            })
+                            .child(label),
+                    );
+                pill
             };
 
             space_pills.push(pill);
         }
 
         // Subtle hairline divider + minimalist [ + ] create-desktop button
+        let is_drag_over_add = active_drag_target == Some(DropTarget::CreateNewDesktop);
+        let add_bounds_for_pill = add_pill_bounds_rc.clone();
         space_pills.push(
             div()
                 .id("space-bar-sep")
@@ -5136,14 +6324,39 @@ impl Render for SwitcherView {
         space_pills.push(
             div()
                 .id("space-pill-add")
+                .relative()
                 .size(px(24.0))
                 .rounded_full()
                 .cursor_pointer()
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(rgba(0xFFFFFF10))
-                .hover(|s| s.bg(rgba(0xFFFFFF28)))
+                .bg(if is_drag_over_add {
+                    rgba(0x0A84FF7A)
+                } else {
+                    rgba(0xFFFFFF10)
+                })
+                .when(is_drag_over_add, |el| {
+                    el.border_1().border_color(rgba(0x64D2FFEE))
+                })
+                .hover(|s| {
+                    s.bg(if is_drag_over_add {
+                        rgba(0x0A84FF88)
+                    } else {
+                        rgba(0xFFFFFF28)
+                    })
+                })
+                .child(
+                    canvas(
+                        move |bounds, _, _| {
+                            *add_bounds_for_pill.borrow_mut() = Some(bounds);
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .inset_0()
+                    .size_full(),
+                )
                 .on_click(cx.listener(|this, _, window, cx| {
                     cx.stop_propagation();
                     if this.dismiss_space_popups(true, cx) {
@@ -5155,7 +6368,11 @@ impl Render for SwitcherView {
                     div()
                         .text_sm()
                         .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(rgba(0xFFFFFFE8))
+                        .text_color(if is_drag_over_add {
+                            rgb(0xFFFFFF).into()
+                        } else {
+                            rgba(0xFFFFFFE8)
+                        })
                         .child("+"),
                 ),
         );
@@ -5260,8 +6477,17 @@ impl Render for SwitcherView {
                 continue;
             }
 
+            let is_drag_over_vspace = active_drag_target == Some(DropTarget::VirtualSpacePill(sid));
+            let vspace_pulse = self
+                .genie_anim
+                .as_ref()
+                .map(|g| g.space_pill_pulse_strength(sid, now))
+                .unwrap_or(0.0);
+            let vspace_bounds_for_pill = vspace_pill_bounds_rc.clone();
+
             let pill = div()
                 .id(("vspace-pill", s_idx))
+                .relative()
                 .h(px(24.0))
                 .min_w(px(54.0))
                 .max_w(px(176.0))
@@ -5273,15 +6499,17 @@ impl Render for SwitcherView {
                 .items_center()
                 .justify_center()
                 .gap(px(5.0))
-                .drag_over::<DraggedWindow>(|s, _, _, _| {
-                    s.bg(rgba(0xA78BFA66))
-                        .border_1()
-                        .border_color(rgba(0xE9D5FFEE))
-                })
-                .on_drop(cx.listener(move |this, dragged: &DraggedWindow, window, cx| {
-                    this.context_menu = None;
-                    this.add_window_to_virtual_space(sid, dragged.hwnd, window, cx);
-                }))
+                .child(
+                    canvas(
+                        move |bounds, _, _| {
+                            vspace_bounds_for_pill.borrow_mut().insert(sid, bounds);
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .inset_0()
+                    .size_full(),
+                )
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, _, _, cx| {
@@ -5318,55 +6546,71 @@ impl Render for SwitcherView {
                     .hover(|s| s.bg(rgba(0xFF453AF5)).border_color(rgba(0xFFFFFF66)))
                     .child(trash_icon())
             } else {
-                pill.bg(if is_filtered {
+                let bg_color = if is_drag_over_vspace {
+                    rgba(0xA78BFA70)
+                } else if vspace_pulse > 0.02 {
+                    let a = ((0x3D as f32) + vspace_pulse * 96.0).round().clamp(0.0, 255.0) as u32;
+                    rgba(0xA78BFA00 | a)
+                } else if is_filtered {
                     rgba(0xA78BFA3D)
                 } else {
                     rgba(0x00000000)
-                })
-                .when(is_filtered, |el| {
-                    el.border_1().border_color(rgba(0xC4B5FD66))
-                })
-                .hover(|s| {
-                    s.bg(if is_filtered {
-                        rgba(0xA78BFA4F)
-                    } else {
-                        rgba(0xA78BFA24)
+                };
+                pill.bg(bg_color)
+                    .when(is_drag_over_vspace || vspace_pulse > 0.02 || is_filtered, |el| {
+                        let border_col = if is_drag_over_vspace {
+                            rgba(0xE9D5FFEE)
+                        } else if vspace_pulse > 0.02 {
+                            let a = (vspace_pulse * 235.0).round().clamp(50.0, 255.0) as u32;
+                            rgba(0xE9D5FF00 | a)
+                        } else {
+                            rgba(0xC4B5FD66)
+                        };
+                        el.border_1().border_color(border_col)
                     })
-                })
-                .child(
-                    div()
-                        .min_w_0()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_xs()
-                        .font_weight(if is_filtered {
-                            gpui::FontWeight::SEMIBOLD
+                    .hover(|s| {
+                        s.bg(if is_drag_over_vspace {
+                            rgba(0xA78BFA7E)
+                        } else if is_filtered {
+                            rgba(0xA78BFA4F)
                         } else {
-                            gpui::FontWeight::MEDIUM
+                            rgba(0xA78BFA24)
                         })
-                        .text_color(if is_filtered {
-                            rgba(0xFFFFFFFA)
-                        } else if live_count > 0 {
-                            rgba(0xF3E8FFDD)
-                        } else {
-                            rgba(0xE9D5FF88)
-                        })
-                        .child(space.name.clone()),
-                )
-                .when(live_count > 0, |el| {
-                    el.child(
+                    })
+                    .child(
                         div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
                             .text_xs()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(if is_filtered {
-                                rgba(0xE9D5FFE8)
+                            .font_weight(if is_filtered || is_drag_over_vspace || vspace_pulse > 0.1 {
+                                gpui::FontWeight::SEMIBOLD
                             } else {
-                                rgba(0xC4B5FD99)
+                                gpui::FontWeight::MEDIUM
                             })
-                            .child(live_count.to_string()),
+                            .text_color(if is_filtered || is_drag_over_vspace || vspace_pulse > 0.1 {
+                                rgba(0xFFFFFFFA)
+                            } else if live_count > 0 {
+                                rgba(0xF3E8FFDD)
+                            } else {
+                                rgba(0xE9D5FF88)
+                            })
+                            .child(space.name.clone()),
                     )
-                })
+                    .when(live_count > 0, |el| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(if is_filtered || is_drag_over_vspace || vspace_pulse > 0.1 {
+                                    rgba(0xE9D5FFE8)
+                                } else {
+                                    rgba(0xC4B5FD99)
+                                })
+                                .child(live_count.to_string()),
+                        )
+                    })
             };
 
             virtual_space_pills.push(pill);
@@ -5382,25 +6626,44 @@ impl Render for SwitcherView {
                     .bg(rgba(0xA78BFA36)),
             );
         }
+        let is_drag_over_vadd = active_drag_target == Some(DropTarget::CreateNewVirtualSpace);
+        let vadd_bounds_for_pill = vspace_add_pill_bounds_rc.clone();
         virtual_space_pills.push(
             div()
                 .id("vspace-pill-add")
+                .relative()
                 .size(px(24.0))
                 .rounded_full()
                 .cursor_pointer()
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(rgba(0xA78BFA20))
-                .hover(|s| s.bg(rgba(0xA78BFA42)))
-                .drag_over::<DraggedWindow>(|s, _, _, _| {
-                    s.bg(rgba(0xA78BFA78))
-                        .border_1()
-                        .border_color(rgba(0xE9D5FFEE))
+                .bg(if is_drag_over_vadd {
+                    rgba(0xA78BFA7C)
+                } else {
+                    rgba(0xA78BFA20)
                 })
-                .on_drop(cx.listener(|this, dragged: &DraggedWindow, window, cx| {
-                    this.create_virtual_space_with_window(dragged.hwnd, window, cx);
-                }))
+                .when(is_drag_over_vadd, |el| {
+                    el.border_1().border_color(rgba(0xE9D5FFEE))
+                })
+                .hover(|s| {
+                    s.bg(if is_drag_over_vadd {
+                        rgba(0xA78BFA8C)
+                    } else {
+                        rgba(0xA78BFA42)
+                    })
+                })
+                .child(
+                    canvas(
+                        move |bounds, _, _| {
+                            *vadd_bounds_for_pill.borrow_mut() = Some(bounds);
+                        },
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .inset_0()
+                    .size_full(),
+                )
                 .on_click(cx.listener(|this, _, _, cx| {
                     cx.stop_propagation();
                     if this.dismiss_space_popups(true, cx) {
@@ -5412,7 +6675,11 @@ impl Render for SwitcherView {
                     div()
                         .text_sm()
                         .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(rgba(0xF3E8FFEE))
+                        .text_color(if is_drag_over_vadd {
+                            rgb(0xFFFFFF).into()
+                        } else {
+                            rgba(0xF3E8FFEE)
+                        })
                         .child("+"),
                 ),
         );
@@ -5462,14 +6729,113 @@ impl Render for SwitcherView {
                     )
                 });
 
+            let show_preview_box = desktop_id.is_some() && preview_did == desktop_id;
+            let group_bounds_for_section = group_bounds_rc.clone();
+
             let mut section = div()
+                .relative()
                 .w_full()
                 .flex()
                 .flex_col()
                 .when(g_idx > 0, |el| el.mt(px(GROUP_TOP_GAP)))
+                .when_some(desktop_id, |el, did| {
+                    el.child(
+                        canvas(
+                            move |bounds, _, _| {
+                                group_bounds_for_section.borrow_mut().insert(did, bounds);
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0()
+                        .size_full(),
+                    )
+                })
                 .child(header);
 
-            if group.cards.is_empty() && group_vspace_id.is_none() {
+            let build_preview_box = |preview_bounds_slot: Rc<RefCell<Option<Bounds<Pixels>>>>,
+                                     drag_icon: Option<Arc<RenderImage>>| {
+                let mut box_el = div()
+                    .w(px(tile_outer_w))
+                    .flex_shrink_0()
+                    .h(px(item_total_h))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w(px(tile_outer_w))
+                            .h(px(preview_h + TOTAL_RING_PAD * 2.0))
+                            .rounded(px(12.0))
+                            .border(px(OUTER_GLOW_PAD))
+                            .border_color(rgba(0x0A84FF28))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .w(px(preview_w + (MID_GLOW_PAD + INNER_RING_PAD) * 2.0))
+                                    .h(px(preview_h + (MID_GLOW_PAD + INNER_RING_PAD) * 2.0))
+                                    .rounded(px(9.0))
+                                    .border(px(MID_GLOW_PAD))
+                                    .border_color(rgba(0x0A84FF4D))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        div()
+                                            .relative()
+                                            .w(px(preview_w + INNER_RING_PAD * 2.0))
+                                            .h(px(preview_h + INNER_RING_PAD * 2.0))
+                                            .rounded(px(6.0))
+                                            .border(px(INNER_RING_PAD))
+                                            .border_color(rgba(0x64D2FFCC))
+                                            .bg(rgba(0x0A84FF1C))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(
+                                                div()
+                                                    .relative()
+                                                    .w(px(preview_w))
+                                                    .h(px(preview_h))
+                                                    .rounded(px(4.0))
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_center()
+                                                    .when_some(drag_icon, |inner, r_img| {
+                                                        inner.child(
+                                                            div().opacity(0.55).child(
+                                                                img(r_img)
+                                                                    .size(px(34.0))
+                                                                    .rounded(px(8.0)),
+                                                            ),
+                                                        )
+                                                    })
+                                                    .child(
+                                                        canvas(
+                                                            move |bounds, _, _| {
+                                                                *preview_bounds_slot.borrow_mut() =
+                                                                    Some(bounds);
+                                                            },
+                                                            |_, _, _, _| {},
+                                                        )
+                                                        .absolute()
+                                                        .inset_0()
+                                                        .size_full(),
+                                                    ),
+                                            ),
+                                    ),
+                            ),
+                    );
+                if label_pos == LabelPosition::Below {
+                    box_el = box_el.child(div().mt(px(BELOW_LABEL_GAP)).h(px(BELOW_LABEL_H)));
+                }
+                box_el
+            };
+
+            if group.cards.is_empty() && !show_preview_box && group_vspace_id.is_none() {
                 section = section.child(
                     div()
                         .id(("empty-space", g_idx))
@@ -5538,7 +6904,7 @@ impl Render for SwitcherView {
                                 .justify_center()
                                 .on_click(cx.listener(move |this, _, window, cx| {
                                     cx.stop_propagation();
-                                    if this.exit_anim.is_some() || cx.has_active_drag() {
+                                    if this.exit_anim.is_some() || this.active_drag.is_some() {
                                         return;
                                     }
                                     if this.dismiss_space_popups(true, cx) {
@@ -5550,14 +6916,22 @@ impl Render for SwitcherView {
                         )
                 });
 
+                let mut last_row_len = cols;
                 for (chunk_idx, row_chunk) in group.cards.chunks(cols).enumerate() {
+                    let is_last_chunk = chunk_idx + 1 == total_chunks;
+                    last_row_len = row_chunk.len();
                     let mut row_el = div().flex().flex_row().gap(px(COL_GAP)).w_full();
 
                     for card in row_chunk {
                         let card_flat_index = card.flat_index;
                         let is_selected = card_flat_index == selected_flat;
-                        let is_hovered = hovered_flat == Some(card_flat_index);
+                        let is_hovered =
+                            hovered_flat == Some(card_flat_index) && active_drag_hwnd.is_none();
                         let target_hwnd = card.info.hwnd;
+                        let is_being_dragged = active_drag_hwnd == Some(target_hwnd);
+                        let is_genie_target = genie_hwnd == Some(target_hwnd);
+                        let is_genie_hiding_slot = is_genie_target && genie_hides_slot;
+                        let is_genie_dest_slot = is_genie_target && genie_is_transfer;
 
                         let has_live_surface = thumbs_rc.borrow().source_size(target_hwnd).is_some();
 
@@ -5627,7 +7001,9 @@ impl Render for SwitcherView {
                                 fade_u8,
                             }) => (slide_dx, 0.0, fade, fade_u8, false),
                             None => {
-                                if let Some(ref ta) = self.tab_anim {
+                                if is_being_dragged || is_genie_hiding_slot {
+                                    (0.0, 0.0, 1.0, 0u8, true)
+                                } else if let Some(ref ta) = self.tab_anim {
                                     if let Some(&from_b) = ta.shared_from_bounds.get(&target_hwnd) {
                                         if let Some(nat) = card_layouts
                                             .as_ref()
@@ -5654,6 +7030,30 @@ impl Render for SwitcherView {
                                     } else {
                                         (0.0, 0.0, 1.0, 255u8, false)
                                     }
+                                } else if let Some(ref ra) = self.reflow_anim {
+                                    if let Some(&from_b) = ra.from_bounds.get(&target_hwnd) {
+                                        if let Some(nat) = card_layouts
+                                            .as_ref()
+                                            .and_then(|m| m.get(&card_flat_index))
+                                        {
+                                            let cur = lerp_bounds(
+                                                from_b,
+                                                nat.thumb_window_bounds,
+                                                reflow_eased,
+                                            );
+                                            let dx = f32::from(
+                                                cur.origin.x - nat.thumb_window_bounds.origin.x,
+                                            );
+                                            let dy = f32::from(
+                                                cur.origin.y - nat.thumb_window_bounds.origin.y,
+                                            );
+                                            (dx, dy, 1.0, 255u8, false)
+                                        } else {
+                                            (0.0, 0.0, 1.0, 255u8, false)
+                                        }
+                                    } else {
+                                        (0.0, 0.0, 1.0, 255u8, false)
+                                    }
                                 } else {
                                     (0.0, 0.0, 1.0, 255u8, false)
                                 }
@@ -5663,6 +7063,10 @@ impl Render for SwitcherView {
                         let thumbs_for_card = thumbs_rc.clone();
                         let clip_for_card = viewport_clip_rc.clone();
                         let last_bounds_for_card = last_thumb_bounds_rc.clone();
+                        let card_source_desktop = card.info.desktop_id;
+                        let card_is_pinned = card.info.is_pinned;
+                        let card_icon_for_press = card.icon.clone();
+                        let card_accent = card.accent_color;
 
                         let icon_px = if label_pos == LabelPosition::Center {
                             18.0
@@ -5752,8 +7156,30 @@ impl Render for SwitcherView {
 
                         // Multi-ring transparent-interior Apple blue outer glow + soft ambient depth
                         // When Scene B floating focus ring is active, suppress static blue ring on selected card.
-                        let show_static_selected_ring = is_selected && floating_focus_rect.is_none();
-                        let (outer_glow, mid_glow, inner_ring) = if show_static_selected_ring {
+                        let show_static_selected_ring = is_selected
+                            && floating_focus_rect.is_none()
+                            && !is_being_dragged
+                            && !is_genie_hiding_slot;
+                        let genie_slot_glow = if is_genie_dest_slot {
+                            match genie_suck_out_t {
+                                Some(st) => (1.0 - ease_out_cubic(st)).clamp(0.0, 1.0),
+                                None => 0.85,
+                            }
+                        } else {
+                            0.0
+                        };
+                        let (outer_glow, mid_glow, inner_ring) = if is_genie_dest_slot && genie_slot_glow > 0.02 {
+                            let a_outer = (genie_slot_glow * 40.0).round() as u32;
+                            let a_mid = (genie_slot_glow * 76.0).round() as u32;
+                            let a_inner = (genie_slot_glow * 195.0).round() as u32;
+                            (
+                                rgba(0x0A84FF00 | a_outer),
+                                rgba(0x0A84FF00 | a_mid),
+                                rgba(0x64D2FF00 | a_inner),
+                            )
+                        } else if is_being_dragged || is_genie_hiding_slot {
+                            (rgba(0x00000000), rgba(0xFFFFFF10), rgba(0xFFFFFF2A))
+                        } else if show_static_selected_ring {
                             (rgba(0x0A84FF24), rgba(0x0A84FF5A), rgb(0x0A84FF).into())
                         } else if is_hovered {
                             (rgba(0xFFFFFF18), rgba(0xFFFFFF36), rgba(0xFFFFFF8C))
@@ -5763,20 +7189,28 @@ impl Render for SwitcherView {
                             (rgba(0x00000014), rgba(0x00000028), rgba(0x00000000))
                         };
 
+                        let hide_live_content = is_being_dragged || is_genie_hiding_slot;
+                        let thumb_bg = if is_genie_dest_slot && genie_slot_glow > 0.02 {
+                            let a = (genie_slot_glow * 26.0).round() as u32;
+                            rgba(0x0A84FF00 | a)
+                        } else if is_being_dragged || is_genie_hiding_slot {
+                            rgba(0xFFFFFF0A)
+                        } else if has_live_surface {
+                            rgba(0x00000000)
+                        } else {
+                            rgba(0xFFFFFF16)
+                        };
+
                         let thumb_pane = div()
                             .relative()
                             .w(px(preview_w))
                             .h(px(preview_h))
                             .rounded(px(4.0))
-                            .bg(if has_live_surface {
-                                rgba(0x00000000)
-                            } else {
-                                rgba(0xFFFFFF16)
-                            })
+                            .bg(thumb_bg)
                             .flex()
                             .items_center()
                             .justify_center()
-                            .when(!has_live_surface, |el| {
+                            .when(!has_live_surface && !hide_live_content, |el| {
                                 el.child(
                                     div()
                                         .flex()
@@ -5813,6 +7247,11 @@ impl Render for SwitcherView {
                                                 .insert(target_hwnd, bounds);
                                         }
                                         if skip_normal_thumb_update {
+                                            if hide_live_content {
+                                                thumbs_for_card
+                                                    .borrow_mut()
+                                                    .hide_thumbnail(target_hwnd);
+                                            }
                                             return;
                                         }
                                         let sf = window.scale_factor();
@@ -5832,41 +7271,47 @@ impl Render for SwitcherView {
                                 .size_full(),
                             );
 
-                        let (thumb_pane, below_label) = match label_pos {
-                            LabelPosition::BottomRight => (
-                                thumb_pane.child(
-                                    div()
-                                        .absolute()
-                                        .bottom(px(8.0))
-                                        .right(px(8.0))
-                                        .child(label_pill),
+                        let (thumb_pane, below_label) = if hide_live_content {
+                            let spacer = (label_pos == LabelPosition::Below)
+                                .then(|| div().h(px(BELOW_LABEL_H)));
+                            (thumb_pane, spacer)
+                        } else {
+                            match label_pos {
+                                LabelPosition::BottomRight => (
+                                    thumb_pane.child(
+                                        div()
+                                            .absolute()
+                                            .bottom(px(8.0))
+                                            .right(px(8.0))
+                                            .child(label_pill),
+                                    ),
+                                    None,
                                 ),
-                                None,
-                            ),
-                            LabelPosition::BottomLeft => (
-                                thumb_pane.child(
-                                    div()
-                                        .absolute()
-                                        .bottom(px(8.0))
-                                        .left(px(8.0))
-                                        .child(label_pill),
+                                LabelPosition::BottomLeft => (
+                                    thumb_pane.child(
+                                        div()
+                                            .absolute()
+                                            .bottom(px(8.0))
+                                            .left(px(8.0))
+                                            .child(label_pill),
+                                    ),
+                                    None,
                                 ),
-                                None,
-                            ),
-                            LabelPosition::Center => (
-                                thumb_pane.child(
-                                    div()
-                                        .absolute()
-                                        .inset_0()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .px_2()
-                                        .child(label_pill),
+                                LabelPosition::Center => (
+                                    thumb_pane.child(
+                                        div()
+                                            .absolute()
+                                            .inset_0()
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .px_2()
+                                            .child(label_pill),
+                                    ),
+                                    None,
                                 ),
-                                None,
-                            ),
-                            LabelPosition::Below => (thumb_pane, Some(label_pill)),
+                                LabelPosition::Below => (thumb_pane, Some(label_pill)),
+                            }
                         };
 
                         // Inside a soft virtual space, show a quiet hover-only top-right `×` to remove from this space (never closes the real window).
@@ -5921,18 +7366,6 @@ impl Render for SwitcherView {
                             thumb_pane
                         };
 
-                        let drag_payload = DraggedWindow {
-                            hwnd: target_hwnd,
-                            title: SharedString::from(if card.info.title.trim().is_empty() {
-                                card.info.process_name.clone()
-                            } else {
-                                card.info.title.clone()
-                            }),
-                            icon: card.icon.clone(),
-                            monogram: card.monogram.clone(),
-                            accent_color: card.accent_color,
-                        };
-
                         let mut item_el = div()
                             .id(("mission-item", card_flat_index))
                             .when(card_dx != 0.0 || card_dy != 0.0, |el| {
@@ -5947,16 +7380,8 @@ impl Render for SwitcherView {
                             .items_center()
                             .justify_center()
                             .cursor_pointer()
-                            .when(!is_exiting, |el| {
-                                el.on_drag(drag_payload, |dragged, cursor_offset, _, cx| {
-                                    cx.new(|_| DraggedWindowGhost {
-                                        data: dragged.clone(),
-                                        cursor_offset,
-                                    })
-                                })
-                            })
                             .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
-                                if this.exit_anim.is_some() {
+                                if this.exit_anim.is_some() || this.active_drag.is_some() {
                                     return;
                                 }
                                 if *hovered {
@@ -5967,10 +7392,29 @@ impl Render for SwitcherView {
                                 cx.notify();
                             }))
                             .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.begin_card_press(
+                                        card_flat_index,
+                                        target_hwnd,
+                                        card_source_desktop,
+                                        card_is_pinned,
+                                        card_icon_for_press.clone(),
+                                        card_accent,
+                                        event.position,
+                                        cx,
+                                    );
+                                }),
+                            )
+                            .on_mouse_down(
                                 MouseButton::Right,
                                 cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                                     cx.stop_propagation();
-                                    if this.exit_anim.is_some() {
+                                    if this.exit_anim.is_some()
+                                        || this.active_drag.is_some()
+                                        || this.add_picker.is_some()
+                                    {
                                         return;
                                     }
                                     this.disarm_hold_mode();
@@ -5985,17 +7429,6 @@ impl Render for SwitcherView {
                                     cx.notify();
                                 }),
                             )
-                            .on_click(cx.listener(move |this, _, window, cx| {
-                                cx.stop_propagation();
-                                if this.exit_anim.is_some() || cx.has_active_drag() {
-                                    return;
-                                }
-                                if this.dismiss_space_popups(true, cx) {
-                                    return;
-                                }
-                                this.selected_flat = card_flat_index;
-                                this.activate_window(target_hwnd, window, cx);
-                            }))
                             .child(
                                 div()
                                     .w(px(tile_outer_w))
@@ -6041,9 +7474,14 @@ impl Render for SwitcherView {
                         row_el = row_el.child(item_el);
                     }
 
-                    if chunk_idx + 1 == total_chunks && row_chunk.len() < cols {
+                    if is_last_chunk && last_row_len < cols {
                         if let Some(tile) = add_tile.take() {
                             row_el = row_el.child(tile);
+                        } else if show_preview_box {
+                            row_el = row_el.child(build_preview_box(
+                                preview_box_bounds_rc.clone(),
+                                active_drag_icon.clone(),
+                            ));
                         }
                     }
 
@@ -6059,6 +7497,19 @@ impl Render for SwitcherView {
                             .w_full()
                             .child(tile),
                     );
+                }
+
+                if show_preview_box && (group.cards.is_empty() || last_row_len >= cols) {
+                    let preview_row = div()
+                        .flex()
+                        .flex_row()
+                        .gap(px(COL_GAP))
+                        .w_full()
+                        .child(build_preview_box(
+                            preview_box_bounds_rc.clone(),
+                            active_drag_icon.clone(),
+                        ));
+                    rows_col = rows_col.child(preview_row);
                 }
 
                 section = section.child(rows_col);
@@ -6087,12 +7538,122 @@ impl Render for SwitcherView {
                 })
             });
 
+        // Precompute floating drag overlay & pixel-level Genie funnel overlay payloads before building root.
+        let drag_overlay_payload: Option<(RectF, Arc<RenderImage>, Option<DropTarget>)> =
+            self.active_drag
+                .as_ref()
+                .map(|d| (d.floating_rect(), d.full_image.clone(), d.target));
+
+        enum GenieOverlayPayload {
+            Strips {
+                card: RectF,
+                mouth: FunnelMouth,
+                direction: GenieDirection,
+                raw_t: f32,
+                strip_image: Arc<RenderImage>,
+                num_strips: usize,
+                opacity: f32,
+                portal_glow: f32,
+                is_virtual_space: bool,
+            },
+            CancelReturn {
+                rect: RectF,
+                full_image: Arc<RenderImage>,
+            },
+        }
+
+        let genie_overlay_payload: Option<GenieOverlayPayload> =
+            self.genie_anim.as_ref().and_then(|anim| {
+                let raw_t = anim.phase_progress(now);
+                match anim.phase {
+                    GeniePhase::SuckIn {
+                        from_rect, mouth, ..
+                    } => {
+                        let strip_image = anim.strip_image.clone()?;
+                        let sf = window.scale_factor().max(1.0);
+                        let preview_sample = sample_genie_strips(
+                            from_rect,
+                            mouth,
+                            GenieDirection::SuckIn,
+                            raw_t,
+                            anim.num_strips,
+                            sf,
+                        );
+                        Some(GenieOverlayPayload::Strips {
+                            card: from_rect,
+                            mouth,
+                            direction: GenieDirection::SuckIn,
+                            raw_t,
+                            strip_image,
+                            num_strips: anim.num_strips,
+                            opacity: preview_sample.opacity,
+                            portal_glow: preview_sample.portal_glow,
+                            is_virtual_space: anim.is_virtual_space_transfer,
+                        })
+                    }
+                    GeniePhase::SuckOut { mouth, to_rect, .. } => {
+                        let strip_image = anim.strip_image.clone()?;
+                        // Track live card slot during smooth scroll so Genie lands 100% pixel-aligned.
+                        let live_to_rect = self
+                            .resolve_card_thumb_bounds(anim.hwnd, scroll_y)
+                            .map(RectF::from_bounds)
+                            .unwrap_or(to_rect);
+                        let live_mouth = if anim.suck_out_from_pill {
+                            mouth
+                        } else {
+                            let half_w = (live_to_rect.width() * 0.065).clamp(14.0, 24.0);
+                            let use_bottom = (mouth.y - live_to_rect.bottom).abs()
+                                < (mouth.y - live_to_rect.top).abs();
+                            FunnelMouth {
+                                left: live_to_rect.center_x() - half_w,
+                                right: live_to_rect.center_x() + half_w,
+                                y: if use_bottom {
+                                    live_to_rect.bottom
+                                } else {
+                                    live_to_rect.top
+                                },
+                            }
+                        };
+                        let sf = window.scale_factor().max(1.0);
+                        let preview_sample = sample_genie_strips(
+                            live_to_rect,
+                            live_mouth,
+                            GenieDirection::SuckOut,
+                            raw_t,
+                            anim.num_strips,
+                            sf,
+                        );
+                        Some(GenieOverlayPayload::Strips {
+                            card: live_to_rect,
+                            mouth: live_mouth,
+                            direction: GenieDirection::SuckOut,
+                            raw_t,
+                            strip_image,
+                            num_strips: anim.num_strips,
+                            opacity: preview_sample.opacity,
+                            portal_glow: preview_sample.portal_glow,
+                            is_virtual_space: anim.is_virtual_space_transfer,
+                        })
+                    }
+                    GeniePhase::CancelReturn { .. } => {
+                        let rect = anim.sample_cancel_return_rect(now)?;
+                        Some(GenieOverlayPayload::CancelReturn {
+                            rect,
+                            full_image: anim.full_image.clone(),
+                        })
+                    }
+                }
+            });
+
         let root = div()
             .id("windeck-mission-control")
             .relative()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .capture_any_mouse_up(cx.listener(Self::on_capture_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up_out_left))
             .size_full()
             .flex()
             .flex_col()
@@ -6119,7 +7680,7 @@ impl Render for SwitcherView {
                 }),
             )
             .on_click(cx.listener(|this, _, _, cx| {
-                if cx.has_active_drag() || this.exit_anim.is_some() {
+                if this.active_drag.is_some() || this.exit_anim.is_some() {
                     return;
                 }
                 if this.dismiss_space_popups(true, cx) {
@@ -6414,14 +7975,20 @@ impl Render for SwitcherView {
                             )
                         },
                     )
-                    // Post-paint DWM choreographer for Scene A leaving live thumbnails & Scene C zoom/fade targets
+                    // Post-paint DWM choreographer for Scene A leaving live thumbnails, Scene C zoom/fade, & GPU atlas cleanup
                     .child({
                         let thumbs_post = thumbs_rc.clone();
                         let clip_post = self.viewport_clip.clone();
+                        let drop_imgs_post = drop_images_rc.clone();
                         let leaving_u8 = (tab_leave_opacity * 255.0).round() as u8;
                         canvas(
                             |_, _, _| {},
                             move |_, _, window, _| {
+                                let to_drop: Vec<Arc<RenderImage>> =
+                                    drop_imgs_post.borrow_mut().drain(..).collect();
+                                for img in to_drop {
+                                    let _ = window.drop_image(img);
+                                }
                                 if !is_visible {
                                     return;
                                 }
@@ -6667,6 +8234,144 @@ impl Render for SwitcherView {
 
                 el.child(menu_box)
             })
+            // === FLOATING DRAGGED CARD OVERLAY (above cards, headers & top Spaces bar) ===
+            .when_some(drag_overlay_payload, |el, (rect, full_img, target)| {
+                let over_vspace = target.is_some_and(DropTarget::is_virtual_space);
+                let over_native = target.is_some() && !over_vspace;
+                el.child(
+                    div()
+                        .absolute()
+                        .left(px(rect.left - 3.0))
+                        .top(px(rect.top - 3.0))
+                        .w(px(rect.width() + 6.0))
+                        .h(px(rect.height() + 6.0))
+                        .rounded(px(9.0))
+                        .border(px(3.0))
+                        .border_color(if over_vspace {
+                            rgba(0xA78BFA70)
+                        } else if over_native {
+                            rgba(0x0A84FF66)
+                        } else {
+                            rgba(0x00000044)
+                        })
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .w(px(rect.width()))
+                                .h(px(rect.height()))
+                                .rounded(px(6.0))
+                                .overflow_hidden()
+                                .border_1()
+                                .border_color(if over_vspace {
+                                    rgba(0xE9D5FFEE)
+                                } else if over_native {
+                                    rgba(0x64D2FFEE)
+                                } else {
+                                    rgba(0xFFFFFF78)
+                                })
+                                .opacity(0.94)
+                                .child(
+                                    img(full_img)
+                                        .w(px(rect.width()))
+                                        .h(px(rect.height()))
+                                        .rounded(px(5.0)),
+                                ),
+                        ),
+                )
+            })
+            // === PIXEL-LEVEL GENIE FUNNEL OVERLAY (Suck-In / Suck-Out / Cancel Return) ===
+            .when_some(genie_overlay_payload, |el, payload| match payload {
+                GenieOverlayPayload::CancelReturn { rect, full_image } => el.child(
+                    div()
+                        .absolute()
+                        .left(px(rect.left))
+                        .top(px(rect.top))
+                        .w(px(rect.width()))
+                        .h(px(rect.height()))
+                        .rounded(px(5.0))
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(rgba(0xFFFFFF44))
+                        .child(
+                            img(full_image)
+                                .w(px(rect.width()))
+                                .h(px(rect.height()))
+                                .rounded(px(4.0)),
+                        ),
+                ),
+                GenieOverlayPayload::Strips {
+                    card,
+                    mouth,
+                    direction,
+                    raw_t,
+                    strip_image,
+                    num_strips,
+                    opacity,
+                    portal_glow,
+                    is_virtual_space,
+                } => {
+                    let glow_w = mouth.width() + 26.0;
+                    let glow_x = mouth.center_x() - glow_w * 0.5;
+                    let glow_y = mouth.y - 4.0;
+                    let core_a = (portal_glow * 235.0).round().clamp(0.0, 255.0) as u32;
+                    let halo_a = (portal_glow * 120.0).round().clamp(0.0, 255.0) as u32;
+                    let halo_rgb = if is_virtual_space { 0xA78BFA00 } else { 0x0A84FF00 };
+                    let core_rgb = if is_virtual_space { 0xE9D5FF00 } else { 0x64D2FF00 };
+                    el.child(
+                        div()
+                            .absolute()
+                            .inset_0()
+                            .opacity(opacity)
+                            .child(
+                                canvas(
+                                    |_, _, _| {},
+                                    move |_, _, window, _| {
+                                        let sf = window.scale_factor();
+                                        let sample = sample_genie_strips(
+                                            card, mouth, direction, raw_t, num_strips, sf,
+                                        );
+                                        for strip in &sample.strips {
+                                            let _ = window.paint_image(
+                                                strip.bounds,
+                                                Corners::default(),
+                                                strip_image.clone(),
+                                                strip.strip_index,
+                                                false,
+                                            );
+                                        }
+                                    },
+                                )
+                                .absolute()
+                                .inset_0()
+                                .size_full(),
+                            ),
+                    )
+                    .when(portal_glow > 0.02, |inner| {
+                        inner.child(
+                            div()
+                                .absolute()
+                                .left(px(glow_x - 8.0))
+                                .top(px(glow_y - 3.0))
+                                .w(px(glow_w + 16.0))
+                                .h(px(14.0))
+                                .rounded_full()
+                                .bg(rgba(halo_rgb | halo_a))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    div()
+                                        .w(px(glow_w))
+                                        .h(px(5.0))
+                                        .rounded_full()
+                                        .bg(rgba(core_rgb | core_a)),
+                                ),
+                        )
+                    })
+                }
+            })
         };
 
         root
@@ -6803,5 +8508,49 @@ mod tests {
         assert_eq!(picker.resolve_commit_hwnds(&all, &all), all);
         picker.select_all_visible(&all);
         assert!(picker.selected.is_empty());
+    }
+
+    #[test]
+    fn drag_floating_rect_stays_below_top_spaces_bar_and_hit_padding_works() {
+        let bmp = synthesize_fallback_card_bitmap(380, 226, 0x0A84FF);
+        assert!(bitmap_has_visible_pixels(&bmp));
+
+        let blank = CapturedBitmap {
+            width: 32,
+            height: 32,
+            bgra: vec![0u8; 32 * 32 * 4],
+        };
+        assert!(!bitmap_has_visible_pixels(&blank));
+
+        let full_img = bitmap_to_full_render_image(&bmp).expect("full image");
+        let drag = ActiveDrag {
+            hwnd: 123,
+            source_desktop_id: None,
+            is_pinned: false,
+            was_current_tab: true,
+            origin_bounds: Bounds {
+                origin: point(px(200.0), px(300.0)),
+                size: size(px(380.0), px(226.0)),
+            },
+            grab_offset: point(px(190.0), px(113.0)),
+            cursor_pos: point(px(400.0), px(28.0)), // directly over top pill bar!
+            target: None,
+            icon: None,
+            captured: bmp,
+            full_image: full_img,
+        };
+        let rect = drag.floating_rect();
+        assert!(
+            rect.top >= TOP_SPACES_BAR_H,
+            "floating card top ({}) must stay below top Spaces bar ({TOP_SPACES_BAR_H})",
+            rect.top
+        );
+
+        let pill = Bounds {
+            origin: point(px(500.0), px(22.0)),
+            size: size(px(64.0), px(24.0)),
+        };
+        assert!(bounds_contains_padded(pill, point(px(532.0), px(14.0)), 4.0, 14.0));
+        assert!(!bounds_contains_padded(pill, point(px(532.0), px(80.0)), 4.0, 14.0));
     }
 }
