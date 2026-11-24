@@ -22,13 +22,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GW_HWNDNEXT, GWL_EXSTYLE, GWL_STYLE,
     GetClientRect, GetCursorPos, GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
-    HWND_TOPMOST, IsIconic, IsWindowVisible, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE,
-    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, WNDCLASSW, WS_BORDER,
-    WS_CAPTION, WS_DLGFRAME, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_NOACTIVATE,
-    WS_EX_NOREDIRECTIONBITMAP, WS_EX_STATICEDGE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
-    WS_EX_TRANSPARENT, WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
-    WS_THICKFRAME,
+    HWND_NOTOPMOST, HWND_TOPMOST, IsIconic, IsWindowVisible, RegisterClassW, SET_WINDOW_POS_FLAGS,
+    SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
+    WNDCLASSW, WS_BORDER, WS_CAPTION, WS_DLGFRAME, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME,
+    WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_STATICEDGE, WS_EX_TOOLWINDOW,
+    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
+    WS_SYSMENU, WS_THICKFRAME,
 };
 use windows_core::{BOOL, PCSTR, w};
 
@@ -492,6 +492,35 @@ unsafe fn ensure_shown_noactivate(hwnd: HWND) {
     }
 }
 
+unsafe fn promote_topmost(
+    hwnd: HWND,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    flags: SET_WINDOW_POS_FLAGS,
+) {
+    unsafe {
+        let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, flags);
+        if (GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0) == 0 {
+            // Win32 quirk: SetWindowPos(..., HWND_TOPMOST) can return TRUE without granting
+            // WS_EX_TOPMOST when a window sits behind another popup or has stale band linkage.
+            // Bouncing through HWND_NOTOPMOST forces win32k to re-link the window at the top
+            // of the non-topmost band so the immediate HWND_TOPMOST promotion succeeds reliably.
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_NOTOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            let _ = SetWindowPos(hwnd, Some(HWND_TOPMOST), x, y, w, h, flags);
+        }
+    }
+}
+
 /// Enforces strict two-layer Z-order lockstep: `gpui_hwnd` topmost at `rect`,
 /// and `thumb_host_hwnd` topmost, visible, and positioned directly beneath `gpui_hwnd`.
 pub fn pin_layered_z_order(gpui_hwnd: HWND, thumb_host_hwnd: HWND, rect: RECT) {
@@ -506,26 +535,18 @@ pub fn pin_layered_z_order(gpui_hwnd: HWND, thumb_host_hwnd: HWND, rect: RECT) {
         if !IsWindowVisible(gpui_hwnd).as_bool() || IsIconic(gpui_hwnd).as_bool() {
             ensure_shown_noactivate(gpui_hwnd);
         }
-        // Promote thumb_host_hwnd into HWND_TOPMOST explicitly first: in Win32,
-        // SetWindowPos(non_topmost, Some(topmost), ...) does NOT grant WS_EX_TOPMOST.
-        let _ = SetWindowPos(
+        // Promote both layers into HWND_TOPMOST explicitly first: in Win32,
+        // SetWindowPos(non_topmost, Some(topmost), ...) does NOT grant WS_EX_TOPMOST,
+        // and placing a topmost host behind a non-topmost GPUI window would strip WS_EX_TOPMOST.
+        promote_topmost(
             thumb_host_hwnd,
-            Some(HWND_TOPMOST),
             x,
             y,
             w,
             h,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
-        let _ = SetWindowPos(
-            gpui_hwnd,
-            Some(HWND_TOPMOST),
-            x,
-            y,
-            w,
-            h,
-            SWP_NOACTIVATE | SWP_SHOWWINDOW,
-        );
+        promote_topmost(gpui_hwnd, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
         let _ = SetWindowPos(
             thumb_host_hwnd,
             Some(gpui_hwnd),
@@ -558,9 +579,8 @@ pub fn show_and_focus_layered_overlay(
     unsafe {
         // 1. Reveal & size bottom thumbnail/backdrop host without stealing focus
         ensure_shown_noactivate(thumb_host_hwnd);
-        let _ = SetWindowPos(
+        promote_topmost(
             thumb_host_hwnd,
-            Some(HWND_TOPMOST),
             x,
             y,
             win_w,
@@ -570,9 +590,8 @@ pub fn show_and_focus_layered_overlay(
 
         // 2. Reveal & size interactive GPUI overlay directly on top without premature activation
         ensure_shown_noactivate(gpui_hwnd);
-        let _ = SetWindowPos(
+        promote_topmost(
             gpui_hwnd,
-            Some(HWND_TOPMOST),
             x,
             y,
             win_w,
@@ -676,7 +695,7 @@ mod tests {
 
     #[test]
     fn layered_overlay_show_and_hide_maintains_visibility_size_and_z_order() {
-        let _guard = OVERLAY_TEST_LOCK.lock().unwrap();
+        let _guard = OVERLAY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let gpui_win = TestHwnd::create_hidden_popup(800, 600);
         configure_borderless_immersive(gpui_win.0, true);
         let thumb_host = ThumbnailHostWindow::create(true).expect("ThumbnailHostWindow::create");
@@ -718,7 +737,7 @@ mod tests {
 
     #[test]
     fn pin_layered_z_order_recovers_from_intervening_window_and_hidden_host() {
-        let _guard = OVERLAY_TEST_LOCK.lock().unwrap();
+        let _guard = OVERLAY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let gpui_win = TestHwnd::create_hidden_popup(800, 600);
         configure_borderless_immersive(gpui_win.0, false);
         let thumb_host = ThumbnailHostWindow::create(false).expect("ThumbnailHostWindow::create");
@@ -733,6 +752,11 @@ mod tests {
             false,
         )
         .expect("show_and_focus_layered_overlay");
+        let after_show = inspect_layered_overlay_state(gpui_win.0, thumb_host.hwnd());
+        assert!(
+            after_show.is_healthy(),
+            "show_and_focus_layered_overlay must promote both layers to topmost even with a sibling popup: {after_show:?}"
+        );
 
         // Deliberately push thumb_host to bottom and wedge a visible window directly beneath gpui_win.
         unsafe {
@@ -779,7 +803,7 @@ mod tests {
         assert!(!broken_vis.is_healthy());
 
         pin_layered_z_order(gpui_win.0, thumb_host.hwnd(), rect);
-        thumb_host.force_reconfigure(true, BackdropStyle::Blurred, 0.25);
+        thumb_host.force_reconfigure(false, BackdropStyle::Blurred, 0.25);
         let recovered_vis = inspect_layered_overlay_state(gpui_win.0, thumb_host.hwnd());
         assert!(
             recovered_vis.host_visible
