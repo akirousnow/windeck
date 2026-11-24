@@ -10,7 +10,7 @@ use windows::Win32::Graphics::Dwm::{
 };
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFOEXW,
-    MonitorFromWindow,
+    MonitorFromRect, MonitorFromWindow,
 };
 use windows::Win32::Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation};
 use windows::Win32::System::Threading::{
@@ -21,7 +21,7 @@ use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GA_ROOTOWNER, GWL_EXSTYLE, GetAncestor, GetClassNameW, GetLastActivePopup,
     GetWindowLongW, GetWindowPlacement, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsIconic, IsWindowVisible, IsZoomed, SW_SHOWMAXIMIZED,
+    GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, IsZoomed, SW_SHOWMAXIMIZED,
     WINDOWPLACEMENT, WPF_RESTORETOMAXIMIZED, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 use windows_core::{BOOL, PWSTR};
@@ -178,6 +178,95 @@ fn get_extended_frame_bounds(hwnd: HWND) -> Option<RECT> {
     } else {
         None
     }
+}
+
+struct WindowGeometryFields {
+    is_minimized: bool,
+    is_maximized: bool,
+    restore_to_maximized: bool,
+    monitor_index: Option<usize>,
+    rect: RECT,
+    visible_rect: RECT,
+    normal_rect: RECT,
+}
+
+fn query_window_geometry_fields(hwnd: HWND, monitors: &[MonitorInfo]) -> WindowGeometryFields {
+    let is_iconic = unsafe { IsIconic(hwnd) }.as_bool();
+    let mut rect = RECT::default();
+    let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
+
+    let mut placement = WINDOWPLACEMENT {
+        length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+    let has_placement = unsafe { GetWindowPlacement(hwnd, &mut placement) }.is_ok();
+    let is_maximized = unsafe { IsZoomed(hwnd) }.as_bool()
+        || (has_placement && placement.showCmd == SW_SHOWMAXIMIZED.0 as u32);
+    let restore_to_maximized =
+        has_placement && (placement.flags.0 & WPF_RESTORETOMAXIMIZED.0) != 0;
+
+    // For minimized windows, GetWindowRect is iconic (-32000, -32000), so MonitorFromWindow
+    // would bias toward the top-left-most monitor. Resolve monitor from rcNormalPosition instead.
+    let hmon = if is_iconic
+        && has_placement
+        && placement.rcNormalPosition.right > placement.rcNormalPosition.left
+        && placement.rcNormalPosition.bottom > placement.rcNormalPosition.top
+    {
+        unsafe { MonitorFromRect(&placement.rcNormalPosition, MONITOR_DEFAULTTONEAREST) }
+    } else {
+        unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) }
+    };
+    let monitor_index = monitors.iter().position(|m| m.handle == hmon.0 as isize);
+
+    let visible_rect = if !is_iconic {
+        get_extended_frame_bounds(hwnd).unwrap_or(rect)
+    } else {
+        rect
+    };
+
+    let (ws_off_x, ws_off_y) = monitor_index
+        .and_then(|idx| monitors.get(idx))
+        .map(|m| (m.work_area.left - m.bounds.left, m.work_area.top - m.bounds.top))
+        .unwrap_or((0, 0));
+    let normal_rect = if has_placement {
+        RECT {
+            left: placement.rcNormalPosition.left + ws_off_x,
+            top: placement.rcNormalPosition.top + ws_off_y,
+            right: placement.rcNormalPosition.right + ws_off_x,
+            bottom: placement.rcNormalPosition.bottom + ws_off_y,
+        }
+    } else {
+        RECT::default()
+    };
+
+    WindowGeometryFields {
+        is_minimized: is_iconic,
+        is_maximized,
+        restore_to_maximized,
+        monitor_index,
+        rect,
+        visible_rect,
+        normal_rect,
+    }
+}
+
+/// Refreshes a `WindowInfo`'s live Win32/DWM geometry fields (minimized/maximized flags,
+/// monitor index, `rect`, `visible_rect`, and `normal_rect`) in place.
+/// Returns `false` if the HWND is no longer valid.
+pub fn refresh_window_geometry(info: &mut WindowInfo, monitors: &[MonitorInfo]) -> bool {
+    let hwnd = HWND(info.hwnd as *mut c_void);
+    if info.hwnd == 0 || !unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        return false;
+    }
+    let g = query_window_geometry_fields(hwnd, monitors);
+    info.is_minimized = g.is_minimized;
+    info.is_maximized = g.is_maximized;
+    info.restore_to_maximized = g.restore_to_maximized;
+    info.monitor_index = g.monitor_index;
+    info.rect = g.rect;
+    info.visible_rect = g.visible_rect;
+    info.normal_rect = g.normal_rect;
+    true
 }
 
 fn query_process_info(pid: u32) -> (String, String, Option<bool>) {
@@ -353,46 +442,16 @@ pub fn enumerate_windows(
         }
 
         // Check zero-sized non-minimized ghost windows
-        let is_iconic = unsafe { IsIconic(hwnd) }.as_bool();
-        let mut rect = RECT::default();
-        let _ = unsafe { GetWindowRect(hwnd, &mut rect) };
-        let w = rect.right - rect.left;
-        let h = rect.bottom - rect.top;
-        if !is_iconic && (w <= 0 || h <= 0) {
+        let geom = query_window_geometry_fields(hwnd, monitors);
+        let w = geom.rect.right - geom.rect.left;
+        let h = geom.rect.bottom - geom.rect.top;
+        if !geom.is_minimized && (w <= 0 || h <= 0) {
             continue;
         }
 
         let mut pid = 0u32;
         unsafe { GetWindowThreadProcessId(hwnd, Some(&mut pid)) };
         let (process_name, exe_path, is_elevated) = query_process_info(pid);
-
-        let mut placement = WINDOWPLACEMENT {
-            length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
-            ..Default::default()
-        };
-        let _ = unsafe { GetWindowPlacement(hwnd, &mut placement) };
-        let is_maximized = unsafe { IsZoomed(hwnd) }.as_bool()
-            || placement.showCmd == SW_SHOWMAXIMIZED.0 as u32;
-        let restore_to_maximized = (placement.flags.0 & WPF_RESTORETOMAXIMIZED.0) != 0;
-
-        let hmon = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
-        let monitor_index = monitors.iter().position(|m| m.handle == hmon.0 as isize);
-
-        let visible_rect = if !is_iconic {
-            get_extended_frame_bounds(hwnd).unwrap_or(rect)
-        } else {
-            rect
-        };
-        let (ws_off_x, ws_off_y) = monitor_index
-            .and_then(|idx| monitors.get(idx))
-            .map(|m| (m.work_area.left - m.bounds.left, m.work_area.top - m.bounds.top))
-            .unwrap_or((0, 0));
-        let normal_rect = RECT {
-            left: placement.rcNormalPosition.left + ws_off_x,
-            top: placement.rcNormalPosition.top + ws_off_y,
-            right: placement.rcNormalPosition.right + ws_off_x,
-            bottom: placement.rcNormalPosition.bottom + ws_off_y,
-        };
 
         // Determine desktop assignment
         let desktop_id = if lookup.is_pinned {
@@ -419,15 +478,15 @@ pub fn enumerate_windows(
             desktop_id,
             desktop_index,
             is_pinned: lookup.is_pinned,
-            is_minimized: is_iconic,
-            is_maximized,
-            restore_to_maximized,
+            is_minimized: geom.is_minimized,
+            is_maximized: geom.is_maximized,
+            restore_to_maximized: geom.restore_to_maximized,
             is_elevated,
             cloaked_flags: cloaked,
-            monitor_index,
-            rect,
-            visible_rect,
-            normal_rect,
+            monitor_index: geom.monitor_index,
+            rect: geom.rect,
+            visible_rect: geom.visible_rect,
+            normal_rect: geom.normal_rect,
         });
     }
 

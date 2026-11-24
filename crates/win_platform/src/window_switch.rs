@@ -7,6 +7,7 @@ use anyhow::{Result, anyhow};
 use windows::Win32::Foundation::{
     CloseHandle, ERROR_ACCESS_DENIED, GetLastError, HWND, LPARAM, WPARAM,
 };
+use windows::Win32::Graphics::Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute};
 use windows::Win32::System::Threading::{
     GetCurrentProcessId, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
     PROCESS_TERMINATE, QueryFullProcessImageNameW, TerminateProcess,
@@ -18,8 +19,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, GetForegroundWindow, GetWindowPlacement, GetWindowThreadProcessId,
     IsHungAppWindow, IsIconic, IsWindow, IsWindowVisible, IsZoomed, PostMessageW, SW_HIDE,
-    SW_RESTORE, SW_SHOWMAXIMIZED, SetForegroundWindow, ShowWindow, WINDOWPLACEMENT, WM_CLOSE,
-    WPF_RESTORETOMAXIMIZED,
+    SW_RESTORE, SW_SHOWMAXIMIZED, SW_SHOWNOACTIVATE, SetForegroundWindow, ShowWindow,
+    WINDOWPLACEMENT, WM_CLOSE, WPF_RESTORETOMAXIMIZED,
 };
 use windows_core::{BOOL, PWSTR};
 
@@ -52,6 +53,140 @@ pub struct ForegroundActivationResult {
     pub foreground_matched: bool,
     pub is_iconic_after: bool,
     pub is_zoomed_after: bool,
+}
+
+/// RAII guard that temporarily disables DWM window transitions (`DWMWA_TRANSITIONS_FORCEDISABLED`)
+/// while WinDeck pre-restores a minimized window behind its topmost overlay curtain, and
+/// unconditionally re-enables transitions when dropped.
+#[derive(Debug)]
+pub struct DwmTransitionSuppressGuard {
+    target_raw: isize,
+}
+
+impl DwmTransitionSuppressGuard {
+    pub fn acquire(target_raw: isize) -> Option<Self> {
+        if target_raw == 0 {
+            return None;
+        }
+        let target = HWND(target_raw as *mut c_void);
+        if !unsafe { IsWindow(Some(target)) }.as_bool() {
+            return None;
+        }
+        let disable = BOOL(1);
+        let hr = unsafe {
+            DwmSetWindowAttribute(
+                target,
+                DWMWA_TRANSITIONS_FORCEDISABLED,
+                &disable as *const BOOL as *const c_void,
+                std::mem::size_of::<BOOL>() as u32,
+            )
+        };
+        if hr.is_ok() {
+            Some(Self { target_raw })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for DwmTransitionSuppressGuard {
+    fn drop(&mut self) {
+        if self.target_raw == 0 {
+            return;
+        }
+        let target = HWND(self.target_raw as *mut c_void);
+        if unsafe { IsWindow(Some(target)) }.as_bool() {
+            let enable = BOOL(0);
+            let _ = unsafe {
+                DwmSetWindowAttribute(
+                    target,
+                    DWMWA_TRANSITIONS_FORCEDISABLED,
+                    &enable as *const BOOL as *const c_void,
+                    std::mem::size_of::<BOOL>() as u32,
+                )
+            };
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct PreRestoreResult {
+    pub was_minimized: bool,
+    pub had_restore_to_maximized_flag: bool,
+    pub restored: bool,
+    pub is_zoomed_after: bool,
+    pub dwm_guard: Option<DwmTransitionSuppressGuard>,
+}
+
+/// Pre-restores a minimized window behind WinDeck's topmost overlay curtain so a fly-out zoom
+/// animation lands directly on the live restored window with zero double-restore animation.
+///
+/// - Skips hung windows (`IsHungAppWindow`) so the UI thread never blocks.
+/// - Temporarily suppresses Windows' DWM restore transition via [`DwmTransitionSuppressGuard`],
+///   which the caller must hold alive until the overlay finishes hiding.
+/// - Restores minimized windows via `SW_SHOWNOACTIVATE` first so WinDeck keeps foreground focus
+///   while the overlay animates; if a `WPF_RESTORETOMAXIMIZED` window does not stay zoomed under
+///   `SW_SHOWNOACTIVATE`, falls back to `SW_SHOWMAXIMIZED` (caller should re-pin overlay Z-order right after).
+pub fn pre_restore_minimized_window(target_raw: isize) -> PreRestoreResult {
+    let target = HWND(target_raw as *mut c_void);
+    if target_raw == 0 || !unsafe { IsWindow(Some(target)) }.as_bool() {
+        return PreRestoreResult {
+            was_minimized: false,
+            had_restore_to_maximized_flag: false,
+            restored: false,
+            is_zoomed_after: false,
+            dwm_guard: None,
+        };
+    }
+
+    let was_minimized = unsafe { IsIconic(target) }.as_bool();
+    if !was_minimized {
+        return PreRestoreResult {
+            was_minimized: false,
+            had_restore_to_maximized_flag: false,
+            restored: false,
+            is_zoomed_after: unsafe { IsZoomed(target) }.as_bool(),
+            dwm_guard: None,
+        };
+    }
+
+    if unsafe { IsHungAppWindow(target) }.as_bool() {
+        return PreRestoreResult {
+            was_minimized: true,
+            had_restore_to_maximized_flag: false,
+            restored: false,
+            is_zoomed_after: false,
+            dwm_guard: None,
+        };
+    }
+
+    let mut placement = WINDOWPLACEMENT {
+        length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+    let _ = unsafe { GetWindowPlacement(target, &mut placement) };
+    let had_restore_to_maximized_flag = (placement.flags.0 & WPF_RESTORETOMAXIMIZED.0) != 0;
+
+    let dwm_guard = DwmTransitionSuppressGuard::acquire(target_raw);
+
+    unsafe {
+        let _ = ShowWindow(target, SW_SHOWNOACTIVATE);
+        if had_restore_to_maximized_flag && !IsZoomed(target).as_bool() {
+            let _ = ShowWindow(target, SW_SHOWMAXIMIZED);
+        }
+    }
+
+    let restored = !unsafe { IsIconic(target) }.as_bool();
+    let is_zoomed_after = unsafe { IsZoomed(target) }.as_bool();
+    let dwm_guard = if restored { dwm_guard } else { None };
+
+    PreRestoreResult {
+        was_minimized,
+        had_restore_to_maximized_flag,
+        restored,
+        is_zoomed_after,
+        dwm_guard,
+    }
 }
 
 fn send_synthetic_alt_tap() {
@@ -137,14 +272,15 @@ pub fn activate_window_foreground(target_raw: isize) -> Result<ForegroundActivat
         }
     }
 
-    let mut fg_ok = unsafe { SetForegroundWindow(target) }.as_bool();
     let mut used_alt_input_fallback = false;
-    if !fg_ok {
-        send_synthetic_alt_tap();
-        used_alt_input_fallback = true;
-        fg_ok = unsafe { SetForegroundWindow(target) }.as_bool();
+    if unsafe { GetForegroundWindow() } != target {
+        let fg_ok = unsafe { SetForegroundWindow(target) }.as_bool();
+        if !fg_ok && unsafe { GetForegroundWindow() } != target {
+            send_synthetic_alt_tap();
+            used_alt_input_fallback = true;
+            let _ = unsafe { SetForegroundWindow(target) };
+        }
     }
-    let _ = fg_ok;
 
     let fg_after = unsafe { GetForegroundWindow() }.0 as isize;
     let is_iconic_after = unsafe { IsIconic(target) }.as_bool();
@@ -471,7 +607,141 @@ pub fn force_quit_window(target_raw: isize, same_pid_window_count: usize) -> Res
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Once;
+
+    use windows::Win32::Foundation::{LRESULT, RECT};
+    use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, RegisterClassW, SW_MINIMIZE,
+        SW_SHOWNORMAL, WINDOW_EX_STYLE, WNDCLASSW, WS_OVERLAPPEDWINDOW, WS_POPUP,
+    };
+    use windows_core::w;
+
+    use crate::overlay_win::{
+        OverlayMonitorPolicy, ThumbnailHostWindow, configure_borderless_immersive,
+        hide_layered_overlay, inspect_layered_overlay_state, pin_layered_z_order,
+        show_and_focus_layered_overlay,
+    };
+    use crate::window_enum::{WindowInfo, enumerate_monitors, refresh_window_geometry};
+
     use super::*;
+
+    struct TestWin(HWND);
+
+    impl TestWin {
+        fn create_overlapped(x: i32, y: i32, w: i32, h: i32) -> Self {
+            static REG: Once = Once::new();
+            let cls = w!("WinDeckSwitchTestOverlapped");
+            let hinst = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+            unsafe extern "system" fn proc(
+                hwnd: HWND,
+                msg: u32,
+                wp: WPARAM,
+                lp: LPARAM,
+            ) -> LRESULT {
+                unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+            }
+            REG.call_once(|| {
+                let wc = WNDCLASSW {
+                    lpfnWndProc: Some(proc),
+                    hInstance: hinst.into(),
+                    lpszClassName: cls,
+                    ..Default::default()
+                };
+                unsafe { RegisterClassW(&wc) };
+            });
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    cls,
+                    w!("WinDeckSwitchTestTarget"),
+                    WS_OVERLAPPEDWINDOW,
+                    x,
+                    y,
+                    w,
+                    h,
+                    None,
+                    None,
+                    Some(hinst.into()),
+                    None,
+                )
+            }
+            .expect("CreateWindowExW overlapped");
+            Self(hwnd)
+        }
+
+        fn create_popup(w: i32, h: i32) -> Self {
+            static REG: Once = Once::new();
+            let cls = w!("WinDeckSwitchTestPopup");
+            let hinst = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+            unsafe extern "system" fn proc(
+                hwnd: HWND,
+                msg: u32,
+                wp: WPARAM,
+                lp: LPARAM,
+            ) -> LRESULT {
+                unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+            }
+            REG.call_once(|| {
+                let wc = WNDCLASSW {
+                    lpfnWndProc: Some(proc),
+                    hInstance: hinst.into(),
+                    lpszClassName: cls,
+                    ..Default::default()
+                };
+                unsafe { RegisterClassW(&wc) };
+            });
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    cls,
+                    w!("WinDeckSwitchTestOverlay"),
+                    WS_POPUP,
+                    0,
+                    0,
+                    w,
+                    h,
+                    None,
+                    None,
+                    Some(hinst.into()),
+                    None,
+                )
+            }
+            .expect("CreateWindowExW popup");
+            Self(hwnd)
+        }
+    }
+
+    impl Drop for TestWin {
+        fn drop(&mut self) {
+            if !self.0.is_invalid() {
+                let _ = unsafe { DestroyWindow(self.0) };
+            }
+        }
+    }
+
+    fn blank_window_info(hwnd: HWND) -> WindowInfo {
+        WindowInfo {
+            hwnd: hwnd.0 as isize,
+            pid: 0,
+            process_name: String::new(),
+            exe_path: String::new(),
+            class_name: String::new(),
+            title: String::new(),
+            desktop_id: None,
+            desktop_index: None,
+            is_pinned: false,
+            is_minimized: false,
+            is_maximized: false,
+            restore_to_maximized: false,
+            is_elevated: None,
+            cloaked_flags: 0,
+            monitor_index: None,
+            rect: RECT::default(),
+            visible_rect: RECT::default(),
+            normal_rect: RECT::default(),
+        }
+    }
 
     #[test]
     fn protected_shell_processes_are_guarded() {
@@ -491,5 +761,110 @@ mod tests {
     #[test]
     fn activate_window_foreground_rejects_invalid_hwnd() {
         assert!(activate_window_foreground(0).is_err());
+    }
+
+    #[test]
+    fn pre_restore_rejects_invalid_and_skips_non_minimized() {
+        let invalid = pre_restore_minimized_window(0);
+        assert!(!invalid.was_minimized);
+        assert!(!invalid.restored);
+        assert!(invalid.dwm_guard.is_none());
+
+        let win = TestWin::create_overlapped(120, 120, 640, 420);
+        unsafe {
+            let _ = ShowWindow(win.0, SW_SHOWNOACTIVATE);
+        }
+        let non_min = pre_restore_minimized_window(win.0.0 as isize);
+        assert!(!non_min.was_minimized);
+        assert!(!non_min.restored);
+        assert!(non_min.dwm_guard.is_none());
+    }
+
+    #[test]
+    fn pre_restore_normal_and_maximized_minimized_windows_behind_overlay() {
+        let monitors = enumerate_monitors();
+        assert!(!monitors.is_empty());
+
+        let overlay_gpui = TestWin::create_popup(800, 600);
+        configure_borderless_immersive(overlay_gpui.0, false);
+        let thumb_host = ThumbnailHostWindow::create(false).expect("ThumbnailHostWindow::create");
+        let (overlay_rect, _) = show_and_focus_layered_overlay(
+            overlay_gpui.0,
+            thumb_host.hwnd(),
+            OverlayMonitorPolicy::Primary,
+            false,
+        )
+        .expect("show_and_focus_layered_overlay");
+
+        // 1. Normal window minimized -> pre-restore should unminimize without stealing focus
+        let normal = TestWin::create_overlapped(120, 100, 720, 480);
+        unsafe {
+            let _ = ShowWindow(normal.0, SW_SHOWNORMAL);
+            let _ = ShowWindow(normal.0, SW_MINIMIZE);
+        }
+        assert!(unsafe { IsIconic(normal.0) }.as_bool());
+
+        let mut info = blank_window_info(normal.0);
+        assert!(refresh_window_geometry(&mut info, &monitors));
+        assert!(info.is_minimized);
+        assert!(!info.restore_to_maximized);
+        assert!(info.normal_rect.right - info.normal_rect.left >= 600);
+        assert!(info.monitor_index.is_some());
+
+        pin_layered_z_order(overlay_gpui.0, thumb_host.hwnd(), overlay_rect);
+        let res = pre_restore_minimized_window(normal.0.0 as isize);
+        pin_layered_z_order(overlay_gpui.0, thumb_host.hwnd(), overlay_rect);
+
+        assert!(res.was_minimized);
+        assert!(!res.had_restore_to_maximized_flag);
+        assert!(res.restored);
+        assert!(!res.is_zoomed_after);
+        assert!(res.dwm_guard.is_some());
+        assert!(!unsafe { IsIconic(normal.0) }.as_bool());
+
+        assert!(refresh_window_geometry(&mut info, &monitors));
+        assert!(!info.is_minimized);
+        assert!(info.visible_rect.right - info.visible_rect.left >= 600);
+        assert!(info.visible_rect.left > -10000);
+        let diag = inspect_layered_overlay_state(overlay_gpui.0, thumb_host.hwnd());
+        assert!(
+            diag.is_healthy(),
+            "overlay must stay topmost above pre-restored normal window: {diag:?}"
+        );
+        drop(res.dwm_guard);
+
+        // 2. Maximized-then-minimized window -> pre-restore must preserve maximized state
+        let maxed = TestWin::create_overlapped(140, 120, 700, 460);
+        unsafe {
+            let _ = ShowWindow(maxed.0, SW_SHOWMAXIMIZED);
+            let _ = ShowWindow(maxed.0, SW_MINIMIZE);
+        }
+        assert!(unsafe { IsIconic(maxed.0) }.as_bool());
+
+        let mut max_info = blank_window_info(maxed.0);
+        assert!(refresh_window_geometry(&mut max_info, &monitors));
+        assert!(max_info.is_minimized);
+        assert!(max_info.restore_to_maximized);
+
+        pin_layered_z_order(overlay_gpui.0, thumb_host.hwnd(), overlay_rect);
+        let max_res = pre_restore_minimized_window(maxed.0.0 as isize);
+        pin_layered_z_order(overlay_gpui.0, thumb_host.hwnd(), overlay_rect);
+
+        assert!(max_res.was_minimized);
+        assert!(max_res.had_restore_to_maximized_flag);
+        assert!(max_res.restored);
+        assert!(max_res.is_zoomed_after, "maximized-then-minimized window must restore maximized");
+        assert!(max_res.dwm_guard.is_some());
+        assert!(!unsafe { IsIconic(maxed.0) }.as_bool());
+        assert!(unsafe { IsZoomed(maxed.0) }.as_bool());
+
+        let diag2 = inspect_layered_overlay_state(overlay_gpui.0, thumb_host.hwnd());
+        assert!(
+            diag2.is_healthy(),
+            "overlay must stay topmost above pre-restored maximized window: {diag2:?}"
+        );
+
+        drop(max_res.dwm_guard);
+        hide_layered_overlay(overlay_gpui.0, thumb_host.hwnd());
     }
 }

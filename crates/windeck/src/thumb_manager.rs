@@ -263,6 +263,20 @@ impl ThumbnailManager {
         self.entries.get(&hwnd).and_then(|e| e.source_size)
     }
 
+    /// Re-queries `DwmQueryThumbnailSourceSize` for an already-registered thumbnail
+    /// (e.g. right after pre-restoring a minimized window behind the overlay curtain),
+    /// preserving any existing cached size if DWM transiently reports zero.
+    pub fn refresh_source_size(&mut self, hwnd: isize) -> Option<(i32, i32)> {
+        let entry = self.entries.get_mut(&hwnd)?;
+        if let Ok((w, h)) = entry.thumb.query_source_size()
+            && w > 0
+            && h > 0
+        {
+            entry.source_size = Some((w, h));
+        }
+        entry.source_size
+    }
+
     pub fn unregister_all(&mut self) {
         self.entries.clear();
     }

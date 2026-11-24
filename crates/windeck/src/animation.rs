@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui::{Bounds, Pixels, RenderImage, SharedString, point, px, size};
-use win_platform::{DesktopId, MonitorInfo, WindowInfo};
+use win_platform::{DesktopId, DwmTransitionSuppressGuard, MonitorInfo, WindowInfo};
 use windows::Win32::Foundation::RECT;
 
 use crate::config::{PreviewFit, TransitionEffect};
@@ -241,7 +241,8 @@ pub enum ExitTransitionKind {
     ///   while outgoing grid sweeps out in the opposite direction and the target window sweeps in from the
     ///   target desktop's side into a poised launch rect.
     /// - Phase 2 (`pan_duration..total`): Pop/zoom the target window from the poised rect to its real
-    ///   destination bounds (or gentle pop-fade for minimized/other-monitor windows).
+    ///   destination bounds (including minimized windows pre-restored behind the curtain, or gentle
+    ///   pop-fade when no live surface or on another monitor).
     CrossDesktopWindow {
         target_hwnd: isize,
         target_desktop_id: DesktopId,
@@ -409,6 +410,7 @@ pub struct ExitTransition {
     pub finishing: bool,
     pub desktop_ready: Arc<AtomicBool>,
     pub desktop_switch_error: Arc<Mutex<Option<String>>>,
+    pub dwm_transition_guard: Option<DwmTransitionSuppressGuard>,
     pub kind: ExitTransitionKind,
 }
 
@@ -461,8 +463,13 @@ impl ExitTransition {
 }
 
 /// Resolves the target window's physical destination rect relative to `thumb_host_hwnd`'s client origin.
+///
+/// For minimized windows (whose current `rect` is iconic `(-32000, -32000)`), resolves the expected
+/// restored bounds from `mon.work_area` (when `restore_to_maximized`) or `win.normal_rect`, so
+/// WinDeck can pre-restore behind the overlay curtain and fly directly to the target window.
+///
 /// Returns `None` when a fly-to-window zoom would be invalid or visually jarring:
-/// - minimized window (iconic `(-32000, -32000)` + Windows' own `SW_RESTORE` animation)
+/// - minimized window with missing/iconic restored placement
 /// - degenerate zero/tiny rect
 /// - target window sits predominantly on a different monitor than the overlay host (`< 50%` overlap)
 pub fn resolve_exit_target_phys_rect(
@@ -470,11 +477,19 @@ pub fn resolve_exit_target_phys_rect(
     overlay_phys_rect: RECT,
     monitors: &[MonitorInfo],
 ) -> Option<RECT> {
-    if win.is_minimized {
-        return None;
-    }
-
-    let mut target = if win.visible_rect.right > win.visible_rect.left
+    let mut target = if win.is_minimized {
+        if win.restore_to_maximized {
+            win.monitor_index
+                .and_then(|idx| monitors.get(idx))
+                .map(|mon| mon.work_area)?
+        } else {
+            let nr = win.normal_rect;
+            if nr.left <= -20000 || nr.top <= -20000 {
+                return None;
+            }
+            nr
+        }
+    } else if win.visible_rect.right > win.visible_rect.left
         && win.visible_rect.bottom > win.visible_rect.top
     {
         win.visible_rect
@@ -482,7 +497,7 @@ pub fn resolve_exit_target_phys_rect(
         win.rect
     };
 
-    if win.is_maximized {
+    if !win.is_minimized && win.is_maximized {
         if let Some(mon) = win.monitor_index.and_then(|idx| monitors.get(idx)) {
             target = RECT {
                 left: target.left.max(mon.work_area.left),
@@ -643,15 +658,70 @@ mod tests {
         assert_eq!(max_resolved.right, 1920);
         assert_eq!(max_resolved.bottom, 1040);
 
-        // Minimized window degrades to None
+        // Minimized window with iconic/degenerate normal_rect degrades to None
         let iconic = RECT {
             left: -32000,
             top: -32000,
             right: -31840,
             bottom: -31972,
         };
-        let min_win = test_window(iconic, iconic, true, false);
-        assert!(resolve_exit_target_phys_rect(&min_win, screen, &mons).is_none());
+        let min_iconic_only = test_window(iconic, iconic, true, false);
+        assert!(resolve_exit_target_phys_rect(&min_iconic_only, screen, &mons).is_none());
+
+        // Minimized normal window on same monitor resolves to its restored normal_rect
+        let mut min_normal = test_window(iconic, iconic, true, false);
+        min_normal.normal_rect = RECT {
+            left: 160,
+            top: 90,
+            right: 1260,
+            bottom: 810,
+        };
+        let min_normal_resolved =
+            resolve_exit_target_phys_rect(&min_normal, screen, &mons).unwrap();
+        assert_eq!(min_normal_resolved.left, 160);
+        assert_eq!(min_normal_resolved.top, 90);
+        assert_eq!(min_normal_resolved.right, 1260);
+        assert_eq!(min_normal_resolved.bottom, 810);
+
+        // Maximized-then-minimized window resolves to monitor work_area
+        let mut min_maxed = test_window(iconic, iconic, true, false);
+        min_maxed.restore_to_maximized = true;
+        let min_maxed_resolved =
+            resolve_exit_target_phys_rect(&min_maxed, screen, &mons).unwrap();
+        assert_eq!(min_maxed_resolved.left, 0);
+        assert_eq!(min_maxed_resolved.top, 0);
+        assert_eq!(min_maxed_resolved.right, 1920);
+        assert_eq!(min_maxed_resolved.bottom, 1040);
+
+        // Minimized window belonging to secondary monitor still degrades to None
+        let second_mon = test_monitor(
+            RECT {
+                left: 1920,
+                top: 0,
+                right: 3840,
+                bottom: 1080,
+            },
+            RECT {
+                left: 1920,
+                top: 0,
+                right: 3840,
+                bottom: 1040,
+            },
+        );
+        let two_mons = vec![mons[0].clone(), second_mon];
+        let mut min_other_mon = test_window(iconic, iconic, true, false);
+        min_other_mon.monitor_index = Some(1);
+        min_other_mon.restore_to_maximized = true;
+        assert!(resolve_exit_target_phys_rect(&min_other_mon, screen, &two_mons).is_none());
+        let mut min_other_normal = test_window(iconic, iconic, true, false);
+        min_other_normal.monitor_index = Some(1);
+        min_other_normal.normal_rect = RECT {
+            left: 2000,
+            top: 100,
+            right: 3000,
+            bottom: 800,
+        };
+        assert!(resolve_exit_target_phys_rect(&min_other_normal, screen, &two_mons).is_none());
 
         // Window on secondary monitor degrades to None
         let second_mon_rc = RECT {

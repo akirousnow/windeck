@@ -12,12 +12,14 @@ use gpui::{
 };
 use smallvec::smallvec;
 use win_platform::{
-    DesktopId, ForceQuitOutcome, HoldNavDirection, IconBgra, MonitorInfo, ReleaseInfo, ShellHost,
-    SingleInstanceGuard, ThumbnailHostWindow, VirtualDesktopClient, VirtualDesktopInfo, WindowInfo,
+    DesktopId, DwmTransitionSuppressGuard, ForceQuitOutcome, HoldNavDirection, IconBgra,
+    MonitorInfo, PreRestoreResult, ReleaseInfo, ShellHost, SingleInstanceGuard,
+    ThumbnailHostWindow, VirtualDesktopClient, VirtualDesktopInfo, WindowInfo,
     activate_window_foreground, configure_borderless_immersive, enumerate_monitors,
     enumerate_windows, extract_window_icon, force_quit_window, hide_layered_overlay,
-    inspect_layered_overlay_state, pin_layered_z_order, query_window_and_client_sizes,
-    show_and_focus_layered_overlay, switch_desktop_and_wait, switch_to_window,
+    inspect_layered_overlay_state, pin_layered_z_order, pre_restore_minimized_window,
+    query_window_and_client_sizes, refresh_window_geometry, show_and_focus_layered_overlay,
+    switch_desktop_and_wait, switch_to_window,
 };
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -187,6 +189,7 @@ pub struct SwitcherView {
     pub(crate) update_dialog_open: bool,
     pub(crate) update_dialog_error: Option<SharedString>,
     pub(crate) visible: bool,
+    suppress_blur_hide: bool,
     has_completed_first_open: bool,
     pub(crate) last_overlay_rect: Option<RECT>,
     shown_at: Option<Instant>,
@@ -277,6 +280,7 @@ impl SwitcherView {
             update_dialog_open: false,
             update_dialog_error: None,
             visible: false,
+            suppress_blur_hide: false,
             has_completed_first_open: false,
             last_overlay_rect: None,
             shown_at: None,
@@ -371,6 +375,7 @@ impl SwitcherView {
     ) {
         if !self.visible
             || !self.config.hide_on_blur
+            || self.suppress_blur_hide
             || self.is_downloading_update()
             || self.exit_anim.is_some()
         {
@@ -1474,6 +1479,113 @@ impl SwitcherView {
         cx.notify();
     }
 
+    /// Pre-restores a minimized window behind WinDeck's topmost overlay curtain while guarding
+    /// `hide_on_blur` and re-pinning both overlay layers strictly above the restored window.
+    fn pre_restore_behind_curtain(&mut self, target_hwnd: isize) -> PreRestoreResult {
+        self.suppress_blur_hide = true;
+        let res = pre_restore_minimized_window(target_hwnd);
+        pin_layered_z_order(
+            self.gpui_hwnd,
+            self.thumb_host.hwnd(),
+            self.overlay_phys_rect,
+        );
+        self.suppress_blur_hide = false;
+        res
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn on_cross_desktop_switch_ready(
+        &mut self,
+        target_hwnd: isize,
+        mut target_info: Option<WindowInfo>,
+        should_pre_restore: bool,
+        switch_res: anyhow::Result<bool>,
+        ready: &Arc<AtomicBool>,
+        err_slot: &Arc<Mutex<Option<String>>>,
+        cx: &mut Context<Self>,
+    ) {
+        let desktop_switched_ok = match switch_res {
+            Ok(matched) => matched,
+            Err(e) => {
+                if let Ok(mut guard) = err_slot.lock() {
+                    *guard = Some(format!("{e:#}"));
+                }
+                false
+            }
+        };
+
+        if should_pre_restore {
+            let matches_active_exit = self.exit_anim.as_ref().is_some_and(|exit| {
+                !exit.finishing
+                    && matches!(
+                        exit.kind,
+                        ExitTransitionKind::CrossDesktopWindow {
+                            target_hwnd: active_hwnd,
+                            ..
+                        } if active_hwnd == target_hwnd
+                    )
+            });
+            if matches_active_exit {
+                if desktop_switched_ok {
+                    let pre = self.pre_restore_behind_curtain(target_hwnd);
+                    let refreshed_dest = if pre.restored {
+                        target_info.as_mut().and_then(|info| {
+                            refresh_window_geometry(info, &self.monitors).then(|| {
+                                resolve_exit_target_phys_rect(
+                                    info,
+                                    self.overlay_phys_rect,
+                                    &self.monitors,
+                                )
+                            })?
+                        })
+                    } else {
+                        None
+                    };
+                    let live_now = if pre.restored {
+                        self.thumbs
+                            .borrow_mut()
+                            .refresh_source_size(target_hwnd)
+                            .is_some()
+                    } else {
+                        false
+                    };
+
+                    if let Some(ref mut exit) = self.exit_anim {
+                        if pre.restored {
+                            exit.dwm_transition_guard = pre.dwm_guard;
+                        }
+                        if let ExitTransitionKind::CrossDesktopWindow {
+                            to_dest_phys,
+                            has_live_surface,
+                            ..
+                        } = &mut exit.kind
+                        {
+                            if pre.restored {
+                                *has_live_surface = live_now;
+                                *to_dest_phys = if live_now {
+                                    refreshed_dest.or(*to_dest_phys)
+                                } else {
+                                    None
+                                };
+                            } else if pre.was_minimized {
+                                *to_dest_phys = None;
+                            }
+                        }
+                    }
+                } else if let Some(ref mut exit) = self.exit_anim {
+                    if let ExitTransitionKind::CrossDesktopWindow { to_dest_phys, .. } =
+                        &mut exit.kind
+                    {
+                        *to_dest_phys = None;
+                    }
+                }
+            }
+        }
+
+        ready.store(true, Ordering::Release);
+        cx.notify();
+    }
+
     fn activate_window(&mut self, target_hwnd: isize, window: &mut Window, cx: &mut Context<Self>) {
         if self.exit_anim.is_some() {
             return;
@@ -1531,7 +1643,7 @@ impl SwitcherView {
         self.armed_delete_desktop = None;
         self.hovered_flat = None;
 
-        let target_info = self
+        let mut target_info = self
             .all_windows
             .iter()
             .find(|w| w.hwnd == target_hwnd)
@@ -1553,25 +1665,6 @@ impl SwitcherView {
 
         let desktop_ready = Arc::new(AtomicBool::new(!is_cross_desktop));
         let desktop_switch_error = Arc::new(Mutex::new(None));
-        if is_cross_desktop {
-            if let Some(target_did) = target_desktop_id {
-                let vdm = self.vdm.clone();
-                let ready = desktop_ready.clone();
-                let err_slot = desktop_switch_error.clone();
-                cx.background_executor()
-                    .spawn(async move {
-                        if let Err(e) =
-                            switch_desktop_and_wait(&vdm, target_did, Duration::from_millis(200))
-                        {
-                            if let Ok(mut guard) = err_slot.lock() {
-                                *guard = Some(format!("{e:#}"));
-                            }
-                        }
-                        ready.store(true, Ordering::Release);
-                    })
-                    .detach();
-            }
-        }
 
         let scale = window.scale_factor().max(self.overlay_scale).max(1.0);
         let from_slot_phys = self
@@ -1605,8 +1698,10 @@ impl SwitcherView {
                 layouts.get(&target_flat).map(|r| r.thumb_window_bounds)
             })
             .map(|b| bounds_to_phys_rect(b, scale));
-        let has_live_surface = self.thumbs.borrow().source_size(target_hwnd).is_some();
+        let mut has_live_surface = self.thumbs.borrow().source_size(target_hwnd).is_some();
         let profile = TransitionProfile::from_effect(self.config.transition_effect);
+        let mut dwm_transition_guard: Option<DwmTransitionSuppressGuard> = None;
+        let mut should_pre_restore_after_desktop_switch = false;
 
         let (exit_duration, kind) = if is_cross_desktop {
             if let Some(target_did) = target_desktop_id {
@@ -1623,10 +1718,14 @@ impl SwitcherView {
                         .and_then(|d| d.custom_name.clone())
                         .unwrap_or_else(|| format!("桌面 {}", dst_idx + 1)),
                 );
+                let candidate_dest_phys = target_info.as_ref().and_then(|info| {
+                    resolve_exit_target_phys_rect(info, self.overlay_phys_rect, &self.monitors)
+                });
+                should_pre_restore_after_desktop_switch =
+                    target_info.as_ref().is_some_and(|i| i.is_minimized)
+                        && candidate_dest_phys.is_some();
                 let to_dest_phys = if has_live_surface {
-                    target_info.as_ref().and_then(|info| {
-                        resolve_exit_target_phys_rect(info, self.overlay_phys_rect, &self.monitors)
-                    })
+                    candidate_dest_phys
                 } else {
                     None
                 };
@@ -1680,22 +1779,58 @@ impl SwitcherView {
                     },
                 )
             }
-        } else if profile.use_zoom_to_window && has_live_surface {
-            let resolved_dest = target_info.as_ref().and_then(|info| {
+        } else if profile.use_zoom_to_window {
+            let mut resolved_dest = target_info.as_ref().and_then(|info| {
                 resolve_exit_target_phys_rect(info, self.overlay_phys_rect, &self.monitors)
             });
-            if let (Some(from_phys), Some(to_phys)) = (from_slot_phys, resolved_dest) {
-                (
-                    profile.exit_zoom_duration,
-                    ExitTransitionKind::ZoomWindow {
-                        target_hwnd,
-                        from_slot_phys: from_phys,
-                        to_dest_phys: to_phys,
-                        preview_fit: self.config.preview_fit,
-                        target_desktop_id,
-                        is_cross_desktop,
-                    },
-                )
+            if target_info.as_ref().is_some_and(|i| i.is_minimized) && resolved_dest.is_some() {
+                let pre = self.pre_restore_behind_curtain(target_hwnd);
+                if pre.restored {
+                    dwm_transition_guard = pre.dwm_guard;
+                    if let Some(ref mut info) = target_info {
+                        if refresh_window_geometry(info, &self.monitors) {
+                            resolved_dest = resolve_exit_target_phys_rect(
+                                info,
+                                self.overlay_phys_rect,
+                                &self.monitors,
+                            );
+                        }
+                    }
+                    has_live_surface = self
+                        .thumbs
+                        .borrow_mut()
+                        .refresh_source_size(target_hwnd)
+                        .is_some();
+                } else if pre.was_minimized {
+                    // Window stayed iconic (e.g. hung or elevated UIPI): degrade cleanly to GentleFadeWindow.
+                    resolved_dest = None;
+                }
+            }
+            if has_live_surface {
+                if let (Some(from_phys), Some(to_phys)) = (from_slot_phys, resolved_dest) {
+                    (
+                        profile.exit_zoom_duration,
+                        ExitTransitionKind::ZoomWindow {
+                            target_hwnd,
+                            from_slot_phys: from_phys,
+                            to_dest_phys: to_phys,
+                            preview_fit: self.config.preview_fit,
+                            target_desktop_id,
+                            is_cross_desktop,
+                        },
+                    )
+                } else {
+                    (
+                        profile.exit_zoom_duration,
+                        ExitTransitionKind::GentleFadeWindow {
+                            target_hwnd,
+                            from_slot_phys,
+                            preview_fit: self.config.preview_fit,
+                            target_desktop_id,
+                            is_cross_desktop,
+                        },
+                    )
+                }
             } else {
                 (
                     profile.exit_zoom_duration,
@@ -1726,10 +1861,45 @@ impl SwitcherView {
             duration: exit_duration,
             use_spring: profile.use_spring,
             finishing: false,
-            desktop_ready,
-            desktop_switch_error,
+            desktop_ready: desktop_ready.clone(),
+            desktop_switch_error: desktop_switch_error.clone(),
+            dwm_transition_guard,
             kind,
         });
+
+        if is_cross_desktop {
+            if let Some(target_did) = target_desktop_id {
+                let vdm = self.vdm.clone();
+                let ready = desktop_ready;
+                let err_slot = desktop_switch_error;
+                let info_for_restore = target_info;
+                cx.spawn(async move |this, cx| {
+                    let switch_res = cx
+                        .background_executor()
+                        .spawn(async move {
+                            switch_desktop_and_wait(&vdm, target_did, Duration::from_millis(200))
+                        })
+                        .await;
+                    let updated = this
+                        .update(cx, |view, cx| {
+                            view.on_cross_desktop_switch_ready(
+                                target_hwnd,
+                                info_for_restore,
+                                should_pre_restore_after_desktop_switch,
+                                switch_res,
+                                &ready,
+                                &err_slot,
+                                cx,
+                            );
+                        })
+                        .is_ok();
+                    if !updated {
+                        ready.store(true, Ordering::Release);
+                    }
+                })
+                .detach();
+            }
+        }
         cx.notify();
     }
 
@@ -1838,6 +2008,7 @@ impl SwitcherView {
             finishing: false,
             desktop_ready,
             desktop_switch_error,
+            dwm_transition_guard: None,
             kind: ExitTransitionKind::DesktopSwitch {
                 target_desktop_id: desktop_id,
                 target_desktop_label,
@@ -1852,6 +2023,7 @@ impl SwitcherView {
         let Some(exit) = self.exit_anim.take() else {
             return;
         };
+        let dwm_guard = exit.dwm_transition_guard;
         let elapsed_ms = exit.started_at.elapsed().as_secs_f64() * 1000.0;
         let desktop_err = exit
             .desktop_switch_error
@@ -1968,6 +2140,7 @@ impl SwitcherView {
         self.thumbs.borrow_mut().unregister_all();
         self.last_thumb_bounds.borrow_mut().clear();
         hide_layered_overlay(self.gpui_hwnd, self.thumb_host.hwnd());
+        drop(dwm_guard);
         cx.notify();
     }
 
@@ -2577,7 +2750,7 @@ impl Render for SwitcherView {
                         exit.use_spring,
                         viewport_w_logical,
                         host_size_phys,
-                        *to_dest_phys,
+                        if *has_live_surface { *to_dest_phys } else { None },
                     );
                     chrome = sample.outgoing_opacity;
                     // Keep the top Spaces bar subtly visible during Phase 1 so the active desktop pill visibly shifts left/right,

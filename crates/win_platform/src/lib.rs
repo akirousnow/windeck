@@ -32,9 +32,12 @@ pub use updater::{
 pub use virtual_desktop::{
     ComProbeStatus, DesktopId, VirtualDesktopClient, VirtualDesktopInfo, WindowDesktopLookup,
 };
-pub use window_enum::{MonitorInfo, WindowInfo, enumerate_monitors, enumerate_windows};
+pub use window_enum::{
+    MonitorInfo, WindowInfo, enumerate_monitors, enumerate_windows, refresh_window_geometry,
+};
 pub use window_icon::{IconBgra, extract_window_icon};
 pub use window_switch::{
-    ForceQuitOutcome, ForceQuitReport, ForegroundActivationResult, SwitchReport,
-    activate_window_foreground, force_quit_window, switch_desktop_and_wait, switch_to_window,
+    DwmTransitionSuppressGuard, ForceQuitOutcome, ForceQuitReport, ForegroundActivationResult,
+    PreRestoreResult, SwitchReport, activate_window_foreground, force_quit_window,
+    pre_restore_minimized_window, switch_desktop_and_wait, switch_to_window,
 };
