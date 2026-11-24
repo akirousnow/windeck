@@ -725,6 +725,7 @@ mod tests {
             hwnd: hwnd.0 as isize,
             pid: 0,
             process_name: String::new(),
+            app_name: String::new(),
             exe_path: String::new(),
             class_name: String::new(),
             title: String::new(),

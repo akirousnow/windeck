@@ -562,6 +562,7 @@ mod tests {
             hwnd: 100,
             pid: 1,
             process_name: "app.exe".to_string(),
+            app_name: String::new(),
             exe_path: String::new(),
             class_name: "Wnd".to_string(),
             title: "Test".to_string(),

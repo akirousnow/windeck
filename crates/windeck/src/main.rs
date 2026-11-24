@@ -5,6 +5,7 @@ mod config;
 mod desktop_reorder;
 mod genie;
 mod nav;
+mod search;
 mod settings_panel;
 mod switcher_view;
 mod thumb_manager;

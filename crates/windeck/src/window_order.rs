@@ -241,6 +241,7 @@ mod tests {
             hwnd,
             pid,
             process_name: format!("app_{pid}.exe"),
+            app_name: String::new(),
             exe_path: String::new(),
             class_name: "TestWnd".to_string(),
             title: format!("Window {hwnd}"),

@@ -279,6 +279,7 @@ impl SwitcherView {
         self.disarm_hold_mode();
         self.clear_all_animations(false);
         self.clear_space_popups();
+        self.reset_search_without_refresh();
         // Clear live DWM thumbnails while in Settings so Layer 1 exposes pure, unobstructed Gaussian blur
         self.thumbs.borrow_mut().unregister_all();
         self.settings_open = true;
@@ -303,6 +304,7 @@ impl SwitcherView {
         // Immediately restore live DWM thumbnails for the Mission Control grid
         self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
         self.clamp_scroll();
+        window.focus(&self.focus_handle);
         window.refresh();
         cx.notify();
     }

@@ -247,6 +247,10 @@ impl LocalShortcut {
         parts.join("+")
     }
 
+    pub fn is_bare_printable(&self) -> bool {
+        !self.ctrl && !self.alt && !self.shift && self.key.len() == 1
+    }
+
     pub fn matches(
         &self,
         key: &str,
@@ -461,12 +465,12 @@ immersive = true
 preview_width = 380
 preview_height = 226
 
-# 固定尺寸预览适配方式（界面内按 F 键可实时切换）:
+# 固定尺寸预览适配方式（界面内按 Ctrl+Shift+F 可实时切换）:
 #   "cover"   = 等比铺满固定框（无黑边、无拉伸，竖窗保留顶部内容）
 #   "contain" = 等比完整显示整窗（不裁剪）
 preview_fit = "cover"
 
-# 软件名称与图标位置（界面内按 L 键可实时切换）:
+# 软件名称与图标位置（界面内按 Ctrl+L 可实时切换）:
 #   "bottom_right" = 嵌入缩略图右下角（默认）
 #   "bottom_left"  = 嵌入缩略图左下角
 #   "center"       = 嵌入缩略图正中央
@@ -776,10 +780,10 @@ immersive = {immersive}
 preview_width = {preview_width}
 preview_height = {preview_height}
 
-# 固定尺寸预览适配方式（界面内按 F 键可实时切换）: "cover" | "contain"
+# 固定尺寸预览适配方式（界面内按 Ctrl+Shift+F 可实时切换）: "cover" | "contain"
 preview_fit = "{preview_fit}"
 
-# 软件名称与图标位置（界面内按 L 键可实时切换）: "bottom_right" | "bottom_left" | "center" | "below"
+# 软件名称与图标位置（界面内按 Ctrl+L 可实时切换）: "bottom_right" | "bottom_left" | "center" | "below"
 label_position = "{label_position}"
 
 # 背景风格: "blurred" (毛玻璃磨砂) | "transparent" (半透明暗幕) | "opaque" (深邃暗幕)
