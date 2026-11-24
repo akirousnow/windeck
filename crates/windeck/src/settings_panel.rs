@@ -18,7 +18,7 @@ use crate::switcher_view::SwitcherView;
 use crate::update_dialog::UpdateStatus;
 
 const SHEET_W: f32 = 500.0;
-const SHEET_CONTENT_EST_H: f32 = 760.0;
+const SHEET_CONTENT_EST_H: f32 = 880.0;
 
 /// Minimalist 3-slider icon matching the hairline weight of the top Spaces bar.
 fn sliders_icon() -> Div {
@@ -80,6 +80,55 @@ fn setting_row(label: &'static str, control: impl IntoElement) -> Div {
                 .child(label),
         )
         .child(control)
+}
+
+fn section_header(title: &'static str) -> Div {
+    div()
+        .w_full()
+        .pt(px(12.0))
+        .pb(px(4.0))
+        .text_size(px(11.0))
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .text_color(rgba(0xFFFFFF66))
+        .child(title)
+}
+
+fn setting_row_with_hint(
+    label: &'static str,
+    hint: &'static str,
+    control: impl IntoElement,
+) -> Div {
+    div()
+        .w_full()
+        .min_h(px(52.0))
+        .py(px(8.0))
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(px(16.0))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap(px(3.0))
+                .child(
+                    div()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgba(0xFFFFFFCC))
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(rgba(0xFFFFFF6E))
+                        .child(hint),
+                ),
+        )
+        .child(div().flex_shrink_0().child(control))
 }
 
 /// Quiet frosted pill container matching the top Spaces capsule bar (`rgba(0xFFFFFF0E)`).
@@ -228,6 +277,7 @@ impl SwitcherView {
         self.recording_hotkey_letter = false;
         self.recording_force_quit_key = false;
         self.settings_error = None;
+        self.win_arrow_patch_error = None;
         self.settings_scroll_y = 0.0;
         self.autostart_enabled = is_autostart_enabled();
         window.focus(&self.focus_handle);
@@ -243,6 +293,7 @@ impl SwitcherView {
         self.recording_hotkey_letter = false;
         self.recording_force_quit_key = false;
         self.settings_error = None;
+        self.win_arrow_patch_error = None;
         // Immediately restore live DWM thumbnails for the Mission Control grid
         self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
         self.clamp_scroll();
@@ -308,6 +359,40 @@ impl SwitcherView {
         cx.notify();
     }
 
+    pub(crate) fn apply_win_arrow_patch_change(
+        &mut self,
+        enabled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let patch_res = if let Some(ref host) = *self.shell_host {
+            host.set_win_arrow_patch_enabled(enabled)
+        } else {
+            Ok(())
+        };
+
+        match patch_res {
+            Ok(()) => {
+                self.config.win_arrow_switch_desktop = enabled;
+                self.win_arrow_patch_error = None;
+                self.persist_config();
+                append_log(&format!("WIN_ARROW_PATCH UPDATED -> enabled={enabled}"));
+                let toast = if enabled {
+                    "已启用：关闭面板后按 Win + ←/→ 切换虚拟桌面"
+                } else {
+                    "已关闭：已恢复系统默认 Win + ←/→ 分屏"
+                };
+                self.transient_toast = Some((SharedString::from(toast), Instant::now()));
+            }
+            Err(e) => {
+                self.win_arrow_patch_error = Some(SharedString::from(format!("{e}")));
+                append_log(&format!(
+                    "WIN_ARROW_PATCH UPDATE FAILED -> enabled={enabled}: {e:#}"
+                ));
+            }
+        }
+        cx.notify();
+    }
+
     pub(crate) fn apply_visual_and_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.thumb_host.configure(
             self.config.immersive,
@@ -358,9 +443,18 @@ impl SwitcherView {
             } else {
                 self.settings_error = None;
             }
+            if let Err(e) = host.set_win_arrow_patch_enabled(defaults.win_arrow_switch_desktop) {
+                defaults.win_arrow_switch_desktop = self.config.win_arrow_switch_desktop;
+                self.win_arrow_patch_error = Some(SharedString::from(format!("{e}")));
+            } else {
+                self.win_arrow_patch_error = None;
+            }
+        } else {
+            self.win_arrow_patch_error = None;
         }
         self.config = defaults;
         self.recording_hotkey_letter = false;
+        self.recording_force_quit_key = false;
         self.apply_geometry_and_save(window, cx);
         self.transient_toast = Some((SharedString::from("已恢复默认"), Instant::now()));
         cx.notify();
@@ -412,6 +506,7 @@ impl SwitcherView {
         let cross_nav = self.config.cross_desktop_nav;
         let hide_on_blur = self.config.hide_on_blur;
         let auto_update = self.config.auto_update;
+        let win_arrow_switch_desktop = self.config.win_arrow_switch_desktop;
         let cur_ver_tag = format!("v{}", self.effective_version);
 
         let (update_hint_text, update_hint_color, update_btn_label, update_has_new, update_checking) =
@@ -1176,7 +1271,33 @@ impl SwitcherView {
                                         ),
                                     ))
                                     .child(row_divider())
-                                    .child(setting_row("版本更新", update_check_control)),
+                                    .child(setting_row("版本更新", update_check_control))
+                                    .child(row_divider())
+                                    .child(section_header("系统补丁"))
+                                    .child(setting_row_with_hint(
+                                        "Win + ←/→ 切虚拟桌面",
+                                        "覆盖系统窗口分屏，改用原生动画切换虚拟桌面（管理员窗口不生效）",
+                                        minimal_switch(
+                                            "sw-win-arrow-desktop",
+                                            win_arrow_switch_desktop,
+                                            cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.apply_win_arrow_patch_change(
+                                                    !win_arrow_switch_desktop,
+                                                    cx,
+                                                );
+                                            }),
+                                        ),
+                                    ))
+                                    .when_some(self.win_arrow_patch_error.clone(), |el, err| {
+                                        el.child(
+                                            div()
+                                                .pb(px(8.0))
+                                                .text_xs()
+                                                .text_color(rgb(0xFF8A80))
+                                                .child(err),
+                                        )
+                                    }),
                             ),
                     )
                     // Whisper-quiet footer links (no heavy buttons)
