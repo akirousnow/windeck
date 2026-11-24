@@ -5565,6 +5565,16 @@ impl SwitcherView {
             .desktop_id
             .and_then(|did| self.desktops.iter().position(|d| d.id == did))
             .or(win.desktop_index);
+        let anchor_idx = current_idx
+            .unwrap_or(fallback_active_idx)
+            .min(self.desktops.len() - 1);
+        let anchor_did = self.desktops[anchor_idx].id;
+        let has_other_window_on_source_desktop = self.all_windows.iter().any(|w| {
+            w.hwnd != hwnd
+                && !w.is_pinned
+                && (w.desktop_id == Some(anchor_did)
+                    || (w.desktop_id.is_none() && w.desktop_index == Some(anchor_idx)))
+        });
 
         let resolution = resolve_desktop_move_target(
             action,
@@ -5572,12 +5582,19 @@ impl SwitcherView {
             win.is_pinned,
             self.desktops.len(),
             fallback_active_idx,
+            has_other_window_on_source_desktop,
         );
 
         let create_new = match resolution {
             ResolvedDesktopMove::AlreadyAtFirst => {
                 self.transient_toast =
                     Some((SharedString::from("已在第一个桌面"), Instant::now()));
+                cx.notify();
+                return;
+            }
+            ResolvedDesktopMove::AlreadyAtLastSingleTab => {
+                self.transient_toast =
+                    Some((SharedString::from("已在最后一个桌面"), Instant::now()));
                 cx.notify();
                 return;
             }
@@ -8809,6 +8826,7 @@ enum ResolvedDesktopMove {
     MoveToExisting { target_idx: usize },
     CreateAndMove,
     AlreadyAtFirst,
+    AlreadyAtLastSingleTab,
     AlreadyOnTarget { idx: usize },
     OutOfRange { requested_1based: usize, total: usize },
 }
@@ -8819,6 +8837,7 @@ fn resolve_desktop_move_target(
     is_pinned: bool,
     desktop_count: usize,
     fallback_active_idx: usize,
+    has_other_window_on_source_desktop: bool,
 ) -> ResolvedDesktopMove {
     if desktop_count == 0 {
         return ResolvedDesktopMove::OutOfRange {
@@ -8853,8 +8872,14 @@ fn resolve_desktop_move_target(
                 ResolvedDesktopMove::MoveToExisting {
                     target_idx: anchor_idx + 1,
                 }
-            } else {
+            } else if has_other_window_on_source_desktop {
                 ResolvedDesktopMove::CreateAndMove
+            } else if is_pinned {
+                ResolvedDesktopMove::MoveToExisting {
+                    target_idx: anchor_idx,
+                }
+            } else {
+                ResolvedDesktopMove::AlreadyAtLastSingleTab
             }
         }
         MoveDesktopAction::Index(target_idx) => {
@@ -9005,55 +9030,63 @@ mod tests {
 
     #[test]
     fn resolve_desktop_move_target_handles_boundaries_auto_create_direct_index_and_pinned() {
-        // First desktop: Previous stops cleanly; Next advances to Desktop 2
+        // First desktop: Previous stops cleanly; Next advances to Desktop 2 even if solo tab
         assert_eq!(
-            resolve_desktop_move_target(MoveDesktopAction::Previous, Some(0), false, 3, 0),
+            resolve_desktop_move_target(MoveDesktopAction::Previous, Some(0), false, 3, 0, false),
             ResolvedDesktopMove::AlreadyAtFirst
         );
         assert_eq!(
-            resolve_desktop_move_target(MoveDesktopAction::Next, Some(0), false, 3, 0),
+            resolve_desktop_move_target(MoveDesktopAction::Next, Some(0), false, 3, 0, false),
             ResolvedDesktopMove::MoveToExisting { target_idx: 1 }
         );
 
-        // Last desktop: Next requests auto-creating a brand-new desktop
+        // Last desktop: Next auto-creates ONLY when current desktop has multiple tabs
         assert_eq!(
-            resolve_desktop_move_target(MoveDesktopAction::Next, Some(2), false, 3, 2),
+            resolve_desktop_move_target(MoveDesktopAction::Next, Some(2), false, 3, 2, true),
             ResolvedDesktopMove::CreateAndMove
         );
         assert_eq!(
-            resolve_desktop_move_target(MoveDesktopAction::Previous, Some(2), false, 3, 2),
+            resolve_desktop_move_target(MoveDesktopAction::Next, Some(2), false, 3, 2, false),
+            ResolvedDesktopMove::AlreadyAtLastSingleTab
+        );
+        assert_eq!(
+            resolve_desktop_move_target(MoveDesktopAction::Previous, Some(2), false, 3, 2, false),
             ResolvedDesktopMove::MoveToExisting { target_idx: 1 }
         );
 
         // Direct 1..9 index move
         assert_eq!(
-            resolve_desktop_move_target(MoveDesktopAction::Index(1), Some(0), false, 3, 0),
+            resolve_desktop_move_target(MoveDesktopAction::Index(1), Some(0), false, 3, 0, true),
             ResolvedDesktopMove::MoveToExisting { target_idx: 1 }
         );
         assert_eq!(
-            resolve_desktop_move_target(MoveDesktopAction::Index(1), Some(1), false, 3, 1),
+            resolve_desktop_move_target(MoveDesktopAction::Index(1), Some(1), false, 3, 1, true),
             ResolvedDesktopMove::AlreadyOnTarget { idx: 1 }
         );
         assert_eq!(
-            resolve_desktop_move_target(MoveDesktopAction::Index(4), Some(0), false, 3, 0),
+            resolve_desktop_move_target(MoveDesktopAction::Index(4), Some(0), false, 3, 0, true),
             ResolvedDesktopMove::OutOfRange {
                 requested_1based: 5,
                 total: 3,
             }
         );
 
-        // Pinned window: can be unpinned onto current/target desktop via direct index or Previous/Next
+        // Pinned window: creates new desktop only when last desktop has other windows; otherwise lands on last desktop
         assert_eq!(
-            resolve_desktop_move_target(MoveDesktopAction::Index(0), None, true, 3, 0),
+            resolve_desktop_move_target(MoveDesktopAction::Index(0), None, true, 3, 0, false),
             ResolvedDesktopMove::MoveToExisting { target_idx: 0 }
         );
         assert_eq!(
-            resolve_desktop_move_target(MoveDesktopAction::Previous, None, true, 3, 0),
+            resolve_desktop_move_target(MoveDesktopAction::Previous, None, true, 3, 0, false),
             ResolvedDesktopMove::MoveToExisting { target_idx: 0 }
         );
         assert_eq!(
-            resolve_desktop_move_target(MoveDesktopAction::Next, None, true, 3, 2),
+            resolve_desktop_move_target(MoveDesktopAction::Next, None, true, 3, 2, true),
             ResolvedDesktopMove::CreateAndMove
+        );
+        assert_eq!(
+            resolve_desktop_move_target(MoveDesktopAction::Next, None, true, 3, 2, false),
+            ResolvedDesktopMove::MoveToExisting { target_idx: 2 }
         );
     }
 }
