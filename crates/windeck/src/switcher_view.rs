@@ -16,8 +16,8 @@ use gpui::{
 use smallvec::smallvec;
 use win_platform::{
     CapturedBitmap, DesktopId, DwmTransitionSuppressGuard, ForceQuitOutcome, HoldNavDirection,
-    IconBgra, MonitorInfo, PreRestoreResult, ReleaseInfo, ShellHost, SingleInstanceGuard,
-    ThumbnailHostWindow, VirtualDesktopClient, VirtualDesktopInfo, WindowInfo,
+    IconBgra, MonitorInfo, PreRestoreResult, PrimaryModifier, ReleaseInfo, ShellHost,
+    SingleInstanceGuard, ThumbnailHostWindow, VirtualDesktopClient, VirtualDesktopInfo, WindowInfo,
     activate_window_foreground, capture_screen_rect_bgra, capture_window_bgra,
     configure_borderless_immersive, enumerate_monitors, enumerate_windows, extract_window_icon,
     force_quit_window, hide_layered_overlay, inspect_layered_overlay_state, pin_layered_z_order,
@@ -36,7 +36,9 @@ use crate::animation::{
     exp_damp, lerp_bounds, resolve_exit_target_phys_rect, sample_cross_desktop_window,
     scale_rect_around_center,
 };
-use crate::config::{AppConfig, LabelPosition, PreviewFit, append_log};
+use crate::config::{
+    AppConfig, LabelPosition, MoveDesktopAction, MoveDesktopModifier, PreviewFit, append_log,
+};
 use crate::genie::{
     FunnelMouth, GENIE_CAPTURE_MAX_W, GENIE_STRIP_COUNT, GenieDirection, GeniePhase,
     GenieTransferAnim, RectF, bitmap_to_full_render_image, bitmap_to_strip_render_image,
@@ -4422,6 +4424,25 @@ impl SwitcherView {
             return;
         }
 
+        // Quick move selected window across native virtual desktops (default: Alt + ↑/↓, Alt + 1..9)
+        if let Some(move_action) = self.config.move_desktop_modifier.match_move_action(
+            key,
+            mods.control,
+            mods.alt,
+            mods.shift,
+        ) {
+            let conflicts_with_held_primary = matches!(
+                (self.config.move_desktop_modifier, held_primary),
+                (MoveDesktopModifier::Alt, Some(PrimaryModifier::Alt))
+                    | (MoveDesktopModifier::Ctrl, Some(PrimaryModifier::Ctrl))
+            );
+            if !conflicts_with_held_primary || matches!(move_action, MoveDesktopAction::Index(_)) {
+                cx.stop_propagation();
+                self.move_selected_window_by_hotkey(move_action, event.is_held, window, cx);
+                return;
+            }
+        }
+
         match key {
             "enter" | "space" => {
                 cx.stop_propagation();
@@ -4639,14 +4660,16 @@ impl SwitcherView {
             }
             "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
                 if let Ok(n) = key.parse::<usize>() {
-                    if mods.control {
+                    if mods.control && !mods.alt && !mods.shift {
                         if let Some(s) = self.virtual_spaces.spaces().get(n - 1) {
                             let sid = s.id;
                             self.set_view_filter(ViewFilter::VirtualSpace(sid), window, cx);
                         }
-                    } else if let Some(d) = self.desktops.get(n - 1) {
-                        let did = d.id;
-                        self.set_view_filter(ViewFilter::NativeDesktop(did), window, cx);
+                    } else if !mods.control && !mods.alt && !mods.shift {
+                        if let Some(d) = self.desktops.get(n - 1) {
+                            let did = d.id;
+                            self.set_view_filter(ViewFilter::NativeDesktop(did), window, cx);
+                        }
                     }
                 }
             }
@@ -4936,6 +4959,7 @@ impl SwitcherView {
                 pill_pulse_desktop: None,
                 pill_pulse_space: None,
                 is_virtual_space_transfer: false,
+                keep_source_slot_visible: false,
             });
         } else {
             self.queue_drop_image(drag.full_image);
@@ -5214,6 +5238,7 @@ impl SwitcherView {
             pill_pulse_desktop: None,
             pill_pulse_space: Some(space_id),
             is_virtual_space_transfer: true,
+            keep_source_slot_visible: true,
         });
         cx.notify();
     }
@@ -5461,6 +5486,362 @@ impl SwitcherView {
             pill_pulse_desktop: Some(target_did),
             pill_pulse_space: None,
             is_virtual_space_transfer: false,
+            keep_source_slot_visible: false,
+        });
+        cx.notify();
+    }
+
+    fn flush_genie_anim_now(&mut self) {
+        let Some(anim) = self.genie_anim.take() else {
+            return;
+        };
+        if matches!(anim.phase, GeniePhase::SuckIn { .. }) && anim.auto_switch_filter {
+            if let Some(target_did) = anim.target_desktop_id {
+                self.view_filter = ViewFilter::NativeDesktop(target_did);
+                self.scroll_y = 0.0;
+                self.scroll_target_y = 0.0;
+                self.scroll_last_tick = None;
+                self.tab_anim = None;
+                self.reflow_anim = None;
+                self.selection_anim = None;
+                self.rebuild_visible_groups(false);
+                if let Some(idx) = self.flat_hwnds.iter().position(|&h| h == anim.hwnd) {
+                    self.selected_flat = idx;
+                }
+                self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
+            }
+        }
+        for img in anim.into_images() {
+            self.queue_drop_image(img);
+        }
+        self.thumbs.borrow_mut().retain_targets(&self.flat_hwnds);
+    }
+
+    fn desktop_display_name(&self, idx: usize) -> String {
+        self.desktops
+            .get(idx)
+            .and_then(|d| d.custom_name.clone())
+            .unwrap_or_else(|| format!("桌面 {}", idx + 1))
+    }
+
+    fn move_selected_window_by_hotkey(
+        &mut self,
+        action: MoveDesktopAction,
+        is_held: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Flush any in-flight Genie animation first so rapid repeated presses (`Alt+↓`, `Alt+↓`)
+        // smoothly advance the same window across multiple desktops without dropping keypresses.
+        self.flush_genie_anim_now();
+        self.selection_anim = None;
+
+        let Some(&hwnd) = self.flat_hwnds.get(self.selected_flat) else {
+            return;
+        };
+        if self.desktops.is_empty() {
+            return;
+        }
+        let Some(win) = self.all_windows.iter().find(|w| w.hwnd == hwnd).cloned() else {
+            return;
+        };
+
+        self.disarm_hold_mode();
+        self.hovered_flat = None;
+
+        let fallback_active_idx = match self.view_filter {
+            ViewFilter::NativeDesktop(did) => self
+                .desktops
+                .iter()
+                .position(|d| d.id == did)
+                .unwrap_or(0),
+            _ => self
+                .desktops
+                .iter()
+                .position(|d| d.is_current)
+                .unwrap_or(0),
+        };
+        let current_idx = win
+            .desktop_id
+            .and_then(|did| self.desktops.iter().position(|d| d.id == did))
+            .or(win.desktop_index);
+
+        let resolution = resolve_desktop_move_target(
+            action,
+            current_idx,
+            win.is_pinned,
+            self.desktops.len(),
+            fallback_active_idx,
+        );
+
+        let create_new = match resolution {
+            ResolvedDesktopMove::AlreadyAtFirst => {
+                self.transient_toast =
+                    Some((SharedString::from("已在第一个桌面"), Instant::now()));
+                cx.notify();
+                return;
+            }
+            ResolvedDesktopMove::AlreadyOnTarget { idx } => {
+                let name = self.desktop_display_name(idx);
+                self.transient_toast =
+                    Some((SharedString::from(format!("已在「{name}」")), Instant::now()));
+                cx.notify();
+                return;
+            }
+            ResolvedDesktopMove::OutOfRange {
+                requested_1based,
+                total,
+            } => {
+                self.transient_toast = Some((
+                    SharedString::from(format!("桌面 {requested_1based} 不存在（当前共 {total} 个）")),
+                    Instant::now(),
+                ));
+                cx.notify();
+                return;
+            }
+            ResolvedDesktopMove::CreateAndMove => {
+                // Guard against key-repeat accidentally spawning dozens of empty desktops.
+                if is_held {
+                    return;
+                }
+                true
+            }
+            ResolvedDesktopMove::MoveToExisting { .. } => false,
+        };
+
+        let accent_color = self
+            .groups
+            .iter()
+            .flat_map(|g| g.cards.iter())
+            .find(|c| c.info.hwnd == hwnd)
+            .map(|c| c.accent_color)
+            .unwrap_or(0x0A84FF);
+
+        // Snapshot source card bounds, live pixels, and sibling positions BEFORE mutating desktops.
+        let source_bounds = self
+            .last_thumb_bounds
+            .borrow()
+            .get(&hwnd)
+            .copied()
+            .or_else(|| self.resolve_card_thumb_bounds(hwnd, self.scroll_y));
+        let prev_sibling_bounds = self.snapshot_current_thumb_bounds();
+        let add_pill_snapshot = *self.add_pill_bounds.borrow();
+        let animate = self.config.transition_effect.is_enabled();
+        let captured_for_genie = if animate {
+            source_bounds.map(|sb| {
+                (
+                    RectF::from_bounds(sb),
+                    self.capture_card_bitmap_for_drag(hwnd, sb, accent_color, window),
+                )
+            })
+        } else {
+            None
+        };
+
+        // Guard against Explorer transient focus bump during virtual desktop COM mutation.
+        self.shown_at = Some(Instant::now());
+
+        let (target_did, created_new) = if create_new {
+            match self.vdm.create_desktop() {
+                Ok(new_id) => {
+                    if let Ok(fresh_desktops) = self.vdm.get_desktops() {
+                        self.desktops = fresh_desktops;
+                    }
+                    (new_id, true)
+                }
+                Err(e) => {
+                    self.transient_toast = Some((
+                        SharedString::from(format!("新建桌面失败：{e}")),
+                        Instant::now(),
+                    ));
+                    append_log(&format!("HOTKEY CREATE_DESKTOP ERROR: {e:#}"));
+                    cx.notify();
+                    return;
+                }
+            }
+        } else if let ResolvedDesktopMove::MoveToExisting { target_idx } = resolution {
+            (self.desktops[target_idx].id, false)
+        } else {
+            return;
+        };
+
+        if let Err(e) = self.vdm.move_window_to_desktop(hwnd, target_did) {
+            self.transient_toast = Some((
+                SharedString::from(format!("移动窗口失败：{e}")),
+                Instant::now(),
+            ));
+            append_log(&format!(
+                "HOTKEY MOVE_WINDOW ERROR hwnd=0x{:X} target={target_did}: {e:#}",
+                hwnd
+            ));
+            cx.notify();
+            return;
+        }
+
+        let target_desktop_idx = self.desktops.iter().position(|d| d.id == target_did);
+        for w in &mut self.all_windows {
+            if w.hwnd == hwnd {
+                w.desktop_id = Some(target_did);
+                w.desktop_index = target_desktop_idx;
+                w.is_pinned = false;
+            }
+        }
+        self.window_order.sync(
+            &self.all_windows,
+            &self.desktops,
+            is_window_alive_with_pid,
+        );
+
+        let target_label = target_desktop_idx
+            .map(|idx| self.desktop_display_name(idx))
+            .unwrap_or_else(|| "新桌面".to_string());
+        let in_virtual_space = matches!(self.view_filter, ViewFilter::VirtualSpace(_));
+        let auto_switch_filter =
+            matches!(self.view_filter, ViewFilter::NativeDesktop(fid) if fid != target_did);
+
+        if created_new {
+            self.transient_toast = Some((
+                SharedString::from(format!("已新建「{target_label}」并移入")),
+                Instant::now(),
+            ));
+        } else if in_virtual_space || !animate {
+            self.transient_toast = Some((
+                SharedString::from(format!("已移至「{target_label}」")),
+                Instant::now(),
+            ));
+        }
+
+        append_log(&format!(
+            "HOTKEY_MOVE hwnd=0x{:X} action={action:?} target={target_did} created_new={created_new} auto_switch={auto_switch_filter}",
+            hwnd
+        ));
+
+        let Some((from_rect, captured)) = captured_for_genie else {
+            if auto_switch_filter {
+                self.view_filter = ViewFilter::NativeDesktop(target_did);
+                self.scroll_y = 0.0;
+                self.scroll_target_y = 0.0;
+                self.scroll_last_tick = None;
+            }
+            self.rebuild_visible_groups(false);
+            if let Some(idx) = self.flat_hwnds.iter().position(|&h| h == hwnd) {
+                self.selected_flat = idx;
+                self.ensure_selected_visible();
+            }
+            self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
+            self.clamp_scroll();
+            window.refresh();
+            cx.notify();
+            return;
+        };
+
+        let Some(full_image) = bitmap_to_full_render_image(&captured) else {
+            if auto_switch_filter {
+                self.view_filter = ViewFilter::NativeDesktop(target_did);
+                self.scroll_y = 0.0;
+                self.scroll_target_y = 0.0;
+                self.scroll_last_tick = None;
+            }
+            self.rebuild_visible_groups(false);
+            if let Some(idx) = self.flat_hwnds.iter().position(|&h| h == hwnd) {
+                self.selected_flat = idx;
+                self.ensure_selected_visible();
+            }
+            self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
+            self.clamp_scroll();
+            window.refresh();
+            cx.notify();
+            return;
+        };
+
+        self.rebuild_visible_groups(false);
+        if !auto_switch_filter {
+            if let Some(idx) = self.flat_hwnds.iter().position(|&h| h == hwnd) {
+                self.selected_flat = idx;
+                self.ensure_selected_visible();
+            }
+        }
+        self.clamp_scroll();
+
+        if !in_virtual_space {
+            {
+                let mut thumbs = self.thumbs.borrow_mut();
+                thumbs.ensure_targets(&self.flat_hwnds);
+                thumbs.hide_thumbnail(hwnd);
+            }
+
+            let mut reflow_from = prev_sibling_bounds;
+            reflow_from.remove(&hwnd);
+            if !reflow_from.is_empty() {
+                let profile = TransitionProfile::from_effect(self.config.transition_effect);
+                self.reflow_anim = Some(ReflowAnim {
+                    started_at: Instant::now(),
+                    duration: Duration::from_millis(200),
+                    use_spring: profile.use_spring,
+                    from_bounds: reflow_from,
+                });
+            }
+        }
+
+        let pill_mouth = || {
+            let pill_bounds = if created_new {
+                add_pill_snapshot
+                    .or_else(|| self.pill_bounds.borrow().get(&target_did).copied())
+            } else {
+                self.pill_bounds.borrow().get(&target_did).copied()
+            };
+            pill_bounds
+                .map(FunnelMouth::from_top_pill)
+                .unwrap_or(FunnelMouth {
+                    left: from_rect.center_x() - 18.0,
+                    right: from_rect.center_x() + 18.0,
+                    y: TOP_SPACES_BAR_H - 12.0,
+                })
+        };
+
+        let (mouth, suck_out_from_pill, play_suck_out, suck_in_duration) = if auto_switch_filter {
+            (pill_mouth(), true, true, Duration::from_millis(210))
+        } else if in_virtual_space {
+            (pill_mouth(), true, false, Duration::from_millis(230))
+        } else if let Some(dest_slot_now) =
+            self.resolve_card_thumb_bounds(hwnd, self.scroll_target_y)
+        {
+            let dest_rect = RectF::from_bounds(dest_slot_now);
+            (
+                FunnelMouth::for_group_preview_box(from_rect, dest_rect),
+                false,
+                true,
+                Duration::from_millis(190),
+            )
+        } else {
+            (pill_mouth(), true, false, Duration::from_millis(230))
+        };
+
+        let (strip_image, num_strips) =
+            match bitmap_to_strip_render_image(&captured, GENIE_STRIP_COUNT) {
+                Some((img, count)) => (Some(img), count),
+                None => (None, 0),
+            };
+
+        self.genie_anim = Some(GenieTransferAnim {
+            hwnd,
+            target_desktop_id: Some(target_did),
+            auto_switch_filter,
+            play_suck_out,
+            suck_out_from_pill,
+            phase: GeniePhase::SuckIn {
+                from_rect,
+                mouth,
+                duration: suck_in_duration,
+            },
+            phase_started_at: Instant::now(),
+            full_image,
+            strip_image,
+            num_strips,
+            pill_pulse_desktop: Some(target_did),
+            pill_pulse_space: None,
+            is_virtual_space_transfer: false,
+            keep_source_slot_visible: in_virtual_space,
         });
         cx.notify();
     }
@@ -6076,10 +6457,10 @@ impl Render for SwitcherView {
         let genie_hides_slot = self
             .genie_anim
             .as_ref()
-            .is_some_and(|g| !g.is_virtual_space_transfer);
+            .is_some_and(|g| !g.keep_source_slot_visible);
         let genie_is_transfer = self.genie_anim.as_ref().is_some_and(|g| {
             !matches!(g.phase, GeniePhase::CancelReturn { .. })
-                && !g.is_virtual_space_transfer
+                && !g.keep_source_slot_visible
                 && g.play_suck_out
         });
         let genie_suck_out_t = self.genie_anim.as_ref().and_then(|g| {
@@ -8423,6 +8804,74 @@ impl Render for SwitcherView {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResolvedDesktopMove {
+    MoveToExisting { target_idx: usize },
+    CreateAndMove,
+    AlreadyAtFirst,
+    AlreadyOnTarget { idx: usize },
+    OutOfRange { requested_1based: usize, total: usize },
+}
+
+fn resolve_desktop_move_target(
+    action: MoveDesktopAction,
+    current_idx: Option<usize>,
+    is_pinned: bool,
+    desktop_count: usize,
+    fallback_active_idx: usize,
+) -> ResolvedDesktopMove {
+    if desktop_count == 0 {
+        return ResolvedDesktopMove::OutOfRange {
+            requested_1based: match action {
+                MoveDesktopAction::Index(idx) => idx + 1,
+                _ => 1,
+            },
+            total: 0,
+        };
+    }
+
+    let anchor_idx = current_idx
+        .unwrap_or(fallback_active_idx)
+        .min(desktop_count - 1);
+
+    match action {
+        MoveDesktopAction::Previous => {
+            if is_pinned {
+                ResolvedDesktopMove::MoveToExisting {
+                    target_idx: anchor_idx.saturating_sub(1),
+                }
+            } else if anchor_idx == 0 {
+                ResolvedDesktopMove::AlreadyAtFirst
+            } else {
+                ResolvedDesktopMove::MoveToExisting {
+                    target_idx: anchor_idx - 1,
+                }
+            }
+        }
+        MoveDesktopAction::Next => {
+            if anchor_idx + 1 < desktop_count {
+                ResolvedDesktopMove::MoveToExisting {
+                    target_idx: anchor_idx + 1,
+                }
+            } else {
+                ResolvedDesktopMove::CreateAndMove
+            }
+        }
+        MoveDesktopAction::Index(target_idx) => {
+            if target_idx >= desktop_count {
+                ResolvedDesktopMove::OutOfRange {
+                    requested_1based: target_idx + 1,
+                    total: desktop_count,
+                }
+            } else if !is_pinned && current_idx == Some(target_idx) {
+                ResolvedDesktopMove::AlreadyOnTarget { idx: target_idx }
+            } else {
+                ResolvedDesktopMove::MoveToExisting { target_idx }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use windows::Win32::UI::WindowsAndMessaging::{GetDesktopWindow, GetWindowThreadProcessId};
@@ -8552,5 +9001,59 @@ mod tests {
         };
         assert!(bounds_contains_padded(pill, point(px(532.0), px(14.0)), 4.0, 14.0));
         assert!(!bounds_contains_padded(pill, point(px(532.0), px(80.0)), 4.0, 14.0));
+    }
+
+    #[test]
+    fn resolve_desktop_move_target_handles_boundaries_auto_create_direct_index_and_pinned() {
+        // First desktop: Previous stops cleanly; Next advances to Desktop 2
+        assert_eq!(
+            resolve_desktop_move_target(MoveDesktopAction::Previous, Some(0), false, 3, 0),
+            ResolvedDesktopMove::AlreadyAtFirst
+        );
+        assert_eq!(
+            resolve_desktop_move_target(MoveDesktopAction::Next, Some(0), false, 3, 0),
+            ResolvedDesktopMove::MoveToExisting { target_idx: 1 }
+        );
+
+        // Last desktop: Next requests auto-creating a brand-new desktop
+        assert_eq!(
+            resolve_desktop_move_target(MoveDesktopAction::Next, Some(2), false, 3, 2),
+            ResolvedDesktopMove::CreateAndMove
+        );
+        assert_eq!(
+            resolve_desktop_move_target(MoveDesktopAction::Previous, Some(2), false, 3, 2),
+            ResolvedDesktopMove::MoveToExisting { target_idx: 1 }
+        );
+
+        // Direct 1..9 index move
+        assert_eq!(
+            resolve_desktop_move_target(MoveDesktopAction::Index(1), Some(0), false, 3, 0),
+            ResolvedDesktopMove::MoveToExisting { target_idx: 1 }
+        );
+        assert_eq!(
+            resolve_desktop_move_target(MoveDesktopAction::Index(1), Some(1), false, 3, 1),
+            ResolvedDesktopMove::AlreadyOnTarget { idx: 1 }
+        );
+        assert_eq!(
+            resolve_desktop_move_target(MoveDesktopAction::Index(4), Some(0), false, 3, 0),
+            ResolvedDesktopMove::OutOfRange {
+                requested_1based: 5,
+                total: 3,
+            }
+        );
+
+        // Pinned window: can be unpinned onto current/target desktop via direct index or Previous/Next
+        assert_eq!(
+            resolve_desktop_move_target(MoveDesktopAction::Index(0), None, true, 3, 0),
+            ResolvedDesktopMove::MoveToExisting { target_idx: 0 }
+        );
+        assert_eq!(
+            resolve_desktop_move_target(MoveDesktopAction::Previous, None, true, 3, 0),
+            ResolvedDesktopMove::MoveToExisting { target_idx: 0 }
+        );
+        assert_eq!(
+            resolve_desktop_move_target(MoveDesktopAction::Next, None, true, 3, 2),
+            ResolvedDesktopMove::CreateAndMove
+        );
     }
 }

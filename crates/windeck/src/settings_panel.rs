@@ -12,13 +12,14 @@ use win_platform::{
 };
 
 use crate::config::{
-    AppConfig, ColumnsConfig, LabelPosition, LocalShortcut, PreviewFit, append_log, config_dir,
+    AppConfig, ColumnsConfig, LabelPosition, LocalShortcut, MoveDesktopModifier, PreviewFit,
+    append_log, config_dir,
 };
 use crate::switcher_view::SwitcherView;
 use crate::update_dialog::UpdateStatus;
 
 const SHEET_W: f32 = 500.0;
-const SHEET_CONTENT_EST_H: f32 = 880.0;
+const SHEET_CONTENT_EST_H: f32 = 925.0;
 
 /// Minimalist 3-slider icon matching the hairline weight of the top Spaces bar.
 fn sliders_icon() -> Div {
@@ -492,6 +493,7 @@ impl SwitcherView {
         let recording = self.recording_hotkey_letter;
         let recording_fq = self.recording_force_quit_key;
         let fq_label = self.config.parsed_force_quit_key().canonical_label();
+        let move_mod = self.config.move_desktop_modifier;
         let autostart = self.autostart_enabled;
         let label_pos = self.config.label_position;
         let preview_fit = self.config.preview_fit;
@@ -743,6 +745,74 @@ impl SwitcherView {
                         fq_label
                     }),
             );
+
+        // Move-window-to-desktop shortcut modifier: [ Alt | Ctrl | Shift | 关闭 ]  [ ↑↓ · 1-9 ]
+        let move_desktop_control = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                pill_group()
+                    .child(glass_pill(
+                        "md-mod-alt",
+                        "Alt",
+                        move_mod == MoveDesktopModifier::Alt,
+                        cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.config.move_desktop_modifier = MoveDesktopModifier::Alt;
+                            this.apply_visual_and_save(window, cx);
+                        }),
+                    ))
+                    .child(glass_pill(
+                        "md-mod-ctrl",
+                        "Ctrl",
+                        move_mod == MoveDesktopModifier::Ctrl,
+                        cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.config.move_desktop_modifier = MoveDesktopModifier::Ctrl;
+                            this.apply_visual_and_save(window, cx);
+                        }),
+                    ))
+                    .child(glass_pill(
+                        "md-mod-shift",
+                        "Shift",
+                        move_mod == MoveDesktopModifier::Shift,
+                        cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.config.move_desktop_modifier = MoveDesktopModifier::Shift;
+                            this.apply_visual_and_save(window, cx);
+                        }),
+                    ))
+                    .child(glass_pill(
+                        "md-mod-off",
+                        "关闭",
+                        move_mod == MoveDesktopModifier::Off,
+                        cx.listener(|this, _, window, cx| {
+                            cx.stop_propagation();
+                            this.config.move_desktop_modifier = MoveDesktopModifier::Off;
+                            this.apply_visual_and_save(window, cx);
+                        }),
+                    )),
+            )
+            .when(move_mod != MoveDesktopModifier::Off, |el| {
+                el.child(
+                    div()
+                        .h(px(27.0))
+                        .px(px(10.0))
+                        .rounded_full()
+                        .bg(rgba(0xFFFFFF12))
+                        .border_1()
+                        .border_color(rgba(0xFFFFFF16))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_xs()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(rgba(0xFFFFFFB8))
+                        .child("↑↓ · 1-9"),
+                )
+            });
 
         // Label placement row
         let label_control = pill_group()
@@ -1171,6 +1241,8 @@ impl SwitcherView {
                                     })
                                     .child(row_divider())
                                     .child(setting_row("强制退出", force_quit_control))
+                                    .child(row_divider())
+                                    .child(setting_row("移动桌面", move_desktop_control))
                                     .child(row_divider())
                                     .child(setting_row("标签位置", label_control))
                                     .child(row_divider())

@@ -238,10 +238,117 @@ impl LocalShortcut {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveDesktopAction {
+    Previous,
+    Next,
+    /// Zero-based native virtual desktop index (`0..=8` for keys `1..=9`).
+    Index(usize),
+}
+
+/// Modifier used inside WinDeck overlay to move the selected window across native virtual desktops
+/// (`<Mod> + ↑/↓` for previous/next desktop, `<Mod> + 1..9` for direct jump).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoveDesktopModifier {
+    Alt,
+    Ctrl,
+    Shift,
+    Off,
+}
+
+impl MoveDesktopModifier {
+    pub fn parse(val: &str) -> Option<Self> {
+        match val.trim().to_ascii_lowercase().as_str() {
+            "alt" => Some(Self::Alt),
+            "ctrl" | "control" => Some(Self::Ctrl),
+            "shift" => Some(Self::Shift),
+            "off" | "none" | "false" | "disabled" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    pub fn as_config_str(self) -> &'static str {
+        match self {
+            Self::Alt => "alt",
+            Self::Ctrl => "ctrl",
+            Self::Shift => "shift",
+            Self::Off => "off",
+        }
+    }
+
+    pub fn match_move_action(
+        self,
+        key: &str,
+        ctrl: bool,
+        alt: bool,
+        shift: bool,
+    ) -> Option<MoveDesktopAction> {
+        let parse_digit = |k: &str| -> Option<MoveDesktopAction> {
+            let b = k.as_bytes();
+            if b.len() == 1 && (b'1'..=b'9').contains(&b[0]) {
+                Some(MoveDesktopAction::Index((b[0] - b'1') as usize))
+            } else {
+                None
+            }
+        };
+
+        match self {
+            Self::Off => None,
+            Self::Alt => {
+                if !alt || ctrl || shift {
+                    return None;
+                }
+                match key {
+                    "up" => Some(MoveDesktopAction::Previous),
+                    "down" => Some(MoveDesktopAction::Next),
+                    other => parse_digit(other),
+                }
+            }
+            Self::Ctrl => {
+                if !ctrl || alt || shift {
+                    return None;
+                }
+                match key {
+                    "up" => Some(MoveDesktopAction::Previous),
+                    "down" => Some(MoveDesktopAction::Next),
+                    other => parse_digit(other),
+                }
+            }
+            Self::Shift => {
+                if ctrl || alt {
+                    return None;
+                }
+                if shift {
+                    return match key {
+                        "up" => Some(MoveDesktopAction::Previous),
+                        "down" => Some(MoveDesktopAction::Next),
+                        other => parse_digit(other),
+                    };
+                }
+                // On Windows, GPUI translates Shift+1..9 into shifted symbols ("!".."(")
+                // and clears `modifiers.shift`.
+                match key {
+                    "!" => Some(MoveDesktopAction::Index(0)),
+                    "@" => Some(MoveDesktopAction::Index(1)),
+                    "#" => Some(MoveDesktopAction::Index(2)),
+                    "$" => Some(MoveDesktopAction::Index(3)),
+                    "%" => Some(MoveDesktopAction::Index(4)),
+                    "^" => Some(MoveDesktopAction::Index(5)),
+                    "&" => Some(MoveDesktopAction::Index(6)),
+                    "*" => Some(MoveDesktopAction::Index(7)),
+                    "(" => Some(MoveDesktopAction::Index(8)),
+                    _ => None,
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AppConfig {
     pub hotkey: String,
     pub force_quit_key: String,
+    pub move_desktop_modifier: MoveDesktopModifier,
     pub columns: ColumnsConfig,
     pub background: BackdropStyle,
     pub blur_opacity: f32,
@@ -266,6 +373,7 @@ impl Default for AppConfig {
         Self {
             hotkey: "Alt+Q".to_string(),
             force_quit_key: "Delete".to_string(),
+            move_desktop_modifier: MoveDesktopModifier::Alt,
             columns: ColumnsConfig::Auto,
             background: BackdropStyle::Blurred,
             blur_opacity: 0.28,
@@ -295,6 +403,9 @@ hotkey = "Alt+Q"
 
 # 强制退出指定窗口快捷键（在切换器内选中或悬停目标窗口后按下，例如: "Delete", "Shift+Delete", "Ctrl+W", "Alt+F4"）
 force_quit_key = "Delete"
+
+# 快捷移动窗口到其他原生虚拟桌面修饰键（配合 ↑/↓ 移动至上/下桌面，1~9 直达指定桌面）: "alt" | "ctrl" | "shift" | "off"
+move_desktop_modifier = "alt"
 
 # 沉浸式无边框全屏（仿 macOS Mission Control 调度中心）: true = 全屏无边框 | false = 居中浮层
 immersive = true
@@ -421,6 +532,11 @@ impl AppConfig {
             match key.as_str() {
                 "hotkey" if !val.is_empty() => cfg.hotkey = val.to_string(),
                 "force_quit_key" if !val.is_empty() => cfg.force_quit_key = val.to_string(),
+                "move_desktop_modifier" => {
+                    if let Some(m) = MoveDesktopModifier::parse(val) {
+                        cfg.move_desktop_modifier = m;
+                    }
+                }
                 "immersive" => {
                     if let Ok(b) = val.parse::<bool>() {
                         cfg.immersive = b;
@@ -563,6 +679,9 @@ hotkey = "{hotkey}"
 # 强制退出指定窗口快捷键（选中或悬停目标窗口后按下，如 "Delete", "Shift+Delete", "Ctrl+W", "Alt+F4"）
 force_quit_key = "{force_quit_key}"
 
+# 快捷移动窗口到其他原生虚拟桌面修饰键（配合 ↑/↓ 移动至上/下桌面，1~9 直达指定桌面）: "alt" | "ctrl" | "shift" | "off"
+move_desktop_modifier = "{move_desktop_modifier}"
+
 # 沉浸式无边框全屏（仿 macOS Mission Control 调度中心）: true = 全屏无边框 | false = 居中浮层
 immersive = {immersive}
 
@@ -608,6 +727,7 @@ win_arrow_switch_desktop = {win_arrow_switch_desktop}
 "#,
             hotkey = self.parsed_hotkey().canonical_label(),
             force_quit_key = self.parsed_force_quit_key().canonical_label(),
+            move_desktop_modifier = self.move_desktop_modifier.as_config_str(),
             immersive = self.immersive,
             preview_width = self.preview_width.round() as i32,
             preview_height = self.preview_height.round() as i32,
@@ -742,6 +862,63 @@ mod tests {
         assert_eq!(
             round_tripped.win_arrow_switch_desktop,
             cfg.win_arrow_switch_desktop
+        );
+    }
+
+    #[test]
+    fn move_desktop_modifier_parses_round_trips_and_matches_keys() {
+        assert_eq!(AppConfig::default().move_desktop_modifier, MoveDesktopModifier::Alt);
+        assert_eq!(MoveDesktopModifier::parse("ctrl"), Some(MoveDesktopModifier::Ctrl));
+        assert_eq!(MoveDesktopModifier::parse("shift"), Some(MoveDesktopModifier::Shift));
+        assert_eq!(MoveDesktopModifier::parse("off"), Some(MoveDesktopModifier::Off));
+
+        let custom = AppConfig::parse("move_desktop_modifier = \"shift\"\n");
+        assert_eq!(custom.move_desktop_modifier, MoveDesktopModifier::Shift);
+        assert_eq!(
+            AppConfig::parse(&custom.to_toml()).move_desktop_modifier,
+            MoveDesktopModifier::Shift
+        );
+
+        // Alt mode
+        assert_eq!(
+            MoveDesktopModifier::Alt.match_move_action("up", false, true, false),
+            Some(MoveDesktopAction::Previous)
+        );
+        assert_eq!(
+            MoveDesktopModifier::Alt.match_move_action("down", false, true, false),
+            Some(MoveDesktopAction::Next)
+        );
+        assert_eq!(
+            MoveDesktopModifier::Alt.match_move_action("3", false, true, false),
+            Some(MoveDesktopAction::Index(2))
+        );
+        assert_eq!(
+            MoveDesktopModifier::Alt.match_move_action("down", true, true, false),
+            None
+        );
+
+        // Shift mode handles both explicit Shift+Up/Down and Windows GPUI shifted symbols ("!".."(")
+        assert_eq!(
+            MoveDesktopModifier::Shift.match_move_action("up", false, false, true),
+            Some(MoveDesktopAction::Previous)
+        );
+        assert_eq!(
+            MoveDesktopModifier::Shift.match_move_action("!", false, false, false),
+            Some(MoveDesktopAction::Index(0))
+        );
+        assert_eq!(
+            MoveDesktopModifier::Shift.match_move_action("(", false, false, false),
+            Some(MoveDesktopAction::Index(8))
+        );
+        assert_eq!(
+            MoveDesktopModifier::Shift.match_move_action("tab", false, false, true),
+            None
+        );
+
+        // Off mode disables all move shortcuts
+        assert_eq!(
+            MoveDesktopModifier::Off.match_move_action("down", false, true, false),
+            None
         );
     }
 }

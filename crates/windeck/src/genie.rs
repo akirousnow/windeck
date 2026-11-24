@@ -441,6 +441,7 @@ pub struct GenieTransferAnim {
     pub pill_pulse_desktop: Option<DesktopId>,
     pub pill_pulse_space: Option<SpaceId>,
     pub is_virtual_space_transfer: bool,
+    pub keep_source_slot_visible: bool,
 }
 
 impl GenieTransferAnim {
