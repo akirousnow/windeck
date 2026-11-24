@@ -12,8 +12,9 @@ pub mod window_switch;
 pub use dwm_thumb::DwmThumbnail;
 pub use os_version::OsVersion;
 pub use overlay_win::{
-    BackdropStyle, OverlayMonitorPolicy, ThumbnailHostWindow, apply_backdrop_style,
-    configure_borderless_immersive, hide_layered_overlay, query_window_and_client_sizes,
+    BackdropStyle, LayeredOverlayDiagnostics, OverlayMonitorPolicy, ThumbnailHostWindow,
+    apply_backdrop_style, configure_borderless_immersive, hide_layered_overlay,
+    inspect_layered_overlay_state, pin_layered_z_order, query_window_and_client_sizes,
     show_and_focus_layered_overlay, target_monitor_rects,
 };
 pub use process_metrics::{
@@ -26,7 +27,7 @@ pub use shell_host::{
 pub use updater::{
     CURRENT_VERSION, GITHUB_OWNER, GITHUB_RELEASES_PAGE, GITHUB_REPO, ReleaseInfo,
     UpdateCheckResult, check_latest_release, download_and_stage_update, is_newer_version,
-    normalize_version_str, wait_for_pid_and_cleanup_old_exe,
+    normalize_version_str, relaunch_updated_exe, wait_for_pid_and_cleanup_old_exe,
 };
 pub use virtual_desktop::{
     ComProbeStatus, DesktopId, VirtualDesktopClient, VirtualDesktopInfo, WindowDesktopLookup,

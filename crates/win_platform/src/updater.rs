@@ -1,7 +1,9 @@
 use std::ffi::c_void;
 use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
@@ -15,7 +17,10 @@ use windows::Win32::Networking::WinHttp::{
     WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse,
     WinHttpSendRequest, WinHttpSetOption, WinHttpSetTimeouts,
 };
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+use windows::Win32::System::Threading::{
+    CREATE_NEW_PROCESS_GROUP, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject,
+};
+use windows::Win32::UI::WindowsAndMessaging::{ASFW_ANY, AllowSetForegroundWindow};
 use windows_core::{HSTRING, PCWSTR, w};
 
 pub const GITHUB_OWNER: &str = "akirousnow";
@@ -789,6 +794,25 @@ pub fn download_and_stage_update(
     Ok(current_exe)
 }
 
+/// Spawns the newly staged WinDeck executable detached in its own process group and hands off
+/// Windows foreground activation rights while the exiting process still owns the foreground.
+pub fn relaunch_updated_exe(exe_path: &Path, wait_pid: u32) -> Result<u32> {
+    unsafe {
+        let _ = AllowSetForegroundWindow(ASFW_ANY);
+    }
+    let pid_str = wait_pid.to_string();
+    let child = Command::new(exe_path)
+        .args(["--wait-pid", &pid_str])
+        .creation_flags(CREATE_NEW_PROCESS_GROUP.0)
+        .spawn()
+        .with_context(|| format!("重启新版程序失败：{}", exe_path.display()))?;
+    let child_pid = child.id();
+    unsafe {
+        let _ = AllowSetForegroundWindow(child_pid);
+    }
+    Ok(child_pid)
+}
+
 /// Waits briefly for a previous WinDeck PID (when restarted after self-update) and cleans up
 /// any leftover `windeck.exe.old` file beside the current executable.
 pub fn wait_for_pid_and_cleanup_old_exe(wait_pid: Option<u32>) {
@@ -1043,5 +1067,26 @@ mod tests {
             parse_expected_sha256(sum_text, "windeck.exe").as_deref(),
             Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad")
         );
+    }
+
+    #[test]
+    fn relaunch_updated_exe_handles_missing_and_valid_binaries() {
+        let missing = Path::new(r"C:\__windeck_nonexistent_test_dir__\missing_windeck.exe");
+        assert!(relaunch_updated_exe(missing, 999_999).is_err());
+
+        // Spawn the test harness binary itself with `--wait-pid`, which rejects the unknown flag
+        // and exits immediately without opening UI or side effects, proving detached spawn works.
+        let self_exe = std::env::current_exe().expect("current_exe");
+        let child_pid = relaunch_updated_exe(&self_exe, std::process::id())
+            .expect("relaunch_updated_exe should spawn valid executable");
+        assert_ne!(child_pid, 0);
+        assert_ne!(child_pid, std::process::id());
+
+        unsafe {
+            if let Ok(handle) = OpenProcess(PROCESS_SYNCHRONIZE, false, child_pid) {
+                let _ = WaitForSingleObject(handle, 3_000);
+                let _ = CloseHandle(handle);
+            }
+        }
     }
 }

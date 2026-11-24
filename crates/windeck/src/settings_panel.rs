@@ -322,11 +322,6 @@ impl SwitcherView {
 
     pub(crate) fn apply_geometry_and_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         configure_borderless_immersive(self.gpui_hwnd, self.config.immersive);
-        self.thumb_host.configure(
-            self.config.immersive,
-            self.config.background,
-            self.config.blur_opacity,
-        );
         if let Ok((phys_rc, scale)) = show_and_focus_layered_overlay(
             self.gpui_hwnd,
             self.thumb_host.hwnd(),
@@ -335,11 +330,17 @@ impl SwitcherView {
         ) {
             self.overlay_phys_rect = phys_rc;
             self.overlay_scale = scale;
+            self.last_overlay_rect = Some(phys_rc);
             let logical_w = ((phys_rc.right - phys_rc.left) as f32 / scale).max(640.0);
             let logical_h = ((phys_rc.bottom - phys_rc.top) as f32 / scale).max(420.0);
             self.viewport_width_px.set(logical_w);
             self.viewport_height_px.set((logical_h - 58.0).max(260.0));
         }
+        self.thumb_host.configure(
+            self.config.immersive,
+            self.config.background,
+            self.config.blur_opacity,
+        );
         window.focus(&self.focus_handle);
         self.persist_config();
         self.clamp_scroll();
