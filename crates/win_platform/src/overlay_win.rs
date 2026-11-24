@@ -4,8 +4,9 @@ use std::sync::Once;
 use anyhow::{Context, Result};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
-    DWM_WINDOW_CORNER_PREFERENCE, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
-    DWMWCP_DONOTROUND, DWMWCP_ROUND, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
+    DWM_WINDOW_CORNER_PREFERENCE, DWMWA_BORDER_COLOR, DWMWA_CLOAKED,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DWMWCP_ROUND, DwmExtendFrameIntoClientArea,
+    DwmGetWindowAttribute, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTOPRIMARY, MONITOR_DEFAULTTONEAREST, MONITORINFO,
@@ -19,12 +20,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_KEYUP, SendInput, VK_MENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GWL_EXSTYLE, GWL_STYLE, GetClientRect,
-    GetCursorPos, GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST, RegisterClassW,
-    SW_HIDE, SW_SHOW, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    WNDCLASSW, WS_BORDER, WS_CAPTION, WS_DLGFRAME, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME,
-    WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_STATICEDGE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GW_HWNDNEXT, GWL_EXSTYLE, GWL_STYLE,
+    GetClientRect, GetCursorPos, GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
+    HWND_TOPMOST, IsIconic, IsWindowVisible, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, WNDCLASSW, WS_BORDER,
+    WS_CAPTION, WS_DLGFRAME, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_NOACTIVATE,
+    WS_EX_NOREDIRECTIONBITMAP, WS_EX_STATICEDGE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
     WS_EX_TRANSPARENT, WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
     WS_THICKFRAME,
 };
@@ -122,7 +124,10 @@ pub struct ThumbnailHostWindow {
 }
 
 impl ThumbnailHostWindow {
-    pub fn create(fullscreen: bool, backdrop: BackdropStyle, blur_opacity: f32) -> Result<Self> {
+    /// Creates the hidden bottom-layer host HWND with frame attributes ready.
+    /// The Acrylic / backdrop accent policy is deferred until [`Self::configure`] is called
+    /// once the host window is visible and sized to its real monitor rect.
+    pub fn create(fullscreen: bool) -> Result<Self> {
         static REGISTER_ONCE: Once = Once::new();
         let class_name = w!("WinDeckThumbHostClass");
         let hinstance = unsafe { GetModuleHandleW(None) }?;
@@ -171,7 +176,7 @@ impl ThumbnailHostWindow {
         .context("CreateWindowExW for ThumbnailHostWindow")?;
 
         let host = Self { hwnd };
-        host.configure(fullscreen, backdrop, blur_opacity);
+        host.configure_frame_attrs(fullscreen);
         Ok(host)
     }
 
@@ -179,7 +184,7 @@ impl ThumbnailHostWindow {
         self.hwnd
     }
 
-    pub fn configure(&self, fullscreen: bool, backdrop: BackdropStyle, blur_opacity: f32) {
+    fn configure_frame_attrs(&self, fullscreen: bool) {
         unsafe {
             let margins = MARGINS {
                 cxLeftWidth: -1,
@@ -209,7 +214,18 @@ impl ThumbnailHostWindow {
                 std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
             );
         }
+    }
+
+    pub fn configure(&self, fullscreen: bool, backdrop: BackdropStyle, blur_opacity: f32) {
+        self.configure_frame_attrs(fullscreen);
         apply_backdrop_style(self.hwnd, backdrop, blur_opacity);
+    }
+
+    /// Resets `WCA_ACCENT_POLICY` to disabled before re-applying the target backdrop,
+    /// forcing DWM to rebuild the Acrylic composition surface during recovery.
+    pub fn force_reconfigure(&self, fullscreen: bool, backdrop: BackdropStyle, blur_opacity: f32) {
+        apply_accent_policy(self.hwnd, 0, 0, (0, 0, 0, 0));
+        self.configure(fullscreen, backdrop, blur_opacity);
     }
 }
 
@@ -239,13 +255,14 @@ pub fn configure_borderless_immersive(hwnd: HWND, fullscreen: bool) {
         SetWindowLongPtrW(hwnd, GWL_STYLE, stripped_style as isize);
 
         let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        // Note: Win32 ignores WS_EX_TOPMOST in SetWindowLongPtrW; topmost band membership is
+        // enforced via SetWindowPos(HWND_TOPMOST) in show_and_focus_layered_overlay / pin_layered_z_order.
         let clean_ex = (ex_style
             & !(WS_EX_WINDOWEDGE.0
                 | WS_EX_CLIENTEDGE.0
                 | WS_EX_DLGMODALFRAME.0
                 | WS_EX_STATICEDGE.0))
-            | WS_EX_TOOLWINDOW.0
-            | WS_EX_TOPMOST.0;
+            | WS_EX_TOOLWINDOW.0;
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, clean_ex as isize);
 
         let no_border: u32 = DWMWA_COLOR_NONE;
@@ -373,6 +390,154 @@ fn focus_hwnd(hwnd: HWND) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayeredOverlayDiagnostics {
+    pub gpui_visible: bool,
+    pub host_visible: bool,
+    pub host_iconic: bool,
+    pub host_cloaked: u32,
+    pub host_directly_behind_gpui: bool,
+    pub gpui_topmost: bool,
+    pub host_topmost: bool,
+    pub gpui_foreground: bool,
+    pub gpui_size: (i32, i32),
+    pub host_size: (i32, i32),
+}
+
+impl LayeredOverlayDiagnostics {
+    pub fn is_healthy(&self) -> bool {
+        self.gpui_visible
+            && self.host_visible
+            && !self.host_iconic
+            && self.host_cloaked == 0
+            && self.host_directly_behind_gpui
+            && self.gpui_topmost
+            && self.host_topmost
+            && self.host_size.0 > 1
+            && self.host_size.1 > 1
+            && self.host_size == self.gpui_size
+    }
+}
+
+/// Inspects live Win32/DWM visibility, Z-order adjacency, topmost flags, cloak state, and sizes
+/// for the two-layer overlay pair (`gpui_hwnd` directly over `thumb_host_hwnd`).
+pub fn inspect_layered_overlay_state(
+    gpui_hwnd: HWND,
+    thumb_host_hwnd: HWND,
+) -> LayeredOverlayDiagnostics {
+    unsafe {
+        let gpui_visible = IsWindowVisible(gpui_hwnd).as_bool();
+        let host_visible = IsWindowVisible(thumb_host_hwnd).as_bool();
+        let host_iconic = IsIconic(thumb_host_hwnd).as_bool();
+
+        let mut host_cloaked: u32 = 0;
+        let _ = DwmGetWindowAttribute(
+            thumb_host_hwnd,
+            DWMWA_CLOAKED,
+            &mut host_cloaked as *mut u32 as *mut c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+
+        let gpui_ex = GetWindowLongPtrW(gpui_hwnd, GWL_EXSTYLE) as u32;
+        let host_ex = GetWindowLongPtrW(thumb_host_hwnd, GWL_EXSTYLE) as u32;
+        let gpui_topmost = (gpui_ex & WS_EX_TOPMOST.0) != 0;
+        let host_topmost = (host_ex & WS_EX_TOPMOST.0) != 0;
+        let gpui_foreground = GetForegroundWindow() == gpui_hwnd;
+
+        let mut host_directly_behind_gpui = false;
+        let mut intervening_visible = 0u32;
+        let mut cur = GetWindow(gpui_hwnd, GW_HWNDNEXT).ok();
+        let mut steps = 0u32;
+        while let Some(hwnd) = cur {
+            if hwnd == thumb_host_hwnd {
+                host_directly_behind_gpui = intervening_visible == 0;
+                break;
+            }
+            if IsWindowVisible(hwnd).as_bool() {
+                intervening_visible += 1;
+            }
+            steps += 1;
+            if steps > 512 {
+                break;
+            }
+            cur = GetWindow(hwnd, GW_HWNDNEXT).ok();
+        }
+
+        let (gpui_size, _) = query_window_and_client_sizes(gpui_hwnd);
+        let (host_size, _) = query_window_and_client_sizes(thumb_host_hwnd);
+
+        LayeredOverlayDiagnostics {
+            gpui_visible,
+            host_visible,
+            host_iconic,
+            host_cloaked,
+            host_directly_behind_gpui,
+            gpui_topmost,
+            host_topmost,
+            gpui_foreground,
+            gpui_size,
+            host_size,
+        }
+    }
+}
+
+unsafe fn ensure_shown_noactivate(hwnd: HWND) {
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        // The very first ShowWindow call in a process may be overridden by STARTUPINFO.wShowWindow
+        // (e.g. SW_HIDE / SW_MINIMIZE). Retry once so the first layer is never left hidden or iconic.
+        if !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
+            let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+        }
+    }
+}
+
+/// Enforces strict two-layer Z-order lockstep: `gpui_hwnd` topmost at `rect`,
+/// and `thumb_host_hwnd` topmost, visible, and positioned directly beneath `gpui_hwnd`.
+pub fn pin_layered_z_order(gpui_hwnd: HWND, thumb_host_hwnd: HWND, rect: RECT) {
+    let x = rect.left;
+    let y = rect.top;
+    let w = (rect.right - rect.left).max(1);
+    let h = (rect.bottom - rect.top).max(1);
+    unsafe {
+        if !IsWindowVisible(thumb_host_hwnd).as_bool() || IsIconic(thumb_host_hwnd).as_bool() {
+            ensure_shown_noactivate(thumb_host_hwnd);
+        }
+        if !IsWindowVisible(gpui_hwnd).as_bool() || IsIconic(gpui_hwnd).as_bool() {
+            ensure_shown_noactivate(gpui_hwnd);
+        }
+        // Promote thumb_host_hwnd into HWND_TOPMOST explicitly first: in Win32,
+        // SetWindowPos(non_topmost, Some(topmost), ...) does NOT grant WS_EX_TOPMOST.
+        let _ = SetWindowPos(
+            thumb_host_hwnd,
+            Some(HWND_TOPMOST),
+            x,
+            y,
+            w,
+            h,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+        let _ = SetWindowPos(
+            gpui_hwnd,
+            Some(HWND_TOPMOST),
+            x,
+            y,
+            w,
+            h,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+        let _ = SetWindowPos(
+            thumb_host_hwnd,
+            Some(gpui_hwnd),
+            x,
+            y,
+            w,
+            h,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
+    }
+}
+
 /// Positions and reveals both layers in strict lockstep Z-order:
 /// `gpui_hwnd` (topmost, per-pixel transparent interactive UI + embedded labels) directly above
 /// `thumb_host_hwnd` (frosted Acrylic backdrop + live hardware-accelerated DWM thumbnails).
@@ -383,9 +548,16 @@ pub fn show_and_focus_layered_overlay(
     immersive_fullscreen: bool,
 ) -> Result<(RECT, f32)> {
     let (x, y, win_w, win_h, scale) = compute_overlay_rect(policy, immersive_fullscreen)?;
+    let rect = RECT {
+        left: x,
+        top: y,
+        right: x + win_w,
+        bottom: y + win_h,
+    };
 
     unsafe {
-        // 1. Reveal bottom thumbnail/backdrop host without stealing focus
+        // 1. Reveal & size bottom thumbnail/backdrop host without stealing focus
+        ensure_shown_noactivate(thumb_host_hwnd);
         let _ = SetWindowPos(
             thumb_host_hwnd,
             Some(HWND_TOPMOST),
@@ -395,9 +567,9 @@ pub fn show_and_focus_layered_overlay(
             win_h,
             SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED,
         );
-        let _ = ShowWindow(thumb_host_hwnd, SW_SHOWNOACTIVATE);
 
-        // 2. Reveal interactive GPUI overlay directly on top
+        // 2. Reveal & size interactive GPUI overlay directly on top without premature activation
+        ensure_shown_noactivate(gpui_hwnd);
         let _ = SetWindowPos(
             gpui_hwnd,
             Some(HWND_TOPMOST),
@@ -405,32 +577,17 @@ pub fn show_and_focus_layered_overlay(
             y,
             win_w,
             win_h,
-            SWP_SHOWWINDOW | SWP_FRAMECHANGED,
-        );
-        let _ = ShowWindow(gpui_hwnd, SW_SHOW);
-
-        // 3. Pin thumb_host_hwnd strictly 1 Z-slot directly beneath gpui_hwnd
-        let _ = SetWindowPos(
-            thumb_host_hwnd,
-            Some(gpui_hwnd),
-            x,
-            y,
-            win_w,
-            win_h,
-            SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+            SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED,
         );
     }
-    focus_hwnd(gpui_hwnd);
 
-    Ok((
-        RECT {
-            left: x,
-            top: y,
-            right: x + win_w,
-            bottom: y + win_h,
-        },
-        scale,
-    ))
+    // 3. Pin Z-order lockstep before activation, activate gpui_hwnd, then re-pin Z-order lockstep
+    //    so focus changes (including VK_MENU fallback) can never leave thumb_host_hwnd behind another window.
+    pin_layered_z_order(gpui_hwnd, thumb_host_hwnd, rect);
+    focus_hwnd(gpui_hwnd);
+    pin_layered_z_order(gpui_hwnd, thumb_host_hwnd, rect);
+
+    Ok((rect, scale))
 }
 
 pub fn hide_layered_overlay(gpui_hwnd: HWND, thumb_host_hwnd: HWND) {
@@ -449,4 +606,186 @@ pub fn query_window_and_client_sizes(hwnd: HWND) -> ((i32, i32), (i32, i32)) {
         (wr.right - wr.left, wr.bottom - wr.top),
         (cr.right - cr.left, cr.bottom - cr.top),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use windows::Win32::UI::WindowsAndMessaging::{HWND_BOTTOM, WINDOW_EX_STYLE};
+
+    use super::*;
+
+    static OVERLAY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct TestHwnd(HWND);
+
+    impl TestHwnd {
+        fn create_hidden_popup(width: i32, height: i32) -> Self {
+            static REGISTER_TEST_CLASS: Once = Once::new();
+            let class_name = w!("WinDeckOverlayTestPopup");
+            let hinstance = unsafe { GetModuleHandleW(None) }.expect("GetModuleHandleW");
+
+            unsafe extern "system" fn wnd_proc(
+                hwnd: HWND,
+                msg: u32,
+                wparam: WPARAM,
+                lparam: LPARAM,
+            ) -> LRESULT {
+                unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+            }
+
+            REGISTER_TEST_CLASS.call_once(|| {
+                let wc = WNDCLASSW {
+                    lpfnWndProc: Some(wnd_proc),
+                    hInstance: hinstance.into(),
+                    lpszClassName: class_name,
+                    ..Default::default()
+                };
+                unsafe { RegisterClassW(&wc) };
+            });
+
+            let hwnd = unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE(0),
+                    class_name,
+                    w!("WinDeckOverlayTest"),
+                    WS_POPUP,
+                    0,
+                    0,
+                    width,
+                    height,
+                    None,
+                    None,
+                    Some(hinstance.into()),
+                    None,
+                )
+            }
+            .expect("CreateWindowExW test popup");
+            Self(hwnd)
+        }
+    }
+
+    impl Drop for TestHwnd {
+        fn drop(&mut self) {
+            if !self.0.is_invalid() {
+                let _ = unsafe { DestroyWindow(self.0) };
+            }
+        }
+    }
+
+    #[test]
+    fn layered_overlay_show_and_hide_maintains_visibility_size_and_z_order() {
+        let _guard = OVERLAY_TEST_LOCK.lock().unwrap();
+        let gpui_win = TestHwnd::create_hidden_popup(800, 600);
+        configure_borderless_immersive(gpui_win.0, true);
+        let thumb_host = ThumbnailHostWindow::create(true).expect("ThumbnailHostWindow::create");
+
+        let before = inspect_layered_overlay_state(gpui_win.0, thumb_host.hwnd());
+        assert!(!before.gpui_visible);
+        assert!(!before.host_visible);
+        assert!(!before.is_healthy());
+
+        let (rect, _scale) = show_and_focus_layered_overlay(
+            gpui_win.0,
+            thumb_host.hwnd(),
+            OverlayMonitorPolicy::Primary,
+            true,
+        )
+        .expect("show_and_focus_layered_overlay");
+        thumb_host.configure(true, BackdropStyle::Blurred, 0.25);
+
+        let shown = inspect_layered_overlay_state(gpui_win.0, thumb_host.hwnd());
+        assert!(shown.gpui_visible, "gpui window should be visible");
+        assert!(shown.host_visible, "thumb_host should be visible");
+        assert!(!shown.host_iconic, "thumb_host should not be minimized");
+        assert_eq!(shown.host_cloaked, 0, "thumb_host should not be cloaked");
+        assert!(shown.gpui_topmost, "gpui window should be WS_EX_TOPMOST");
+        assert!(shown.host_topmost, "thumb_host should be WS_EX_TOPMOST");
+        assert!(
+            shown.host_directly_behind_gpui,
+            "thumb_host must sit directly beneath gpui window"
+        );
+        assert_eq!(shown.host_size, (rect.right - rect.left, rect.bottom - rect.top));
+        assert_eq!(shown.gpui_size, shown.host_size);
+        assert!(shown.is_healthy(), "overlay diagnostics must be healthy: {shown:?}");
+
+        hide_layered_overlay(gpui_win.0, thumb_host.hwnd());
+        let hidden = inspect_layered_overlay_state(gpui_win.0, thumb_host.hwnd());
+        assert!(!hidden.gpui_visible);
+        assert!(!hidden.host_visible);
+    }
+
+    #[test]
+    fn pin_layered_z_order_recovers_from_intervening_window_and_hidden_host() {
+        let _guard = OVERLAY_TEST_LOCK.lock().unwrap();
+        let gpui_win = TestHwnd::create_hidden_popup(800, 600);
+        configure_borderless_immersive(gpui_win.0, true);
+        let thumb_host = ThumbnailHostWindow::create(true).expect("ThumbnailHostWindow::create");
+        let interloper = TestHwnd::create_hidden_popup(640, 480);
+
+        let (rect, _scale) = show_and_focus_layered_overlay(
+            gpui_win.0,
+            thumb_host.hwnd(),
+            OverlayMonitorPolicy::Primary,
+            true,
+        )
+        .expect("show_and_focus_layered_overlay");
+
+        // Deliberately push thumb_host to bottom and wedge a visible window directly beneath gpui_win.
+        unsafe {
+            let _ = SetWindowPos(
+                thumb_host.hwnd(),
+                Some(HWND_BOTTOM),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE,
+            );
+            let _ = SetWindowPos(
+                interloper.0,
+                Some(gpui_win.0),
+                rect.left,
+                rect.top,
+                640,
+                480,
+                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        }
+
+        let broken_z = inspect_layered_overlay_state(gpui_win.0, thumb_host.hwnd());
+        assert!(
+            !broken_z.host_directly_behind_gpui,
+            "interloper should break direct Z-adjacency before recovery"
+        );
+        assert!(!broken_z.is_healthy());
+
+        pin_layered_z_order(gpui_win.0, thumb_host.hwnd(), rect);
+        let recovered_z = inspect_layered_overlay_state(gpui_win.0, thumb_host.hwnd());
+        assert!(
+            recovered_z.host_directly_behind_gpui && recovered_z.is_healthy(),
+            "pin_layered_z_order must restore strict Z-order lockstep: {recovered_z:?}"
+        );
+
+        // Deliberately hide thumb_host (simulating STARTUPINFO SW_HIDE override on first ShowWindow).
+        unsafe {
+            let _ = ShowWindow(thumb_host.hwnd(), SW_HIDE);
+        }
+        let broken_vis = inspect_layered_overlay_state(gpui_win.0, thumb_host.hwnd());
+        assert!(!broken_vis.host_visible);
+        assert!(!broken_vis.is_healthy());
+
+        pin_layered_z_order(gpui_win.0, thumb_host.hwnd(), rect);
+        thumb_host.force_reconfigure(true, BackdropStyle::Blurred, 0.25);
+        let recovered_vis = inspect_layered_overlay_state(gpui_win.0, thumb_host.hwnd());
+        assert!(
+            recovered_vis.host_visible
+                && recovered_vis.host_directly_behind_gpui
+                && recovered_vis.is_healthy(),
+            "pin_layered_z_order must recover a hidden host window: {recovered_vis:?}"
+        );
+
+        hide_layered_overlay(gpui_win.0, thumb_host.hwnd());
+    }
 }

@@ -3,8 +3,8 @@ use std::time::{Duration, Instant};
 
 use gpui::{Context, Div, MouseButton, SharedString, Window, div, prelude::*, px, rgb, rgba};
 use win_platform::{
-    GITHUB_RELEASES_PAGE, ReleaseInfo, UpdateCheckResult, check_latest_release,
-    download_and_stage_update,
+    GITHUB_RELEASES_PAGE, ReleaseInfo, SingleInstanceGuard, UpdateCheckResult,
+    check_latest_release, download_and_stage_update, relaunch_updated_exe,
 };
 
 use crate::config::append_log;
@@ -333,25 +333,34 @@ impl SwitcherView {
                             release.tag_name,
                             exe_path.display()
                         ));
-                        v.hide(cx);
-                        // Release single-instance lock so the updated WinDeck acquires it immediately
+                        // Release single-instance lock and spawn the replacement process BEFORE hiding
+                        // so the exiting WinDeck still holds foreground lock and can hand it off cleanly.
                         if let Ok(mut guard_slot) = v.single_instance_guard.lock() {
                             if let Some(ref mut guard) = *guard_slot {
                                 guard.release();
                             }
                             *guard_slot = None;
                         }
-                        let pid = std::process::id().to_string();
-                        if let Err(e) = Command::new(&exe_path).args(["--wait-pid", &pid]).spawn() {
-                            append_log(&format!("UPDATE_RELAUNCH ERROR: {e}"));
-                            v.update_status = UpdateStatus::Available(release.clone());
-                            v.update_dialog_open = true;
-                            v.update_dialog_error = Some(SharedString::from(format!(
-                                "更新已写入，但自动重启失败：{e}，请手动重新打开 WinDeck"
-                            )));
-                            cx.notify();
-                        } else {
-                            should_quit = true;
+                        match relaunch_updated_exe(&exe_path, std::process::id()) {
+                            Ok(child_pid) => {
+                                append_log(&format!("UPDATE_RELAUNCH spawned pid={child_pid}"));
+                                v.hide(cx);
+                                should_quit = true;
+                            }
+                            Err(e) => {
+                                append_log(&format!("UPDATE_RELAUNCH ERROR: {e:#}"));
+                                if let Ok(Some(reacquired)) = SingleInstanceGuard::try_acquire() {
+                                    if let Ok(mut guard_slot) = v.single_instance_guard.lock() {
+                                        *guard_slot = Some(reacquired);
+                                    }
+                                }
+                                v.update_status = UpdateStatus::Available(release.clone());
+                                v.update_dialog_open = true;
+                                v.update_dialog_error = Some(SharedString::from(format!(
+                                    "更新已写入，但自动重启失败：{e}，请手动重新打开 WinDeck"
+                                )));
+                                cx.notify();
+                            }
                         }
                     }
                     DownloadEvent::Failed(msg) => {

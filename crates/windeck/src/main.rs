@@ -138,9 +138,10 @@ fn main() -> Result<()> {
     }));
 
     let config = AppConfig::load_or_create();
+    let post_ota_restart = wait_pid.is_some();
     let (winsta, desk) = current_session_desktop_names();
     append_log(&format!(
-        "STARTUP ver=v{} hotkey='{}' immersive={} label='{}' auto_update={} desktop='{}\\{}' hidden={} bench={}",
+        "STARTUP ver=v{} hotkey='{}' immersive={} label='{}' auto_update={} desktop='{}\\{}' hidden={} bench={} wait_pid={:?}",
         effective_version,
         config.hotkey,
         config.immersive,
@@ -149,7 +150,8 @@ fn main() -> Result<()> {
         winsta,
         desk,
         start_hidden,
-        bench_mode
+        bench_mode,
+        wait_pid
     ));
 
     let vdm = Arc::new(VirtualDesktopClient::new()?);
@@ -188,8 +190,6 @@ fn main() -> Result<()> {
 
     let shell_host = Arc::new(shell_host);
     let initial_immersive = config.immersive;
-    let initial_backdrop = config.background;
-    let initial_blur_opacity = config.blur_opacity;
     let initial_auto_update = config.auto_update;
     let guard_for_app = single_instance_guard.clone();
     let ver_for_app = effective_version.clone();
@@ -225,12 +225,8 @@ fn main() -> Result<()> {
             move |window, cx| {
                 let gpui_hwnd = extract_hwnd(window).expect("extract GPUI Win32 HWND");
                 configure_borderless_immersive(gpui_hwnd, initial_immersive);
-                let thumb_host = ThumbnailHostWindow::create(
-                    initial_immersive,
-                    initial_backdrop,
-                    initial_blur_opacity,
-                )
-                .expect("create bottom ThumbnailHostWindow");
+                let thumb_host = ThumbnailHostWindow::create(initial_immersive)
+                    .expect("create bottom ThumbnailHostWindow");
 
                 let shell_for_view = shell_for_loop.clone();
                 let view = cx.new(|cx| {
@@ -279,6 +275,13 @@ fn main() -> Result<()> {
                     if !start_hidden {
                         let view_init = view.clone();
                         cx.spawn(async move |cx| {
+                            if post_ota_restart {
+                                // Let the exiting process's DWM surfaces and GPUI's vsync thread settle
+                                // cleanly before presenting the first post-OTA overlay.
+                                cx.background_executor()
+                                    .timer(Duration::from_millis(80))
+                                    .await;
+                            }
                             let _ = cx.update(|cx| {
                                 let _ = window_handle.update(cx, |_, window, cx| {
                                     view_init.update(cx, |v, cx| {

@@ -14,10 +14,10 @@ use win_platform::{
     DesktopId, ForceQuitOutcome, HoldNavDirection, IconBgra, ReleaseInfo, ShellHost,
     SingleInstanceGuard, ThumbnailHostWindow, VirtualDesktopClient, VirtualDesktopInfo, WindowInfo,
     configure_borderless_immersive, enumerate_monitors, enumerate_windows, extract_window_icon,
-    force_quit_window, hide_layered_overlay, query_window_and_client_sizes,
-    show_and_focus_layered_overlay, switch_to_window,
+    force_quit_window, hide_layered_overlay, inspect_layered_overlay_state, pin_layered_z_order,
+    query_window_and_client_sizes, show_and_focus_layered_overlay, switch_to_window,
 };
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
     GA_ROOTOWNER, GetAncestor, GetForegroundWindow, GetShellWindow, GetWindowThreadProcessId,
     IsWindow, SetForegroundWindow,
@@ -170,6 +170,8 @@ pub struct SwitcherView {
     pub(crate) update_dialog_open: bool,
     pub(crate) update_dialog_error: Option<SharedString>,
     pub(crate) visible: bool,
+    has_completed_first_open: bool,
+    pub(crate) last_overlay_rect: Option<RECT>,
     shown_at: Option<Instant>,
     pub(crate) hold_active: bool,
     pub(crate) hold_navigated: bool,
@@ -248,6 +250,8 @@ impl SwitcherView {
             update_dialog_open: false,
             update_dialog_error: None,
             visible: false,
+            has_completed_first_open: false,
+            last_overlay_rect: None,
             shown_at: None,
             hold_active: false,
             hold_navigated: false,
@@ -468,6 +472,7 @@ impl SwitcherView {
         self.hold_active = false;
         self.hold_navigated = false;
         self.scroll_y = 0.0;
+        *self.viewport_clip.borrow_mut() = None;
         // Always open in full panorama ("全部") so all desktops' windows are visible at once
         self.desktop_filter = None;
 
@@ -478,43 +483,51 @@ impl SwitcherView {
             && self.pending_update.as_ref().is_some_and(|rel| {
                 self.dismissed_update_tag.as_deref() != Some(rel.tag_name.as_str())
             });
-
         if prompt_cached_update {
-            self.thumbs.borrow_mut().unregister_all();
             self.update_dialog_open = true;
-        } else {
-            self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
         }
+
         self.visible = true;
         self.sync_visibility_to_host();
         self.shown_at = Some(Instant::now());
         window.set_background_appearance(WindowBackgroundAppearance::Transparent);
-        self.thumb_host.configure(
-            self.config.immersive,
-            self.config.background,
-            self.config.blur_opacity,
-        );
 
-        window.refresh();
+        // Reveal and size both layers in lockstep Z-order BEFORE applying DWM Acrylic backdrop
+        // and registering DWM thumbnails, so cold-start Layer 1 is never initialized while hidden at 1x1.
         if let Ok((phys_rc, scale)) = show_and_focus_layered_overlay(
             self.gpui_hwnd,
             self.thumb_host.hwnd(),
             self.config.monitor,
             self.config.immersive,
         ) {
+            self.last_overlay_rect = Some(phys_rc);
             let logical_w = ((phys_rc.right - phys_rc.left) as f32 / scale).max(640.0);
             let logical_h = ((phys_rc.bottom - phys_rc.top) as f32 / scale).max(420.0);
             self.viewport_width_px.set(logical_w);
             self.viewport_height_px
                 .set((logical_h - TOP_SPACES_BAR_H).max(260.0));
         }
+
+        self.thumb_host.configure(
+            self.config.immersive,
+            self.config.background,
+            self.config.blur_opacity,
+        );
+
+        if prompt_cached_update {
+            self.thumbs.borrow_mut().unregister_all();
+        } else {
+            self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
+        }
+
         window.focus(&self.focus_handle);
         self.ensure_selected_visible();
         window.refresh();
 
+        let diag = inspect_layered_overlay_state(self.gpui_hwnd, self.thumb_host.hwnd());
         self.last_open_ms = t_start.elapsed().as_secs_f64() * 1000.0;
         append_log(&format!(
-            "OPEN total={:.2}ms enum={:.2}ms desktops={} windows={} thumbs={} fg=0x{:X} sel={} preview={}x{} fit={} label={}",
+            "OPEN total={:.2}ms enum={:.2}ms desktops={} windows={} thumbs={} fg=0x{:X} sel={} preview={}x{} fit={} label={} host_vis={} host_z={} host_top={} gpui_top={} gpui_fg={} host_cloak={} host_sz={}x{}",
             self.last_open_ms,
             self.last_enum_ms,
             self.desktops.len(),
@@ -526,13 +539,86 @@ impl SwitcherView {
             self.config.preview_height as i32,
             self.config.preview_fit.as_config_str(),
             self.config.label_position.as_config_str(),
+            diag.host_visible,
+            diag.host_directly_behind_gpui,
+            diag.host_topmost,
+            diag.gpui_topmost,
+            diag.gpui_foreground,
+            diag.host_cloaked,
+            diag.host_size.0,
+            diag.host_size.1,
         ));
+
+        if !self.has_completed_first_open && !self.bench_mode {
+            self.has_completed_first_open = true;
+            let window_handle = Window::window_handle(window);
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
+                let _ = cx.update(|cx| {
+                    let _ = window_handle.update(cx, |_, window, cx| {
+                        let _ = this.update(cx, |v, cx| {
+                            v.run_first_open_settle(window, cx);
+                        });
+                    });
+                });
+            })
+            .detach();
+        }
 
         if !self.bench_mode && self.config.auto_update {
             self.trigger_update_check(false, cx);
         }
 
         cx.notify();
+    }
+
+    fn run_first_open_settle(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.visible {
+            return;
+        }
+        let before = inspect_layered_overlay_state(self.gpui_hwnd, self.thumb_host.hwnd());
+        if let Some(rect) = self.last_overlay_rect {
+            pin_layered_z_order(self.gpui_hwnd, self.thumb_host.hwnd(), rect);
+        }
+        if !before.is_healthy() {
+            self.thumb_host.force_reconfigure(
+                self.config.immersive,
+                self.config.background,
+                self.config.blur_opacity,
+            );
+            if !self.settings_open && !self.update_dialog_open {
+                self.thumbs.borrow_mut().unregister_all();
+                self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
+            }
+        } else {
+            self.thumb_host.configure(
+                self.config.immersive,
+                self.config.background,
+                self.config.blur_opacity,
+            );
+            if !self.settings_open && !self.update_dialog_open {
+                self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
+            }
+        }
+        window.refresh();
+        cx.notify();
+        let after = inspect_layered_overlay_state(self.gpui_hwnd, self.thumb_host.hwnd());
+        append_log(&format!(
+            "OPEN_SETTLED healthy_before={} healthy_after={} host_vis={} host_z={} host_top={} gpui_top={} gpui_fg={} host_cloak={} host_sz={}x{} thumbs={}",
+            before.is_healthy(),
+            after.is_healthy(),
+            after.host_visible,
+            after.host_directly_behind_gpui,
+            after.host_topmost,
+            after.gpui_topmost,
+            after.gpui_foreground,
+            after.host_cloaked,
+            after.host_size.0,
+            after.host_size.1,
+            self.thumbs.borrow().active_count(),
+        ));
     }
 
     pub fn refresh_snapshot(&mut self) {
@@ -2175,13 +2261,11 @@ impl Render for SwitcherView {
                     .child(
                         canvas(
                             move |bounds, _, _| {
-                                *viewport_clip_rc.borrow_mut() = Some(bounds);
                                 let w = f32::from(bounds.size.width);
                                 let h = f32::from(bounds.size.height);
-                                if w > 100.0 {
+                                if w > 100.0 && h > 100.0 {
+                                    *viewport_clip_rc.borrow_mut() = Some(bounds);
                                     viewport_w_cell.set(w);
-                                }
-                                if h > 100.0 {
                                     viewport_h_cell.set(h);
                                 }
                             },
