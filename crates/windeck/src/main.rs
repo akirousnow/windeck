@@ -153,16 +153,17 @@ fn main() -> Result<()> {
         }
     }));
 
-    let config = AppConfig::load_or_create();
+    let mut config = AppConfig::load_or_create();
     let post_ota_restart = wait_pid.is_some();
     let (winsta, desk) = current_session_desktop_names();
     append_log(&format!(
-        "STARTUP ver=v{} hotkey='{}' immersive={} label='{}' auto_update={} desktop='{}\\{}' hidden={} bench={} wait_pid={:?}",
+        "STARTUP ver=v{} hotkey='{}' immersive={} label='{}' auto_update={} win_arrow_desktop={} desktop='{}\\{}' hidden={} bench={} wait_pid={:?}",
         effective_version,
         config.hotkey,
         config.immersive,
         config.label_position.as_config_str(),
         config.auto_update,
+        config.win_arrow_switch_desktop,
         winsta,
         desk,
         start_hidden,
@@ -178,9 +179,14 @@ fn main() -> Result<()> {
         None
     } else {
         let tx = event_tx.clone();
-        match ShellHost::start(hotkey_spec, hotkey_spec.canonical_label(), move |ev| {
-            let _ = tx.send_blocking(ev);
-        }) {
+        match ShellHost::start(
+            hotkey_spec,
+            hotkey_spec.canonical_label(),
+            config.win_arrow_switch_desktop,
+            move |ev| {
+                let _ = tx.send_blocking(ev);
+            },
+        ) {
             Ok(host) => Some(host),
             Err(e) => {
                 append_log(&format!("ShellHost start failed: {e:#}"));
@@ -188,6 +194,11 @@ fn main() -> Result<()> {
             }
         }
     };
+
+    if let Some(err) = shell_host.as_ref().and_then(|h| h.win_arrow_patch_error()) {
+        append_log(&format!("WIN_ARROW_PATCH startup hook failed: {err}"));
+        config.win_arrow_switch_desktop = false;
+    }
 
     let hotkey_warning = shell_host.as_ref().and_then(|h| {
         if h.hotkey_registered() {
@@ -379,11 +390,21 @@ fn main() -> Result<()> {
                                     append_log(&format!("AUTOSTART toggled -> enabled={enabled}"));
                                 }
                                 ShellEvent::ReloadConfig => {
-                                    let new_cfg = AppConfig::load_or_create();
+                                    let mut new_cfg = AppConfig::load_or_create();
                                     if let Some(ref host) = *shell_for_loop {
                                         if let Err(e) = host.rebind_hotkey(new_cfg.parsed_hotkey())
                                         {
                                             append_log(&format!("RELOAD HOTKEY ERROR: {e:#}"));
+                                        }
+                                        if let Err(e) = host.set_win_arrow_patch_enabled(
+                                            new_cfg.win_arrow_switch_desktop,
+                                        ) {
+                                            append_log(&format!(
+                                                "RELOAD WIN_ARROW_PATCH ERROR: {e:#}"
+                                            ));
+                                            if new_cfg.win_arrow_switch_desktop {
+                                                new_cfg.win_arrow_switch_desktop = false;
+                                            }
                                         }
                                     }
                                     let _ = window_handle.update(cx, |_, window, cx| {

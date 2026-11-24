@@ -258,6 +258,7 @@ pub struct AppConfig {
     pub cross_desktop_nav: bool,
     pub hide_on_blur: bool,
     pub auto_update: bool,
+    pub win_arrow_switch_desktop: bool,
 }
 
 impl Default for AppConfig {
@@ -281,6 +282,7 @@ impl Default for AppConfig {
             cross_desktop_nav: true,
             hide_on_blur: true,
             auto_update: true,
+            win_arrow_switch_desktop: false,
         }
     }
 }
@@ -344,6 +346,9 @@ hide_on_blur = true
 
 # 自动检查 GitHub Release 新版本更新（每次打开时后台静默检测）
 auto_update = true
+
+# 系统补丁：将系统 Win + 左/右方向键 映射为切换虚拟桌面（覆盖系统分屏，使用原生动画；管理员窗口不生效）
+win_arrow_switch_desktop = false
 "#;
 
 pub fn config_dir() -> PathBuf {
@@ -497,6 +502,11 @@ impl AppConfig {
                         cfg.auto_update = b;
                     }
                 }
+                "win_arrow_switch_desktop" => {
+                    if let Ok(b) = val.parse::<bool>() {
+                        cfg.win_arrow_switch_desktop = b;
+                    }
+                }
                 _ => {}
             }
         }
@@ -588,6 +598,9 @@ hide_on_blur = {hide_on_blur}
 
 # 自动检查 GitHub Release 新版本更新（每次打开时后台静默检测）
 auto_update = {auto_update}
+
+# 系统补丁：将系统 Win + 左/右方向键 映射为切换虚拟桌面（覆盖系统分屏，使用原生动画；管理员窗口不生效）
+win_arrow_switch_desktop = {win_arrow_switch_desktop}
 "#,
             hotkey = self.parsed_hotkey().canonical_label(),
             force_quit_key = self.parsed_force_quit_key().canonical_label(),
@@ -607,6 +620,7 @@ auto_update = {auto_update}
             cross_desktop_nav = self.cross_desktop_nav,
             hide_on_blur = self.hide_on_blur,
             auto_update = self.auto_update,
+            win_arrow_switch_desktop = self.win_arrow_switch_desktop,
         )
     }
 
@@ -654,6 +668,7 @@ mod tests {
             cross_desktop_nav = false
             hide_on_blur = false
             auto_update = false
+            win_arrow_switch_desktop = true
         "#;
         let cfg = AppConfig::parse(raw);
         assert_eq!(cfg.hotkey, "Ctrl+E");
@@ -703,6 +718,7 @@ mod tests {
         assert!(default_cfg.tab_transition_enabled());
         assert!(default_cfg.selection_transition_enabled());
         assert!(default_cfg.switch_transition_enabled());
+        assert!(!default_cfg.win_arrow_switch_desktop);
 
         let legacy_cfg = AppConfig::parse("transition_effect = \"smooth\"\n");
         assert_eq!(legacy_cfg.transition_effect, TransitionEffect::Spring);
@@ -718,5 +734,10 @@ mod tests {
         assert_eq!(round_tripped.hide_on_blur, cfg.hide_on_blur);
         assert!(!cfg.auto_update);
         assert_eq!(round_tripped.auto_update, cfg.auto_update);
+        assert!(cfg.win_arrow_switch_desktop);
+        assert_eq!(
+            round_tripped.win_arrow_switch_desktop,
+            cfg.win_arrow_switch_desktop
+        );
     }
 }

@@ -208,6 +208,7 @@ pub struct SwitcherView {
     pub(crate) recording_hotkey_letter: bool,
     pub(crate) recording_force_quit_key: bool,
     pub(crate) settings_error: Option<SharedString>,
+    pub(crate) win_arrow_patch_error: Option<SharedString>,
     pub(crate) settings_scroll_y: f32,
     pub(crate) autostart_enabled: bool,
     scroll_y: f32,
@@ -297,6 +298,7 @@ impl SwitcherView {
             recording_hotkey_letter: false,
             recording_force_quit_key: false,
             settings_error: None,
+            win_arrow_patch_error: None,
             settings_scroll_y: 0.0,
             autostart_enabled: false,
             scroll_y: 0.0,
@@ -497,6 +499,7 @@ impl SwitcherView {
         self.recording_hotkey_letter = false;
         self.recording_force_quit_key = false;
         self.settings_error = None;
+        self.win_arrow_patch_error = None;
         self.transient_toast = None;
         self.sync_visibility_to_host();
         cx.notify();
