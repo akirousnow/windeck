@@ -19,7 +19,73 @@ use crate::switcher_view::SwitcherView;
 use crate::update_dialog::UpdateStatus;
 
 const SHEET_W: f32 = 500.0;
-const SHEET_CONTENT_EST_H: f32 = 1105.0;
+const SHEET_H: f32 = 436.0;
+const SHEET_HEADER_H: f32 = 54.0;
+const SHEET_FOOTER_H: f32 = 44.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SettingsTab {
+    #[default]
+    General,
+    Shortcuts,
+    Layout,
+    Appearance,
+}
+
+impl SettingsTab {
+    pub(crate) const ALL: [Self; 4] = [
+        Self::General,
+        Self::Shortcuts,
+        Self::Layout,
+        Self::Appearance,
+    ];
+
+    pub(crate) fn id(self) -> &'static str {
+        match self {
+            Self::General => "settings-tab-general",
+            Self::Shortcuts => "settings-tab-shortcuts",
+            Self::Layout => "settings-tab-layout",
+            Self::Appearance => "settings-tab-appearance",
+        }
+    }
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::General => "常规",
+            Self::Shortcuts => "快捷键",
+            Self::Layout => "布局",
+            Self::Appearance => "外观",
+        }
+    }
+
+    pub(crate) fn next(self) -> Self {
+        match self {
+            Self::General => Self::Shortcuts,
+            Self::Shortcuts => Self::Layout,
+            Self::Layout => Self::Appearance,
+            Self::Appearance => Self::General,
+        }
+    }
+
+    pub(crate) fn prev(self) -> Self {
+        match self {
+            Self::General => Self::Appearance,
+            Self::Shortcuts => Self::General,
+            Self::Layout => Self::Shortcuts,
+            Self::Appearance => Self::Layout,
+        }
+    }
+
+    pub(crate) fn estimated_content_height(self) -> f32 {
+        let rows = match self {
+            Self::General => 5,
+            Self::Shortcuts => 7,
+            Self::Layout => 5,
+            Self::Appearance => 4,
+        };
+        (rows as f32) * 43.0 + 20.0
+    }
+}
 
 /// Minimalist 3-slider icon matching the hairline weight of the top Spaces bar.
 fn sliders_icon() -> Div {
@@ -83,53 +149,48 @@ fn setting_row(label: &'static str, control: impl IntoElement) -> Div {
         .child(control)
 }
 
-fn section_header(title: &'static str) -> Div {
+fn settings_tab_pill(
+    tab: SettingsTab,
+    active: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> gpui::Stateful<Div> {
     div()
-        .w_full()
-        .pt(px(12.0))
-        .pb(px(4.0))
-        .text_size(px(11.0))
-        .font_weight(gpui::FontWeight::SEMIBOLD)
-        .text_color(rgba(0xFFFFFF66))
-        .child(title)
-}
-
-fn setting_row_with_hint(
-    label: &'static str,
-    hint: &'static str,
-    control: impl IntoElement,
-) -> Div {
-    div()
-        .w_full()
-        .min_h(px(52.0))
-        .py(px(8.0))
+        .id(tab.id())
+        .h(px(28.0))
+        .px(px(14.0))
+        .rounded_full()
+        .cursor_pointer()
         .flex()
-        .flex_row()
         .items_center()
-        .justify_between()
-        .gap(px(16.0))
+        .justify_center()
+        .bg(if active {
+            rgba(0xFFFFFF2E)
+        } else {
+            rgba(0x00000000)
+        })
+        .hover(|s| {
+            s.bg(if active {
+                rgba(0xFFFFFF38)
+            } else {
+                rgba(0xFFFFFF16)
+            })
+        })
+        .on_click(on_click)
         .child(
             div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .gap(px(3.0))
-                .child(
-                    div()
-                        .text_xs()
-                        .font_weight(gpui::FontWeight::MEDIUM)
-                        .text_color(rgba(0xFFFFFFCC))
-                        .child(label),
-                )
-                .child(
-                    div()
-                        .text_size(px(11.0))
-                        .text_color(rgba(0xFFFFFF6E))
-                        .child(hint),
-                ),
+                .text_xs()
+                .font_weight(if active {
+                    gpui::FontWeight::SEMIBOLD
+                } else {
+                    gpui::FontWeight::MEDIUM
+                })
+                .text_color(if active {
+                    rgba(0xFFFFFFFA)
+                } else {
+                    rgba(0xFFFFFF82)
+                })
+                .child(tab.label()),
         )
-        .child(div().flex_shrink_0().child(control))
 }
 
 /// Quiet frosted pill container matching the top Spaces capsule bar (`rgba(0xFFFFFF0E)`).
@@ -286,12 +347,23 @@ impl SwitcherView {
         self.settings_open = true;
         self.clear_shortcut_recordings();
         self.settings_error = None;
+        self.autostart_error = None;
         self.win_arrow_patch_error = None;
         self.quick_drag_hook_error = None;
         self.settings_scroll_y = 0.0;
         self.autostart_enabled = is_autostart_enabled();
         window.focus(&self.focus_handle);
         window.refresh();
+        cx.notify();
+    }
+
+    pub(crate) fn select_settings_tab(&mut self, tab: SettingsTab, cx: &mut Context<Self>) {
+        if self.settings_tab == tab {
+            return;
+        }
+        self.settings_tab = tab;
+        self.clear_shortcut_recordings();
+        self.settings_scroll_y = 0.0;
         cx.notify();
     }
 
@@ -302,6 +374,7 @@ impl SwitcherView {
         self.settings_open = false;
         self.clear_shortcut_recordings();
         self.settings_error = None;
+        self.autostart_error = None;
         self.win_arrow_patch_error = None;
         self.quick_drag_hook_error = None;
         // Immediately restore live DWM thumbnails for the Mission Control grid
@@ -569,6 +642,7 @@ impl SwitcherView {
             self.quick_drag_hook_error = None;
         }
         self.config = defaults;
+        self.autostart_error = None;
         self.clear_shortcut_recordings();
         self.apply_geometry_and_save(window, cx);
         self.transient_toast = Some((SharedString::from("已恢复默认"), Instant::now()));
@@ -738,8 +812,11 @@ impl SwitcherView {
                     ),
             );
 
-        let avail_h = (self.viewport_height_px.get() - 96.0).max(260.0);
-        let max_scroll = (SHEET_CONTENT_EST_H - avail_h).max(0.0);
+        let active_tab = self.settings_tab;
+        let avail_h = (self.viewport_height_px.get() - 56.0).max(260.0);
+        let sheet_h = SHEET_H.min(avail_h);
+        let body_avail_h = (sheet_h - SHEET_HEADER_H - SHEET_FOOTER_H).max(120.0);
+        let max_scroll = (active_tab.estimated_content_height() - body_avail_h).max(0.0);
         let scroll_y = self.settings_scroll_y.clamp(0.0, max_scroll);
 
         // Hotkey row: [ Ctrl | Alt | Win ] + [ Q ]
@@ -1588,6 +1665,213 @@ impl SwitcherView {
                 }),
             ));
 
+        let tab_bar = div()
+            .p(px(3.0))
+            .rounded_full()
+            .bg(rgba(0xFFFFFF0D))
+            .border_1()
+            .border_color(rgba(0xFFFFFF14))
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(2.0))
+            .children(SettingsTab::ALL.into_iter().map(|tab| {
+                settings_tab_pill(
+                    tab,
+                    active_tab == tab,
+                    cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.select_settings_tab(tab, cx);
+                    }),
+                )
+            }));
+
+        let tab_content = {
+            let col = div()
+                .relative()
+                .top(px(-scroll_y))
+                .w_full()
+                .px(px(22.0))
+                .py(px(6.0))
+                .flex()
+                .flex_col();
+
+            match active_tab {
+                SettingsTab::General => col
+                    .child(setting_row(
+                        "开机自启",
+                        minimal_switch(
+                            "sw-autostart",
+                            autostart,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                let next = !autostart;
+                                match set_autostart_enabled(next) {
+                                    Ok(()) => {
+                                        this.autostart_enabled = next;
+                                        this.autostart_error = None;
+                                        append_log(&format!("AUTOSTART settings -> {next}"));
+                                    }
+                                    Err(e) => {
+                                        this.autostart_error =
+                                            Some(SharedString::from(format!("开机自启失败：{e}")));
+                                    }
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                    ))
+                    .when_some(self.autostart_error.clone(), |el, err| {
+                        el.child(
+                            div()
+                                .pb(px(8.0))
+                                .text_xs()
+                                .text_color(rgb(0xFF8A80))
+                                .child(err),
+                        )
+                    })
+                    .child(row_divider())
+                    .child(setting_row(
+                        "失焦隐藏",
+                        minimal_switch(
+                            "sw-hide-blur",
+                            hide_on_blur,
+                            cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.config.hide_on_blur = !hide_on_blur;
+                                this.apply_visual_and_save(window, cx);
+                            }),
+                        ),
+                    ))
+                    .child(row_divider())
+                    .child(setting_row(
+                        "跨桌面衔接",
+                        minimal_switch(
+                            "sw-cross-nav",
+                            cross_nav,
+                            cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.config.cross_desktop_nav = !cross_nav;
+                                this.apply_visual_and_save(window, cx);
+                            }),
+                        ),
+                    ))
+                    .child(row_divider())
+                    .child(setting_row(
+                        "自动更新",
+                        minimal_switch(
+                            "sw-auto-update",
+                            auto_update,
+                            cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                let next = !auto_update;
+                                this.config.auto_update = next;
+                                this.apply_visual_and_save(window, cx);
+                                if next {
+                                    this.trigger_update_check(false, cx);
+                                }
+                            }),
+                        ),
+                    ))
+                    .child(row_divider())
+                    .child(setting_row("版本更新", update_check_control)),
+
+                SettingsTab::Shortcuts => col
+                    .child(setting_row("全局呼出", hotkey_control))
+                    .when_some(self.settings_error.clone(), |el, err| {
+                        el.child(
+                            div()
+                                .pb(px(8.0))
+                                .text_xs()
+                                .text_color(rgb(0xFF8A80))
+                                .child(err),
+                        )
+                    })
+                    .child(row_divider())
+                    .child(setting_row("强制退出", force_quit_control))
+                    .child(row_divider())
+                    .child(setting_row("移动桌面", move_desktop_control))
+                    .child(row_divider())
+                    .child(setting_row("增减列数", columns_keys_control))
+                    .child(row_divider())
+                    .child(setting_row("快捷拖动", quick_drag_control))
+                    .when_some(self.quick_drag_hook_error.clone(), |el, err| {
+                        el.child(
+                            div()
+                                .pb(px(8.0))
+                                .text_xs()
+                                .text_color(rgb(0xFF8A80))
+                                .child(err),
+                        )
+                    })
+                    .child(row_divider())
+                    .child(setting_row(
+                        "拖动后关闭",
+                        minimal_switch(
+                            "sw-quick-drag-auto-hide",
+                            quick_drag_auto_hide,
+                            cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.config.quick_drag_auto_hide = !quick_drag_auto_hide;
+                                this.apply_visual_and_save(window, cx);
+                            }),
+                        ),
+                    ))
+                    .child(row_divider())
+                    .child(setting_row(
+                        "Win + ←/→ 切虚拟桌面",
+                        minimal_switch(
+                            "sw-win-arrow-desktop",
+                            win_arrow_switch_desktop,
+                            cx.listener(move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.apply_win_arrow_patch_change(!win_arrow_switch_desktop, cx);
+                            }),
+                        ),
+                    ))
+                    .when_some(self.win_arrow_patch_error.clone(), |el, err| {
+                        el.child(
+                            div()
+                                .pb(px(8.0))
+                                .text_xs()
+                                .text_color(rgb(0xFF8A80))
+                                .child(err),
+                        )
+                    }),
+
+                SettingsTab::Layout => col
+                    .child(setting_row("每行列数", cols_control))
+                    .child(row_divider())
+                    .child(setting_row("列数范围", cols_bounds_control))
+                    .child(row_divider())
+                    .child(setting_row("预览尺寸", size_control))
+                    .child(row_divider())
+                    .child(setting_row("画面适配", fit_control))
+                    .child(row_divider())
+                    .child(setting_row("标签位置", label_control)),
+
+                SettingsTab::Appearance => col
+                    .child(setting_row("背景效果", bg_control))
+                    .child(row_divider())
+                    .child(setting_row("背景暗度", blur_control))
+                    .child(row_divider())
+                    .child(setting_row(
+                        "沉浸全屏",
+                        minimal_switch(
+                            "sw-immersive",
+                            immersive,
+                            cx.listener(move |this, _, window, cx| {
+                                cx.stop_propagation();
+                                this.config.immersive = !immersive;
+                                this.apply_geometry_and_save(window, cx);
+                            }),
+                        ),
+                    ))
+                    .child(row_divider())
+                    .child(setting_row("弹出屏幕", monitor_control)),
+            }
+        };
+
         // Fullscreen transparent hit area over real Acrylic blur -> click anywhere outside returns to grid
         div()
             .id("windeck-settings-canvas")
@@ -1612,6 +1896,7 @@ impl SwitcherView {
                 div()
                     .id("windeck-settings-sheet")
                     .w(px(SHEET_W))
+                    .h(px(sheet_h))
                     .max_h_full()
                     .rounded(px(20.0))
                     .bg(rgba(0x0B0F186E))
@@ -1638,25 +1923,18 @@ impl SwitcherView {
                             cx.notify();
                         },
                     ))
-                    // Quiet minimalist header
                     .child(
                         div()
-                            .h(px(50.0))
+                            .h(px(SHEET_HEADER_H))
                             .flex_shrink_0()
-                            .px(px(22.0))
+                            .px(px(18.0))
                             .border_b_1()
                             .border_color(rgba(0xFFFFFF10))
                             .flex()
                             .flex_row()
                             .items_center()
                             .justify_between()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(rgba(0xFFFFFFF2))
-                                    .child("设置"),
-                            )
+                            .child(tab_bar)
                             .child(
                                 div()
                                     .id("settings-close-x")
@@ -1680,7 +1958,6 @@ impl SwitcherView {
                                     ),
                             ),
                     )
-                    // Single clean scrollable list (no nested boxes, no loud chrome)
                     .child(
                         div()
                             .relative()
@@ -1688,191 +1965,11 @@ impl SwitcherView {
                             .min_h_0()
                             .w_full()
                             .overflow_hidden()
-                            .child(
-                                div()
-                                    .relative()
-                                    .top(px(-scroll_y))
-                                    .w_full()
-                                    .px(px(22.0))
-                                    .py(px(6.0))
-                                    .flex()
-                                    .flex_col()
-                                    .child(setting_row("快捷键", hotkey_control))
-                                    .when_some(self.settings_error.clone(), |el, err| {
-                                        el.child(
-                                            div()
-                                                .pb(px(8.0))
-                                                .text_xs()
-                                                .text_color(rgb(0xFF8A80))
-                                                .child(err),
-                                        )
-                                    })
-                                    .child(row_divider())
-                                    .child(setting_row("强制退出", force_quit_control))
-                                    .child(row_divider())
-                                    .child(setting_row("移动桌面", move_desktop_control))
-                                    .child(row_divider())
-                                    .child(setting_row("快捷拖动", quick_drag_control))
-                                    .when_some(self.quick_drag_hook_error.clone(), |el, err| {
-                                        el.child(
-                                            div()
-                                                .pb(px(8.0))
-                                                .text_xs()
-                                                .text_color(rgb(0xFF8A80))
-                                                .child(err),
-                                        )
-                                    })
-                                    .child(row_divider())
-                                    .child(setting_row(
-                                        "拖动后关闭",
-                                        minimal_switch(
-                                            "sw-quick-drag-auto-hide",
-                                            quick_drag_auto_hide,
-                                            cx.listener(move |this, _, window, cx| {
-                                                cx.stop_propagation();
-                                                this.config.quick_drag_auto_hide =
-                                                    !quick_drag_auto_hide;
-                                                this.apply_visual_and_save(window, cx);
-                                            }),
-                                        ),
-                                    ))
-                                    .child(row_divider())
-                                    .child(setting_row("增减列数", columns_keys_control))
-                                    .child(row_divider())
-                                    .child(setting_row("标签位置", label_control))
-                                    .child(row_divider())
-                                    .child(setting_row("画面适配", fit_control))
-                                    .child(row_divider())
-                                    .child(setting_row("预览尺寸", size_control))
-                                    .child(row_divider())
-                                    .child(setting_row("每行列数", cols_control))
-                                    .child(row_divider())
-                                    .child(setting_row("列数范围", cols_bounds_control))
-                                    .child(row_divider())
-                                    .child(setting_row("背景效果", bg_control))
-                                    .child(row_divider())
-                                    .child(setting_row("背景暗度", blur_control))
-                                    .child(row_divider())
-                                    .child(setting_row("弹出屏幕", monitor_control))
-                                    .child(row_divider())
-                                    .child(setting_row(
-                                        "沉浸全屏",
-                                        minimal_switch(
-                                            "sw-immersive",
-                                            immersive,
-                                            cx.listener(move |this, _, window, cx| {
-                                                cx.stop_propagation();
-                                                this.config.immersive = !immersive;
-                                                this.apply_geometry_and_save(window, cx);
-                                            }),
-                                        ),
-                                    ))
-                                    .child(row_divider())
-                                    .child(setting_row(
-                                        "跨桌面衔接",
-                                        minimal_switch(
-                                            "sw-cross-nav",
-                                            cross_nav,
-                                            cx.listener(move |this, _, window, cx| {
-                                                cx.stop_propagation();
-                                                this.config.cross_desktop_nav = !cross_nav;
-                                                this.apply_visual_and_save(window, cx);
-                                            }),
-                                        ),
-                                    ))
-                                    .child(row_divider())
-                                    .child(setting_row(
-                                        "失焦隐藏",
-                                        minimal_switch(
-                                            "sw-hide-blur",
-                                            hide_on_blur,
-                                            cx.listener(move |this, _, window, cx| {
-                                                cx.stop_propagation();
-                                                this.config.hide_on_blur = !hide_on_blur;
-                                                this.apply_visual_and_save(window, cx);
-                                            }),
-                                        ),
-                                    ))
-                                    .child(row_divider())
-                                    .child(setting_row(
-                                        "开机自启",
-                                        minimal_switch(
-                                            "sw-autostart",
-                                            autostart,
-                                            cx.listener(move |this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                let next = !autostart;
-                                                match set_autostart_enabled(next) {
-                                                    Ok(()) => {
-                                                        this.autostart_enabled = next;
-                                                        this.settings_error = None;
-                                                        append_log(&format!(
-                                                            "AUTOSTART settings -> {next}"
-                                                        ));
-                                                    }
-                                                    Err(e) => {
-                                                        this.settings_error = Some(
-                                                            SharedString::from(format!(
-                                                                "开机自启失败：{e}"
-                                                            )),
-                                                        );
-                                                    }
-                                                }
-                                                cx.notify();
-                                            }),
-                                        ),
-                                    ))
-                                    .child(row_divider())
-                                    .child(setting_row(
-                                        "自动更新",
-                                        minimal_switch(
-                                            "sw-auto-update",
-                                            auto_update,
-                                            cx.listener(move |this, _, window, cx| {
-                                                cx.stop_propagation();
-                                                let next = !auto_update;
-                                                this.config.auto_update = next;
-                                                this.apply_visual_and_save(window, cx);
-                                                if next {
-                                                    this.trigger_update_check(false, cx);
-                                                }
-                                            }),
-                                        ),
-                                    ))
-                                    .child(row_divider())
-                                    .child(setting_row("版本更新", update_check_control))
-                                    .child(row_divider())
-                                    .child(section_header("系统补丁"))
-                                    .child(setting_row_with_hint(
-                                        "Win + ←/→ 切虚拟桌面",
-                                        "覆盖系统窗口分屏，改用原生动画切换虚拟桌面（管理员窗口不生效）",
-                                        minimal_switch(
-                                            "sw-win-arrow-desktop",
-                                            win_arrow_switch_desktop,
-                                            cx.listener(move |this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                this.apply_win_arrow_patch_change(
-                                                    !win_arrow_switch_desktop,
-                                                    cx,
-                                                );
-                                            }),
-                                        ),
-                                    ))
-                                    .when_some(self.win_arrow_patch_error.clone(), |el, err| {
-                                        el.child(
-                                            div()
-                                                .pb(px(8.0))
-                                                .text_xs()
-                                                .text_color(rgb(0xFF8A80))
-                                                .child(err),
-                                        )
-                                    }),
-                            ),
+                            .child(tab_content),
                     )
-                    // Whisper-quiet footer links (no heavy buttons)
                     .child(
                         div()
-                            .h(px(44.0))
+                            .h(px(SHEET_FOOTER_H))
                             .flex_shrink_0()
                             .px(px(22.0))
                             .border_t_1()
@@ -1880,54 +1977,86 @@ impl SwitcherView {
                             .flex()
                             .flex_row()
                             .items_center()
-                            .justify_between()
+                            .gap(px(14.0))
                             .child(
                                 div()
-                                    .flex()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap(px(14.0))
-                                    .child(
-                                        div()
-                                            .id("settings-open-dir")
-                                            .cursor_pointer()
-                                            .text_xs()
-                                            .text_color(rgba(0xFFFFFF6E))
-                                            .hover(|s| s.text_color(rgba(0xFFFFFFDF)))
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                cx.stop_propagation();
-                                                let dir = config_dir();
-                                                let _ = std::fs::create_dir_all(&dir);
-                                                let _ = Command::new("explorer.exe").arg(dir).spawn();
-                                                this.transient_toast = Some((
-                                                    SharedString::from("已打开配置目录"),
-                                                    Instant::now(),
-                                                ));
-                                                cx.notify();
-                                            }))
-                                            .child("配置文件"),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("settings-reset")
-                                            .cursor_pointer()
-                                            .text_xs()
-                                            .text_color(rgba(0xFFFFFF6E))
-                                            .hover(|s| s.text_color(rgba(0xFFFFFFDF)))
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                cx.stop_propagation();
-                                                this.reset_all_defaults(window, cx);
-                                            }))
-                                            .child("恢复默认"),
-                                    ),
+                                    .id("settings-open-dir")
+                                    .cursor_pointer()
+                                    .text_xs()
+                                    .text_color(rgba(0xFFFFFF6E))
+                                    .hover(|s| s.text_color(rgba(0xFFFFFFDF)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        cx.stop_propagation();
+                                        let dir = config_dir();
+                                        let _ = std::fs::create_dir_all(&dir);
+                                        let _ = Command::new("explorer.exe").arg(dir).spawn();
+                                        this.transient_toast = Some((
+                                            SharedString::from("已打开配置目录"),
+                                            Instant::now(),
+                                        ));
+                                        cx.notify();
+                                    }))
+                                    .child("配置文件"),
                             )
                             .child(
                                 div()
+                                    .id("settings-reset")
+                                    .cursor_pointer()
                                     .text_xs()
-                                    .text_color(rgba(0xFFFFFF44))
-                                    .child("点击空白或按 Esc 返回"),
+                                    .text_color(rgba(0xFFFFFF6E))
+                                    .hover(|s| s.text_color(rgba(0xFFFFFFDF)))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        cx.stop_propagation();
+                                        this.reset_all_defaults(window, cx);
+                                    }))
+                                    .child("恢复默认"),
                             ),
                     ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SettingsTab;
+
+    #[test]
+    fn settings_tabs_cycle_forward_and_backward() {
+        let mut cur = SettingsTab::default();
+        assert_eq!(cur, SettingsTab::General);
+
+        for expected in [
+            SettingsTab::Shortcuts,
+            SettingsTab::Layout,
+            SettingsTab::Appearance,
+            SettingsTab::General,
+        ] {
+            cur = cur.next();
+            assert_eq!(cur, expected);
+        }
+
+        for expected in [
+            SettingsTab::Appearance,
+            SettingsTab::Layout,
+            SettingsTab::Shortcuts,
+            SettingsTab::General,
+        ] {
+            cur = cur.prev();
+            assert_eq!(cur, expected);
+        }
+    }
+
+    #[test]
+    fn all_tabs_fit_inside_default_sheet_body_without_scroll() {
+        let default_body_h = super::SHEET_H - super::SHEET_HEADER_H - super::SHEET_FOOTER_H;
+        for tab in SettingsTab::ALL {
+            assert!(
+                tab.estimated_content_height() <= default_body_h,
+                "tab {:?} estimated height {} exceeds default body height {}",
+                tab,
+                tab.estimated_content_height(),
+                default_body_h
+            );
+        }
     }
 }

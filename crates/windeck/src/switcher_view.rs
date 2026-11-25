@@ -55,6 +55,7 @@ use crate::genie::{
     bitmap_to_strip_render_image, sample_genie_strips, synthesize_fallback_card_bitmap,
 };
 use crate::nav::{NavDirection, navigate};
+use crate::settings_panel::SettingsTab;
 use crate::thumb_manager::ThumbnailManager;
 use crate::update_dialog::UpdateStatus;
 use crate::virtual_spaces::{AddWindowOutcome, SpaceId, VirtualSpaceStore};
@@ -1011,12 +1012,14 @@ pub struct SwitcherView {
     add_picker: Option<AddWindowPickerState>,
     pub(crate) search: OverlaySearchState,
     pub(crate) settings_open: bool,
+    pub(crate) settings_tab: SettingsTab,
     pub(crate) recording_hotkey_letter: bool,
     pub(crate) recording_force_quit_key: bool,
     pub(crate) recording_columns_inc_key: bool,
     pub(crate) recording_columns_dec_key: bool,
     pub(crate) recording_quick_drag_shortcut: bool,
     pub(crate) settings_error: Option<SharedString>,
+    pub(crate) autostart_error: Option<SharedString>,
     pub(crate) win_arrow_patch_error: Option<SharedString>,
     pub(crate) quick_drag_hook_error: Option<SharedString>,
     pub(crate) settings_scroll_y: f32,
@@ -1497,12 +1500,14 @@ impl SwitcherView {
             add_picker: None,
             search: OverlaySearchState::default(),
             settings_open: false,
+            settings_tab: SettingsTab::default(),
             recording_hotkey_letter: false,
             recording_force_quit_key: false,
             recording_columns_inc_key: false,
             recording_columns_dec_key: false,
             recording_quick_drag_shortcut: false,
             settings_error: None,
+            autostart_error: None,
             win_arrow_patch_error: None,
             quick_drag_hook_error: None,
             settings_scroll_y: 0.0,
@@ -1937,6 +1942,7 @@ impl SwitcherView {
         self.update_dialog_open = false;
         self.clear_shortcut_recordings();
         self.settings_error = None;
+        self.autostart_error = None;
         self.win_arrow_patch_error = None;
         self.quick_drag_hook_error = None;
         self.suppress_next_left_mouse_up = false;
@@ -2126,6 +2132,7 @@ impl SwitcherView {
         self.update_dialog_open = false;
         self.clear_shortcut_recordings();
         self.settings_error = None;
+        self.autostart_error = None;
         self.hold_active = false;
         self.hold_navigated = false;
         self.suppress_next_left_mouse_up = false;
@@ -5298,6 +5305,17 @@ impl SwitcherView {
                 }
             } else if key == "escape" {
                 self.close_settings(window, cx);
+            } else if key == "tab" {
+                let next_tab = if mods.shift {
+                    self.settings_tab.prev()
+                } else {
+                    self.settings_tab.next()
+                };
+                self.select_settings_tab(next_tab, cx);
+            } else if key == "left" && !mods.control && !mods.alt && !mods.shift {
+                self.select_settings_tab(self.settings_tab.prev(), cx);
+            } else if key == "right" && !mods.control && !mods.alt && !mods.shift {
+                self.select_settings_tab(self.settings_tab.next(), cx);
             }
             return;
         }

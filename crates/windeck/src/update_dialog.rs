@@ -94,7 +94,10 @@ impl SwitcherView {
 
     pub fn check_update_from_shell(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.visible {
+            self.settings_tab = crate::settings_panel::SettingsTab::General;
             self.open_settings(window, cx);
+        } else if self.settings_open {
+            self.select_settings_tab(crate::settings_panel::SettingsTab::General, cx);
         }
         self.trigger_update_check(true, cx);
     }
