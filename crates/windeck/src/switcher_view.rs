@@ -9,25 +9,28 @@ use std::time::{Duration, Instant};
 use gpui::{
     App, Bounds, ClickEvent, Context, Corners, ElementInputHandler, EntityInputHandler,
     FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, Pixels, Point, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString,
-    UTF16Selection, Window, WindowBackgroundAppearance, canvas, div, img, point, prelude::*, px,
-    rgb, rgba, size,
+    MouseUpEvent, NavigationDirection, Pixels, Point, RenderImage, ScrollDelta, ScrollWheelEvent,
+    SharedString, UTF16Selection, Window, WindowBackgroundAppearance, canvas, div, img, point,
+    prelude::*, px, rgb, rgba, size,
 };
 use smallvec::smallvec;
 use win_platform::{
     CapturedBitmap, DesktopId, DwmTransitionSuppressGuard, ForceQuitOutcome, HoldNavDirection,
-    IconBgra, MonitorInfo, PreRestoreResult, PrimaryModifier, ReleaseInfo, ShellHost,
+    IconBgra, MonitorInfo, PreRestoreResult, PrimaryModifier, QuickDragModifiers,
+    QuickDragMouseButton, QuickDragShortcut, QuickDragTriggerInfo, ReleaseInfo, ShellHost,
     SingleInstanceGuard, ThumbnailHostWindow, VirtualDesktopClient, VirtualDesktopInfo, WindowInfo,
     activate_window_foreground, capture_screen_rect_bgra, capture_window_bgra,
-    configure_borderless_immersive, enumerate_monitors, enumerate_windows, extract_window_icon,
-    force_quit_window, hide_layered_overlay, inspect_layered_overlay_state, pin_layered_z_order,
-    pre_restore_minimized_window, query_window_and_client_sizes, refresh_window_geometry,
-    show_and_focus_layered_overlay, switch_desktop_and_wait, switch_to_window,
+    configure_borderless_immersive, current_cursor_screen_pos, current_physical_modifiers,
+    enumerate_monitors, enumerate_windows, extract_window_icon, force_quit_window,
+    hide_layered_overlay, inspect_layered_overlay_state, pin_layered_z_order,
+    pre_restore_minimized_window, query_window_and_client_sizes, refocus_layered_overlay,
+    refresh_window_geometry, show_and_focus_layered_overlay, switch_desktop_and_wait,
+    switch_to_window,
 };
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::UI::WindowsAndMessaging::{
     GA_ROOTOWNER, GetAncestor, GetForegroundWindow, GetShellWindow, GetWindowThreadProcessId,
-    IsWindow, SetForegroundWindow,
+    IsIconic, IsWindow, SetForegroundWindow,
 };
 
 use crate::animation::{
@@ -85,6 +88,8 @@ const BELOW_DESKTOP_TRIGGER_GAP: f32 = GROUP_TOP_GAP - GROUP_HIT_PAD_Y;
 const DRAG_BOTTOM_REACH_EXTRA: f32 = 28.0;
 const DRAG_THRESHOLD_PX: f32 = 6.0;
 const DRAG_CARD_SCALE: f32 = 0.78;
+const QUICK_DRAG_CANCEL_DISTANCE_PX: f32 = 48.0;
+const QUICK_DRAG_CANCEL_MIN_HOLD_MS: u64 = 260;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DropTarget {
@@ -165,11 +170,129 @@ struct PendingDrag {
     accent_color: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum DragInteractionMode {
+    /// Standard in-panel drag started by pressing and moving a card while Left stays held.
+    PointerHeld,
+    /// Global `Ctrl + Alt + Left Click` quick-drag while the initial physical Left button is held.
+    /// `WH_MOUSE_LL` swallows the original LeftDown/LeftUp, so GPUI sees `pressed_button == None`
+    /// and button release arrives via `ShellEvent::QuickDragButtonReleased`.
+    QuickDragInitialHold {
+        press_screen_x: i32,
+        press_screen_y: i32,
+        started_at: Instant,
+        scale: f32,
+    },
+    /// Click-carry mode entered when the initial `Ctrl + Alt + Left` click is released quickly:
+    /// the card glides smoothly with the pointer until a left-click drops (or Esc / right-click cancels).
+    StickyCarry,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuickDragReleaseDecision {
+    CommitDrop(DropTarget),
+    EnterStickyCarry,
+    CancelDrag,
+}
+
+fn decide_quick_drag_release(
+    moved_logical_px: f32,
+    held_duration: Duration,
+    drop_target: Option<DropTarget>,
+) -> QuickDragReleaseDecision {
+    if moved_logical_px >= DRAG_THRESHOLD_PX {
+        if let Some(target) = drop_target {
+            return QuickDragReleaseDecision::CommitDrop(target);
+        }
+        if moved_logical_px >= QUICK_DRAG_CANCEL_DISTANCE_PX
+            && held_duration >= Duration::from_millis(QUICK_DRAG_CANCEL_MIN_HOLD_MS)
+        {
+            return QuickDragReleaseDecision::CancelDrag;
+        }
+    }
+    QuickDragReleaseDecision::EnterStickyCarry
+}
+
+fn resolve_quick_drag_target_hwnd(
+    trigger: QuickDragTriggerInfo,
+    windows: &[WindowInfo],
+) -> Option<isize> {
+    let candidates = if trigger.triggered_by_keyboard {
+        [
+            trigger.fg_hwnd,
+            trigger.fg_root_hwnd,
+            trigger.cursor_hwnd,
+            trigger.cursor_root_hwnd,
+        ]
+    } else {
+        [
+            trigger.cursor_hwnd,
+            trigger.cursor_root_hwnd,
+            trigger.fg_hwnd,
+            trigger.fg_root_hwnd,
+        ]
+    };
+    for candidate in candidates {
+        if candidate != 0 && windows.iter().any(|w| w.hwnd == candidate) {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// Returns `true` when moving `drag_hwnd` to `target_did` should also switch the real Windows
+/// virtual desktop to `target_did`: specifically when the dragged window is the currently focused
+/// foreground window (or its root owner) and `target_did` differs from the active virtual desktop.
+fn should_follow_actual_desktop_after_drop(
+    drag_hwnd: isize,
+    prev_fg_hwnd: isize,
+    prev_fg_root_hwnd: isize,
+    current_desktop_id: Option<DesktopId>,
+    target_did: DesktopId,
+) -> bool {
+    let is_focused = drag_hwnd != 0 && (drag_hwnd == prev_fg_hwnd || drag_hwnd == prev_fg_root_hwnd);
+    is_focused && current_desktop_id != Some(target_did)
+}
+
+fn handoff_focus_to_window_if_alive(target_raw: isize) {
+    if target_raw == 0 {
+        return;
+    }
+    let target = HWND(target_raw as *mut std::ffi::c_void);
+    if unsafe { IsWindow(Some(target)) }.as_bool() && !unsafe { IsIconic(target) }.as_bool() {
+        let _ = activate_window_foreground(target_raw);
+    }
+}
+
+fn map_screen_to_overlay_logical(
+    screen_x: i32,
+    screen_y: i32,
+    overlay_phys_rect: RECT,
+    scale: f32,
+) -> Point<Pixels> {
+    let sf = scale.max(1.0);
+    point(
+        px((screen_x - overlay_phys_rect.left) as f32 / sf),
+        px((screen_y - overlay_phys_rect.top) as f32 / sf),
+    )
+}
+
+fn clamp_point_to_overlay(pos: Point<Pixels>, overlay_w: f32, overlay_h: f32) -> Point<Pixels> {
+    let max_x = overlay_w.max(64.0);
+    let max_y = overlay_h.max(TOP_SPACES_BAR_H + 64.0);
+    point(
+        px(f32::from(pos.x).clamp(0.0, max_x)),
+        px(f32::from(pos.y).clamp(0.0, max_y)),
+    )
+}
+
 struct ActiveDrag {
     hwnd: isize,
     source_desktop_id: Option<DesktopId>,
     is_pinned: bool,
     was_current_tab: bool,
+    from_quick_drag: bool,
+    mode: DragInteractionMode,
     origin_bounds: Bounds<Pixels>,
     grab_offset: Point<Pixels>,
     cursor_pos: Point<Pixels>,
@@ -868,6 +991,10 @@ pub struct SwitcherView {
     pub(crate) hold_navigated: bool,
     prev_foreground_hwnd: isize,
     prev_foreground_root_hwnd: isize,
+    followed_focus_hwnd: Option<isize>,
+    pending_hidden_focus_hwnd: Option<isize>,
+    follow_desktop_switch_seq: u64,
+    follow_desktop_switch_in_flight: Option<u64>,
     desktops: Vec<VirtualDesktopInfo>,
     monitors: Vec<MonitorInfo>,
     all_windows: Vec<WindowInfo>,
@@ -888,8 +1015,10 @@ pub struct SwitcherView {
     pub(crate) recording_force_quit_key: bool,
     pub(crate) recording_columns_inc_key: bool,
     pub(crate) recording_columns_dec_key: bool,
+    pub(crate) recording_quick_drag_shortcut: bool,
     pub(crate) settings_error: Option<SharedString>,
     pub(crate) win_arrow_patch_error: Option<SharedString>,
+    pub(crate) quick_drag_hook_error: Option<SharedString>,
     pub(crate) settings_scroll_y: f32,
     pub(crate) autostart_enabled: bool,
     scroll_y: f32,
@@ -914,6 +1043,8 @@ pub struct SwitcherView {
     exit_anim: Option<ExitTransition>,
     pending_drag: Option<PendingDrag>,
     active_drag: Option<ActiveDrag>,
+    suppress_next_left_mouse_up: bool,
+    suppress_next_right_mouse_up: bool,
     pending_desktop_reorder: Option<PendingDesktopReorder>,
     active_desktop_reorder: Option<ActiveDesktopReorder>,
     pill_settle_anim: Option<PillSettleAnim>,
@@ -1346,6 +1477,10 @@ impl SwitcherView {
             hold_navigated: false,
             prev_foreground_hwnd: 0,
             prev_foreground_root_hwnd: 0,
+            followed_focus_hwnd: None,
+            pending_hidden_focus_hwnd: None,
+            follow_desktop_switch_seq: 0,
+            follow_desktop_switch_in_flight: None,
             desktops: Vec::new(),
             monitors: Vec::new(),
             all_windows: Vec::new(),
@@ -1366,8 +1501,10 @@ impl SwitcherView {
             recording_force_quit_key: false,
             recording_columns_inc_key: false,
             recording_columns_dec_key: false,
+            recording_quick_drag_shortcut: false,
             settings_error: None,
             win_arrow_patch_error: None,
+            quick_drag_hook_error: None,
             settings_scroll_y: 0.0,
             autostart_enabled: false,
             scroll_y: 0.0,
@@ -1392,6 +1529,8 @@ impl SwitcherView {
             exit_anim: None,
             pending_drag: None,
             active_drag: None,
+            suppress_next_left_mouse_up: false,
+            suppress_next_right_mouse_up: false,
             pending_desktop_reorder: None,
             active_desktop_reorder: None,
             pill_settle_anim: None,
@@ -1485,6 +1624,11 @@ impl SwitcherView {
             || self.exit_anim.is_some()
             || self.active_drag.is_some()
             || self.active_desktop_reorder.is_some()
+            || self.follow_desktop_switch_in_flight.is_some()
+            || self
+                .genie_anim
+                .as_ref()
+                .is_some_and(|g| g.auto_hide_on_finish)
         {
             return;
         }
@@ -1494,7 +1638,7 @@ impl SwitcherView {
                     return;
                 }
             }
-            self.hide(cx);
+            self.hide_inner(false, cx);
         }
     }
 
@@ -1522,10 +1666,92 @@ impl SwitcherView {
                 self.hide(cx);
             }
         } else {
-            self.show_and_refresh_inner(window, hold_armed, cx);
+            self.show_and_refresh_inner(window, hold_armed, None, cx);
             self.hold_active = hold_armed;
             self.hold_navigated = false;
             cx.notify();
+        }
+    }
+
+    pub fn open_with_quick_drag(
+        &mut self,
+        trigger: QuickDragTriggerInfo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.exit_anim.is_some() {
+            self.finish_exit_transition(cx);
+        }
+        if self.visible && self.is_downloading_update() {
+            return;
+        }
+        self.show_and_refresh_inner(window, false, Some(trigger), cx);
+    }
+
+    pub fn handle_quick_drag_button_released(
+        &mut self,
+        screen_x: i32,
+        screen_y: i32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.visible || self.exit_anim.is_some() {
+            return;
+        }
+        let Some((press_screen_x, press_screen_y, started_at, scale, drag_hwnd, src_did, is_pinned)) =
+            self.active_drag.as_ref().and_then(|d| match d.mode {
+                DragInteractionMode::QuickDragInitialHold {
+                    press_screen_x,
+                    press_screen_y,
+                    started_at,
+                    scale,
+                } => Some((
+                    press_screen_x,
+                    press_screen_y,
+                    started_at,
+                    scale,
+                    d.hwnd,
+                    d.source_desktop_id,
+                    d.is_pinned,
+                )),
+                _ => None,
+            })
+        else {
+            return;
+        };
+
+        let moved_logical_px = (((screen_x - press_screen_x) as f32)
+            .hypot((screen_y - press_screen_y) as f32))
+            / scale.max(1.0);
+        let release_pos = map_screen_to_overlay_logical(
+            screen_x,
+            screen_y,
+            self.overlay_phys_rect,
+            self.overlay_scale,
+        );
+        let drop_target = self.resolve_drop_target(release_pos, drag_hwnd, src_did, is_pinned);
+
+        match decide_quick_drag_release(moved_logical_px, started_at.elapsed(), drop_target) {
+            QuickDragReleaseDecision::CommitDrop(target) => {
+                self.finish_active_drag_at(release_pos, Some(target), window, cx);
+            }
+            QuickDragReleaseDecision::EnterStickyCarry => {
+                let overlay_w = self.viewport_width_px.get();
+                let overlay_h = self.viewport_height_px.get() + TOP_SPACES_BAR_H;
+                let clamped_pos = clamp_point_to_overlay(release_pos, overlay_w, overlay_h);
+                if let Some(ref mut drag) = self.active_drag {
+                    drag.mode = DragInteractionMode::StickyCarry;
+                    drag.cursor_pos = clamped_pos;
+                    if drag.target != drop_target {
+                        drag.target = drop_target;
+                        self.preview_box_bounds.borrow_mut().take();
+                    }
+                }
+                cx.notify();
+            }
+            QuickDragReleaseDecision::CancelDrag => {
+                self.cancel_active_drag(cx);
+            }
         }
     }
 
@@ -1683,7 +1909,14 @@ impl SwitcherView {
         }
     }
 
-    pub fn hide(&mut self, cx: &mut Context<Self>) {
+    fn clear_follow_desktop_state(&mut self) {
+        self.followed_focus_hwnd = None;
+        self.pending_hidden_focus_hwnd = None;
+        self.follow_desktop_switch_in_flight = None;
+        self.follow_desktop_switch_seq = self.follow_desktop_switch_seq.wrapping_add(1);
+    }
+
+    fn reset_overlay_state_before_hide(&mut self) {
         self.clear_all_animations(false);
         self.thumbs.borrow_mut().unregister_all();
         self.last_thumb_bounds.borrow_mut().clear();
@@ -1693,7 +1926,6 @@ impl SwitcherView {
         *self.vspace_add_pill_bounds.borrow_mut() = None;
         self.group_bounds.borrow_mut().clear();
         *self.preview_box_bounds.borrow_mut() = None;
-        hide_layered_overlay(self.gpui_hwnd, self.thumb_host.hwnd());
         self.visible = false;
         self.shown_at = None;
         self.hold_active = false;
@@ -1703,17 +1935,146 @@ impl SwitcherView {
         self.search.reset();
         self.settings_open = false;
         self.update_dialog_open = false;
-        self.recording_hotkey_letter = false;
-        self.recording_force_quit_key = false;
+        self.clear_shortcut_recordings();
         self.settings_error = None;
         self.win_arrow_patch_error = None;
+        self.quick_drag_hook_error = None;
+        self.suppress_next_left_mouse_up = false;
+        self.suppress_next_right_mouse_up = false;
         self.transient_toast = None;
         self.sync_visibility_to_host();
+    }
+
+    fn hide_inner(&mut self, allow_focus_handoff: bool, cx: &mut Context<Self>) {
+        let followed_hwnd = self.followed_focus_hwnd.take();
+        let switch_in_flight = self.follow_desktop_switch_in_flight.is_some();
+        self.reset_overlay_state_before_hide();
+        if allow_focus_handoff {
+            if let Some(target_hwnd) = followed_hwnd {
+                if switch_in_flight {
+                    self.pending_hidden_focus_hwnd = Some(target_hwnd);
+                } else {
+                    handoff_focus_to_window_if_alive(target_hwnd);
+                }
+            }
+        } else {
+            self.pending_hidden_focus_hwnd = None;
+        }
+        hide_layered_overlay(self.gpui_hwnd, self.thumb_host.hwnd());
+        cx.notify();
+    }
+
+    pub fn hide(&mut self, cx: &mut Context<Self>) {
+        self.hide_inner(true, cx);
+    }
+
+    fn spawn_follow_desktop_switch(
+        &mut self,
+        target_did: DesktopId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Arc<AtomicBool> {
+        self.follow_desktop_switch_seq = self.follow_desktop_switch_seq.wrapping_add(1);
+        let seq = self.follow_desktop_switch_seq;
+        self.follow_desktop_switch_in_flight = Some(seq);
+        self.shown_at = Some(Instant::now());
+
+        let ready = Arc::new(AtomicBool::new(false));
+        let ready_for_task = ready.clone();
+        let vdm = self.vdm.clone();
+        let window_handle = Window::window_handle(window);
+        cx.spawn(async move |this, cx| {
+            let switch_res = cx
+                .background_executor()
+                .spawn(async move {
+                    switch_desktop_and_wait(&vdm, target_did, Duration::from_millis(200))
+                })
+                .await;
+            let mut updated = false;
+            let _ = cx.update(|cx| {
+                let _ = window_handle.update(cx, |_, window, cx| {
+                    if this
+                        .update(cx, |view, cx| {
+                            view.on_follow_desktop_switch_finished(
+                                seq,
+                                target_did,
+                                switch_res,
+                                &ready_for_task,
+                                window,
+                                cx,
+                            );
+                        })
+                        .is_ok()
+                    {
+                        updated = true;
+                    }
+                });
+            });
+            if !updated {
+                ready_for_task.store(true, Ordering::Release);
+            }
+        })
+        .detach();
+        ready
+    }
+
+    fn on_follow_desktop_switch_finished(
+        &mut self,
+        seq: u64,
+        target_did: DesktopId,
+        switch_res: anyhow::Result<bool>,
+        ready: &Arc<AtomicBool>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        ready.store(true, Ordering::Release);
+        if self.follow_desktop_switch_in_flight == Some(seq) {
+            self.follow_desktop_switch_in_flight = None;
+        }
+        if self.follow_desktop_switch_seq != seq {
+            cx.notify();
+            return;
+        }
+
+        match switch_res {
+            Ok(matched) => {
+                append_log(&format!(
+                    "FOLLOW_DESKTOP_SWITCH target={target_did} matched={matched}"
+                ));
+                if self.visible && self.exit_anim.is_none() {
+                    self.shown_at = Some(Instant::now());
+                    self.suppress_blur_hide = true;
+                    refocus_layered_overlay(
+                        self.gpui_hwnd,
+                        self.thumb_host.hwnd(),
+                        self.overlay_phys_rect,
+                    );
+                    window.focus(&self.focus_handle);
+                    self.suppress_blur_hide = false;
+                } else if !self.visible && self.exit_anim.is_none() {
+                    if let Some(hwnd) = self.pending_hidden_focus_hwnd.take() {
+                        handoff_focus_to_window_if_alive(hwnd);
+                    }
+                }
+            }
+            Err(e) => {
+                append_log(&format!(
+                    "FOLLOW_DESKTOP_SWITCH ERROR target={target_did}: {e:#}"
+                ));
+                self.pending_hidden_focus_hwnd = None;
+                if self.visible && self.exit_anim.is_none() {
+                    if let Ok(fresh_desktops) = self.vdm.get_desktops() {
+                        self.desktops = fresh_desktops;
+                        self.rebuild_visible_groups(false);
+                    }
+                }
+            }
+        }
         cx.notify();
     }
 
     pub fn show_and_refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_and_refresh_inner(window, false, cx);
+        self.show_and_refresh_inner(window, false, None, cx);
     }
 
     fn capture_foreground_candidates(&mut self) {
@@ -1745,20 +2106,30 @@ impl SwitcherView {
         &mut self,
         window: &mut Window,
         hold_armed: bool,
+        quick_drag: Option<QuickDragTriggerInfo>,
         cx: &mut Context<Self>,
     ) {
         let t_start = Instant::now();
-        self.capture_foreground_candidates();
+        self.clear_follow_desktop_state();
+        if let Some(trigger) = quick_drag
+            && (trigger.fg_hwnd != 0 || trigger.fg_root_hwnd != 0)
+        {
+            self.prev_foreground_hwnd = trigger.fg_hwnd;
+            self.prev_foreground_root_hwnd = trigger.fg_root_hwnd;
+        } else {
+            self.capture_foreground_candidates();
+        }
         self.hovered_flat = None;
         self.clear_space_popups();
         self.search.reset();
         self.settings_open = false;
         self.update_dialog_open = false;
-        self.recording_hotkey_letter = false;
-        self.recording_force_quit_key = false;
+        self.clear_shortcut_recordings();
         self.settings_error = None;
         self.hold_active = false;
         self.hold_navigated = false;
+        self.suppress_next_left_mouse_up = false;
+        self.suppress_next_right_mouse_up = false;
         self.clear_all_animations(false);
         self.last_thumb_bounds.borrow_mut().clear();
         self.scroll_y = 0.0;
@@ -1770,8 +2141,56 @@ impl SwitcherView {
 
         self.refresh_snapshot();
 
+        // For global Ctrl+Alt+Left quick-drag, capture the target window's live pixels BEFORE
+        // revealing the overlay so PrintWindow and desktop BitBlt see the real unobstructed window.
+        struct PreparedQuickDrag {
+            trigger: QuickDragTriggerInfo,
+            hwnd: isize,
+            source_desktop_id: Option<DesktopId>,
+            is_pinned: bool,
+            icon: Option<Arc<RenderImage>>,
+            captured: CapturedBitmap,
+            full_image: Arc<RenderImage>,
+        }
+        let prepared_quick_drag: Option<PreparedQuickDrag> = quick_drag.and_then(|trigger| {
+            let target_hwnd = resolve_quick_drag_target_hwnd(trigger, &self.all_windows)?;
+            let card = self
+                .groups
+                .iter()
+                .flat_map(|g| g.cards.iter())
+                .find(|c| c.info.hwnd == target_hwnd)?;
+            let flat_index = card.flat_index;
+            let source_desktop_id = card.info.desktop_id;
+            let is_pinned = card.info.is_pinned;
+            let icon = card.icon.clone();
+            let accent_color = card.accent_color;
+            let visible_rect = card.info.visible_rect;
+            let is_minimized = card.info.is_minimized;
+
+            self.selected_flat = flat_index;
+            let captured = self.capture_window_bitmap_for_quick_drag(
+                target_hwnd,
+                self.config.preview_width,
+                self.config.preview_height,
+                visible_rect,
+                is_minimized,
+                accent_color,
+            );
+            let full_image = bitmap_to_full_render_image(&captured)?;
+            Some(PreparedQuickDrag {
+                trigger,
+                hwnd: target_hwnd,
+                source_desktop_id,
+                is_pinned,
+                icon,
+                captured,
+                full_image,
+            })
+        });
+
         let prompt_cached_update = !self.bench_mode
             && !hold_armed
+            && quick_drag.is_none()
             && self.pending_update.as_ref().is_some_and(|rel| {
                 self.dismissed_update_tag.as_deref() != Some(rel.tag_name.as_str())
             });
@@ -1816,12 +2235,73 @@ impl SwitcherView {
 
         window.focus(&self.focus_handle);
         self.ensure_selected_visible_instant();
+
+        let quick_drag_hwnd = if let Some(prepared) = prepared_quick_drag {
+            self.thumbs.borrow_mut().hide_thumbnail(prepared.hwnd);
+            let (live_x, live_y) = current_cursor_screen_pos()
+                .unwrap_or((prepared.trigger.screen_x, prepared.trigger.screen_y));
+            let overlay_w = self.viewport_width_px.get();
+            let overlay_h = self.viewport_height_px.get() + TOP_SPACES_BAR_H;
+            let cursor_pos = clamp_point_to_overlay(
+                map_screen_to_overlay_logical(
+                    live_x,
+                    live_y,
+                    self.overlay_phys_rect,
+                    self.overlay_scale,
+                ),
+                overlay_w,
+                overlay_h,
+            );
+            let origin_bounds = self
+                .resolve_card_thumb_bounds(prepared.hwnd, self.scroll_y)
+                .unwrap_or_else(|| {
+                    let (_, pw, ph, _, _) = self.fixed_grid_geometry();
+                    Bounds {
+                        origin: point(cursor_pos.x - px(pw * 0.5), cursor_pos.y - px(ph * 0.5)),
+                        size: size(px(pw), px(ph)),
+                    }
+                });
+            let grab_offset = point(
+                px(f32::from(origin_bounds.size.width) * 0.5),
+                px(f32::from(origin_bounds.size.height) * 0.5),
+            );
+            let dragged_hwnd = prepared.hwnd;
+            let initial_mode = if prepared.trigger.triggered_by_keyboard {
+                DragInteractionMode::StickyCarry
+            } else {
+                DragInteractionMode::QuickDragInitialHold {
+                    press_screen_x: prepared.trigger.screen_x,
+                    press_screen_y: prepared.trigger.screen_y,
+                    started_at: Instant::now(),
+                    scale: self.overlay_scale,
+                }
+            };
+            self.active_drag = Some(ActiveDrag {
+                hwnd: dragged_hwnd,
+                source_desktop_id: prepared.source_desktop_id,
+                is_pinned: prepared.is_pinned,
+                was_current_tab: true,
+                from_quick_drag: true,
+                mode: initial_mode,
+                origin_bounds,
+                grab_offset,
+                cursor_pos,
+                target: None,
+                icon: prepared.icon,
+                captured: prepared.captured,
+                full_image: prepared.full_image,
+            });
+            Some(dragged_hwnd)
+        } else {
+            None
+        };
+
         window.refresh();
 
         let diag = inspect_layered_overlay_state(self.gpui_hwnd, self.thumb_host.hwnd());
         self.last_open_ms = t_start.elapsed().as_secs_f64() * 1000.0;
         append_log(&format!(
-            "OPEN total={:.2}ms enum={:.2}ms desktops={} windows={} thumbs={} fg=0x{:X} sel={} preview={}x{} fit={} label={} host_vis={} host_z={} host_top={} gpui_top={} gpui_fg={} host_cloak={} host_sz={}x{}",
+            "OPEN total={:.2}ms enum={:.2}ms desktops={} windows={} thumbs={} fg=0x{:X} sel={} quick_drag_hwnd=0x{:X} preview={}x{} fit={} label={} host_vis={} host_z={} host_top={} gpui_top={} gpui_fg={} host_cloak={} host_sz={}x{}",
             self.last_open_ms,
             self.last_enum_ms,
             self.desktops.len(),
@@ -1829,6 +2309,7 @@ impl SwitcherView {
             self.thumbs.borrow().active_count(),
             self.prev_foreground_hwnd,
             self.selected_flat,
+            quick_drag_hwnd.unwrap_or(0),
             self.config.preview_width as i32,
             self.config.preview_height as i32,
             self.config.preview_fit.as_config_str(),
@@ -1900,6 +2381,9 @@ impl SwitcherView {
                     self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
                 }
             }
+        }
+        if let Some(ref drag) = self.active_drag {
+            self.thumbs.borrow_mut().hide_thumbnail(drag.hwnd);
         }
         window.refresh();
         cx.notify();
@@ -4065,6 +4549,7 @@ impl SwitcherView {
         if self.exit_anim.is_some() {
             return;
         }
+        self.clear_follow_desktop_state();
         let raw = HWND(target_hwnd as *mut std::ffi::c_void);
         if !unsafe { IsWindow(Some(raw)) }.as_bool() {
             self.clear_all_animations(false);
@@ -4388,6 +4873,7 @@ impl SwitcherView {
         if self.exit_anim.is_some() {
             return;
         }
+        self.clear_follow_desktop_state();
         // Locate frontmost non-minimized window on destination desktop to prevent UWP late-activation pull-back
         let dest_front_hwnd = self
             .all_windows
@@ -4787,6 +5273,28 @@ impl SwitcherView {
                     mods.shift,
                 ) {
                     self.apply_columns_dec_key_change(sc, cx);
+                }
+            } else if self.recording_quick_drag_shortcut {
+                if key == "escape" {
+                    self.recording_quick_drag_shortcut = false;
+                    self.quick_drag_hook_error = None;
+                    cx.notify();
+                } else {
+                    let phys = current_physical_modifiers();
+                    let combined = QuickDragModifiers::new(
+                        phys.ctrl || mods.control,
+                        phys.alt || mods.alt,
+                        phys.shift || mods.shift,
+                        phys.win || mods.platform,
+                    );
+                    match QuickDragShortcut::from_key_name(key, combined) {
+                        Ok(Some(sc)) => self.apply_quick_drag_shortcut_change(sc, cx),
+                        Ok(None) => {}
+                        Err(e) => {
+                            self.quick_drag_hook_error = Some(SharedString::from(format!("{e}")));
+                            cx.notify();
+                        }
+                    }
                 }
             } else if key == "escape" {
                 self.close_settings(window, cx);
@@ -5695,6 +6203,50 @@ impl SwitcherView {
         synthesize_fallback_card_bitmap(target_w, target_h, accent_color)
     }
 
+    /// Captures a target window's live preview BEFORE the WinDeck overlay is revealed
+    /// (used by global `Ctrl + Alt + Left Click` quick-drag before DWM thumbnails have painted).
+    fn capture_window_bitmap_for_quick_drag(
+        &self,
+        hwnd: isize,
+        card_w: f32,
+        card_h: f32,
+        visible_rect: RECT,
+        is_minimized: bool,
+        accent_color: u32,
+    ) -> CapturedBitmap {
+        let card_w = card_w.max(64.0);
+        let card_h = card_h.max(40.0);
+        let target_w = (card_w.round() as u32).clamp(64, GENIE_CAPTURE_MAX_W);
+        let target_h = ((card_h * (target_w as f32 / card_w)).round() as u32).clamp(40, 320);
+
+        // Tier 1: Direct PrintWindow capture (clean even if window is partially occluded or off-primary monitor).
+        if let Some(bmp) = capture_window_bgra(
+            hwnd,
+            target_w,
+            target_h,
+            self.config.preview_fit == PreviewFit::Cover,
+        ) {
+            if bitmap_has_visible_pixels(&bmp) {
+                return bmp;
+            }
+        }
+
+        // Tier 2: Pre-overlay DWM screen capture of the window's live visible bounds.
+        if !is_minimized
+            && (visible_rect.right - visible_rect.left) >= 32
+            && (visible_rect.bottom - visible_rect.top) >= 32
+        {
+            if let Some(bmp) = capture_screen_rect_bgra(visible_rect, GENIE_CAPTURE_MAX_W) {
+                if bitmap_has_visible_pixels(&bmp) {
+                    return bmp;
+                }
+            }
+        }
+
+        // Tier 3: Pure-Rust frosted fallback so quick-drag never fails on protected/minimized windows.
+        synthesize_fallback_card_bitmap(target_w, target_h, accent_color)
+    }
+
     fn resolve_drop_target(
         &self,
         pos: Point<Pixels>,
@@ -6281,11 +6833,133 @@ impl SwitcherView {
                 is_virtual_space_transfer: false,
                 keep_source_slot_visible: false,
                 hold_below_new_desktop_zone: false,
+                auto_hide_on_finish: false,
+                auto_hide_wait_ready: None,
             });
         } else {
             self.queue_drop_image(drag.full_image);
         }
         cx.notify();
+    }
+
+    fn finish_active_drag_at(
+        &mut self,
+        pos: Point<Pixels>,
+        resolved_target: Option<DropTarget>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(mut drag) = self.active_drag.take() else {
+            return;
+        };
+        self.drag_scroll_last_tick = None;
+        drag.cursor_pos = pos;
+        let preview_rect_snapshot = self.preview_box_bounds.borrow_mut().take();
+
+        match resolved_target {
+            Some(target) if target.is_virtual_space() => {
+                self.commit_drop_to_virtual_space(drag, target, window, cx);
+            }
+            Some(target) => {
+                self.commit_drop_to_desktop(drag, target, preview_rect_snapshot, window, cx);
+            }
+            None => {
+                // Put drag back transiently so cancel_active_drag launches smooth return animation.
+                self.active_drag = Some(drag);
+                self.cancel_active_drag(cx);
+            }
+        }
+    }
+
+    fn on_capture_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.visible {
+            return;
+        }
+
+        // Settings live shortcut recorder for "快捷拖动": captures modifier+mouse button combos
+        // (Left/Right with modifiers, or Middle/X1/X2 with or without modifiers).
+        if self.settings_open && self.recording_quick_drag_shortcut {
+            let button = match event.button {
+                MouseButton::Left => QuickDragMouseButton::Left,
+                MouseButton::Right => QuickDragMouseButton::Right,
+                MouseButton::Middle => QuickDragMouseButton::Middle,
+                MouseButton::Navigate(NavigationDirection::Back) => QuickDragMouseButton::X1,
+                MouseButton::Navigate(NavigationDirection::Forward) => QuickDragMouseButton::X2,
+            };
+            let phys = current_physical_modifiers();
+            let mods = QuickDragModifiers::new(
+                phys.ctrl || event.modifiers.control,
+                phys.alt || event.modifiers.alt,
+                phys.shift || event.modifiers.shift,
+                phys.win || event.modifiers.platform,
+            );
+            cx.stop_propagation();
+            if event.button == MouseButton::Left {
+                self.suppress_next_left_mouse_up = true;
+            } else if event.button == MouseButton::Right {
+                self.suppress_next_right_mouse_up = true;
+            }
+            if button == QuickDragMouseButton::Left && !mods.any() {
+                self.recording_quick_drag_shortcut = false;
+                self.quick_drag_hook_error = None;
+                cx.notify();
+                return;
+            }
+            match QuickDragShortcut::from_mouse(mods, button) {
+                Ok(sc) => self.apply_quick_drag_shortcut_change(sc, cx),
+                Err(e) => {
+                    self.quick_drag_hook_error = Some(SharedString::from(format!("{e}")));
+                    cx.notify();
+                }
+            }
+            return;
+        }
+
+        if self.exit_anim.is_some()
+            || self.settings_open
+            || self.update_dialog_open
+            || self.add_picker.is_some()
+        {
+            return;
+        }
+
+        let Some((mode, drag_hwnd, src_did, is_pinned, prev_target)) =
+            self.active_drag.as_ref().map(|d| {
+                (
+                    d.mode,
+                    d.hwnd,
+                    d.source_desktop_id,
+                    d.is_pinned,
+                    d.target,
+                )
+            })
+        else {
+            return;
+        };
+
+        if event.button == MouseButton::Right {
+            cx.stop_propagation();
+            self.suppress_next_right_mouse_up = true;
+            self.cancel_active_drag(cx);
+            return;
+        }
+
+        if event.button == MouseButton::Left && mode != DragInteractionMode::PointerHeld {
+            // In StickyCarry (or if a physical LeftUp was missed during QuickDragInitialHold),
+            // a left-click drops onto the hovered target (or cancels cleanly on non-target space)
+            // without letting underlying pills, cards, or root click handlers fire.
+            cx.stop_propagation();
+            self.suppress_next_left_mouse_up = true;
+            let final_target = self
+                .resolve_drop_target(event.position, drag_hwnd, src_did, is_pinned)
+                .or(prev_target);
+            self.finish_active_drag_at(event.position, final_target, window, cx);
+        }
     }
 
     fn on_mouse_move(
@@ -6303,7 +6977,28 @@ impl SwitcherView {
             return;
         }
 
-        // If the left button is no longer held while tracking a drag (e.g. OS swallowed mouse-up),
+        // Quick-drag initial hold (where WH_MOUSE_LL swallowed LeftDown so OS reports no button)
+        // and StickyCarry click-carry mode track pointer motion without requiring `pressed_button`.
+        if let Some((drag_hwnd, src_did, is_pinned)) = self
+            .active_drag
+            .as_ref()
+            .filter(|d| d.mode != DragInteractionMode::PointerHeld)
+            .map(|d| (d.hwnd, d.source_desktop_id, d.is_pinned))
+        {
+            let new_target =
+                self.resolve_drop_target(event.position, drag_hwnd, src_did, is_pinned);
+            if let Some(ref mut d) = self.active_drag {
+                d.cursor_pos = event.position;
+                if d.target != new_target {
+                    d.target = new_target;
+                    self.preview_box_bounds.borrow_mut().take();
+                }
+            }
+            cx.notify();
+            return;
+        }
+
+        // If the left button is no longer held while tracking a standard drag (e.g. OS swallowed mouse-up),
         // cancel cleanly so neither a card nor a desktop tab ever gets stuck floating.
         if event.pressed_button != Some(MouseButton::Left) {
             if self.active_drag.is_some() {
@@ -6432,6 +7127,8 @@ impl SwitcherView {
                 source_desktop_id: pending.source_desktop_id,
                 is_pinned: pending.is_pinned,
                 was_current_tab: pending.was_current_tab,
+                from_quick_drag: false,
+                mode: DragInteractionMode::PointerHeld,
                 origin_bounds: pending.card_bounds,
                 grab_offset: pending.grab_offset,
                 cursor_pos: event.position,
@@ -6450,7 +7147,17 @@ impl SwitcherView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if event.button == MouseButton::Right && self.suppress_next_right_mouse_up {
+            self.suppress_next_right_mouse_up = false;
+            cx.stop_propagation();
+            return;
+        }
         if event.button != MouseButton::Left {
+            return;
+        }
+        if self.suppress_next_left_mouse_up {
+            self.suppress_next_left_mouse_up = false;
+            cx.stop_propagation();
             return;
         }
         if self.pending_desktop_reorder.is_some() || self.active_desktop_reorder.is_some() {
@@ -6493,32 +7200,26 @@ impl SwitcherView {
             return;
         }
 
-        if let Some((drag_hwnd, src_did, is_pinned, prev_target)) = self
-            .active_drag
-            .as_ref()
-            .map(|d| (d.hwnd, d.source_desktop_id, d.is_pinned, d.target))
+        if let Some((mode, drag_hwnd, src_did, is_pinned, prev_target)) =
+            self.active_drag.as_ref().map(|d| {
+                (
+                    d.mode,
+                    d.hwnd,
+                    d.source_desktop_id,
+                    d.is_pinned,
+                    d.target,
+                )
+            })
         {
+            if mode != DragInteractionMode::PointerHeld {
+                // Quick-drag release is delivered by WH_MOUSE_LL (`handle_quick_drag_button_released`)
+                // and StickyCarry commits on capture mouse-down, so swallow any stray MouseUp safely.
+                return;
+            }
             let final_target = self
                 .resolve_drop_target(event.position, drag_hwnd, src_did, is_pinned)
                 .or(prev_target);
-            let mut drag = self.active_drag.take().unwrap();
-            self.drag_scroll_last_tick = None;
-            drag.cursor_pos = event.position;
-            let preview_rect_snapshot = self.preview_box_bounds.borrow_mut().take();
-
-            match final_target {
-                Some(target) if target.is_virtual_space() => {
-                    self.commit_drop_to_virtual_space(drag, target, window, cx);
-                }
-                Some(target) => {
-                    self.commit_drop_to_desktop(drag, target, preview_rect_snapshot, window, cx);
-                }
-                None => {
-                    // Put drag back transiently so cancel_active_drag launches smooth return animation.
-                    self.active_drag = Some(drag);
-                    self.cancel_active_drag(cx);
-                }
-            }
+            self.finish_active_drag_at(event.position, final_target, window, cx);
         }
     }
 
@@ -6528,10 +7229,16 @@ impl SwitcherView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.suppress_next_left_mouse_up = false;
         if self.active_desktop_reorder.is_some() || self.pending_desktop_reorder.is_some() {
             self.cancel_desktop_reorder(cx);
         }
-        if self.active_drag.is_some() || self.pending_drag.is_some() {
+        if self.pending_drag.is_some()
+            || self
+                .active_drag
+                .as_ref()
+                .is_some_and(|d| d.mode == DragInteractionMode::PointerHeld)
+        {
             self.cancel_active_drag(cx);
         }
     }
@@ -6593,8 +7300,14 @@ impl SwitcherView {
             drag.hwnd, space_id.0, space_name, created_new, outcome
         ));
 
+        let auto_hide_after_drop = drag.from_quick_drag && self.config.quick_drag_auto_hide;
+
         if !self.config.transition_effect.is_enabled() {
             self.queue_drop_image(drag.full_image);
+            if auto_hide_after_drop {
+                self.hide(cx);
+                return;
+            }
             window.refresh();
             cx.notify();
             return;
@@ -6653,6 +7366,8 @@ impl SwitcherView {
             is_virtual_space_transfer: true,
             keep_source_slot_visible: true,
             hold_below_new_desktop_zone: false,
+            auto_hide_on_finish: auto_hide_after_drop,
+            auto_hide_wait_ready: None,
         });
         cx.notify();
     }
@@ -6743,13 +7458,58 @@ impl SwitcherView {
         let target_label = target_desktop_idx
             .map(|idx| self.desktop_display_name(idx))
             .unwrap_or_else(|| format!("桌面 {}", self.desktops.len().max(1)));
-        let auto_switch_filter = drag.was_current_tab
+        let current_desktop_id = self.desktops.iter().find(|d| d.is_current).map(|d| d.id);
+        let should_follow_desktop = should_follow_actual_desktop_after_drop(
+            drag.hwnd,
+            self.prev_foreground_hwnd,
+            self.prev_foreground_root_hwnd,
+            current_desktop_id,
+            target_did,
+        );
+        if should_follow_desktop {
+            for d in &mut self.desktops {
+                d.is_current = d.id == target_did;
+            }
+            self.followed_focus_hwnd = Some(drag.hwnd);
+        }
+
+        let auto_switch_filter = (drag.was_current_tab || should_follow_desktop)
             && matches!(self.view_filter, ViewFilter::NativeDesktop(fid) if fid != target_did);
 
+        let auto_hide_after_drop = drag.from_quick_drag && self.config.quick_drag_auto_hide;
         let animate = self.config.transition_effect.is_enabled();
 
         if !animate {
             self.below_new_desktop_anim.reset_immediate();
+            if auto_hide_after_drop {
+                self.queue_drop_image(drag.full_image);
+                if should_follow_desktop {
+                    self.clear_follow_desktop_state();
+                    self.reset_overlay_state_before_hide();
+                    match switch_desktop_and_wait(&self.vdm, target_did, Duration::from_millis(200))
+                    {
+                        Ok(matched) => {
+                            append_log(&format!(
+                                "FOLLOW_DESKTOP_SWITCH(sync) target={target_did} matched={matched}"
+                            ));
+                            handoff_focus_to_window_if_alive(drag.hwnd);
+                        }
+                        Err(e) => {
+                            append_log(&format!(
+                                "FOLLOW_DESKTOP_SWITCH(sync) ERROR target={target_did}: {e:#}"
+                            ));
+                        }
+                    }
+                    hide_layered_overlay(self.gpui_hwnd, self.thumb_host.hwnd());
+                    cx.notify();
+                    return;
+                }
+                self.hide(cx);
+                return;
+            }
+            if should_follow_desktop {
+                let _ = self.spawn_follow_desktop_switch(target_did, window, cx);
+            }
             if auto_switch_filter {
                 self.view_filter = ViewFilter::NativeDesktop(target_did);
                 self.scroll_y = 0.0;
@@ -6757,7 +7517,7 @@ impl SwitcherView {
                 self.scroll_last_tick = None;
             }
             self.rebuild_visible_groups(false);
-            if drag.was_current_tab {
+            if drag.was_current_tab || should_follow_desktop {
                 if let Some(idx) = self.flat_hwnds.iter().position(|&h| h == drag.hwnd) {
                     self.selected_flat = idx;
                     self.ensure_selected_visible();
@@ -6805,7 +7565,7 @@ impl SwitcherView {
         // source desktop while remaining siblings FLIP-reflow smoothly; auto-switch runs right
         // after Stage 1 Suck-In finishes so you watch it suck into the portal, then switch & suck out!).
         self.rebuild_visible_groups(false);
-        if drag.was_current_tab && !auto_switch_filter {
+        if (drag.was_current_tab || should_follow_desktop) && !auto_switch_filter {
             if let Some(idx) = self.flat_hwnds.iter().position(|&h| h == drag.hwnd) {
                 self.selected_flat = idx;
                 self.ensure_selected_visible();
@@ -6910,14 +7670,20 @@ impl SwitcherView {
             false
         };
 
-        let play_suck_out = auto_switch_filter || dest_visible_in_all_view;
-        if is_below_create && !play_suck_out {
+        let play_suck_out = !auto_hide_after_drop && (auto_switch_filter || dest_visible_in_all_view);
+        if is_below_create && !play_suck_out && !auto_hide_after_drop {
             self.transient_toast = Some((
                 SharedString::from(format!("已新建「{target_label}」并移入")),
                 Instant::now(),
             ));
         }
-        let suck_in_duration = if !play_suck_out {
+        let suck_in_duration = if auto_hide_after_drop {
+            if suck_out_from_pill {
+                Duration::from_millis(215)
+            } else {
+                Duration::from_millis(195)
+            }
+        } else if !play_suck_out {
             Duration::from_millis(290)
         } else if suck_out_from_pill {
             Duration::from_millis(235)
@@ -6931,15 +7697,23 @@ impl SwitcherView {
                 None => (None, 0),
             };
 
+        let follow_desktop_ready = if should_follow_desktop {
+            Some(self.spawn_follow_desktop_switch(target_did, window, cx))
+        } else {
+            None
+        };
+
         append_log(&format!(
-            "DRAG_MOVE hwnd=0x{:X} target={} created_new={} via={:?} was_current={} auto_switch={} suck_out={}",
+            "DRAG_MOVE hwnd=0x{:X} target={} created_new={} via={:?} was_current={} follow_desktop={} auto_switch={} suck_out={} auto_hide={}",
             drag.hwnd,
             target_did,
             created_new,
             target,
             drag.was_current_tab,
+            should_follow_desktop,
             auto_switch_filter,
             play_suck_out,
+            auto_hide_after_drop,
         ));
 
         self.genie_anim = Some(GenieTransferAnim {
@@ -6962,6 +7736,12 @@ impl SwitcherView {
             is_virtual_space_transfer: false,
             keep_source_slot_visible: false,
             hold_below_new_desktop_zone,
+            auto_hide_on_finish: auto_hide_after_drop,
+            auto_hide_wait_ready: if auto_hide_after_drop {
+                follow_desktop_ready
+            } else {
+                None
+            },
         });
         cx.notify();
     }
@@ -7342,21 +8122,30 @@ impl SwitcherView {
             is_virtual_space_transfer: false,
             keep_source_slot_visible: in_virtual_space,
             hold_below_new_desktop_zone: false,
+            auto_hide_on_finish: false,
+            auto_hide_wait_ready: None,
         });
         cx.notify();
     }
 
-    fn advance_genie_phase(&mut self, now: Instant) {
-        let should_advance = self
-            .genie_anim
-            .as_ref()
-            .is_some_and(|anim| anim.is_phase_finished(now));
+    fn advance_genie_phase(&mut self, now: Instant) -> bool {
+        let should_advance = self.genie_anim.as_ref().is_some_and(|anim| {
+            if !anim.is_phase_finished(now) {
+                return false;
+            }
+            let is_final_auto_hide = anim.auto_hide_on_finish
+                && (!matches!(anim.phase, GeniePhase::SuckIn { .. }) || !anim.play_suck_out);
+            if is_final_auto_hide && !anim.is_auto_hide_gate_ready() {
+                return false;
+            }
+            true
+        });
         if !should_advance {
-            return;
+            return false;
         }
 
         let Some(mut anim) = self.genie_anim.take() else {
-            return;
+            return false;
         };
 
         match anim.phase {
@@ -7418,21 +8207,25 @@ impl SwitcherView {
                         };
                         anim.phase_started_at = now;
                         self.genie_anim = Some(anim);
-                        return;
+                        return false;
                     }
                 }
 
+                let should_auto_hide = anim.auto_hide_on_finish;
                 // Stage 1 only (or destination offscreen): finish cleanly & drop GPU textures.
                 for img in anim.into_images() {
                     self.queue_drop_image(img);
                 }
                 self.thumbs.borrow_mut().retain_targets(&self.flat_hwnds);
+                should_auto_hide
             }
             GeniePhase::SuckOut { .. } | GeniePhase::CancelReturn { .. } => {
+                let should_auto_hide = anim.auto_hide_on_finish;
                 for img in anim.into_images() {
                     self.queue_drop_image(img);
                 }
                 self.thumbs.borrow_mut().retain_targets(&self.flat_hwnds);
+                should_auto_hide
             }
         }
     }
@@ -7613,7 +8406,22 @@ impl Render for SwitcherView {
         }
 
         // Advance pixel-level Genie funnel transfer (Suck-In -> optional filter switch -> Suck-Out -> done).
-        self.advance_genie_phase(now);
+        if self.advance_genie_phase(now) {
+            cx.spawn(async move |this, cx| {
+                let _ = this.update(cx, |view, cx| {
+                    if view.visible
+                        && view.active_drag.is_none()
+                        && view.exit_anim.is_none()
+                        && view.genie_anim.is_none()
+                        && !view.settings_open
+                        && !view.update_dialog_open
+                    {
+                        view.hide(cx);
+                    }
+                });
+            })
+            .detach();
+        }
 
         // Advance bidirectional "suck-out / suck-in" bottom create-desktop drop zone.
         let is_dragging_below_new_desktop = self
@@ -10078,6 +10886,7 @@ impl Render for SwitcherView {
             .on_key_down(cx.listener(Self::on_key_down))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .capture_any_mouse_down(cx.listener(Self::on_capture_mouse_down))
             .capture_any_mouse_up(cx.listener(Self::on_capture_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up_out_left))
             .size_full()
@@ -11488,6 +12297,8 @@ mod tests {
             source_desktop_id: None,
             is_pinned: false,
             was_current_tab: true,
+            from_quick_drag: false,
+            mode: DragInteractionMode::PointerHeld,
             origin_bounds: Bounds {
                 origin: point(px(200.0), px(300.0)),
                 size: size(px(380.0), px(226.0)),
@@ -11644,5 +12455,288 @@ mod tests {
             800.0,
             "expanded bottom zone replaces drag_reach_extra via max() with zero double-padding"
         );
+    }
+
+    #[test]
+    fn quick_drag_target_resolution_prefers_cursor_window_and_falls_back_to_foreground() {
+        let make_win = |hwnd: isize| WindowInfo {
+            hwnd,
+            pid: 1,
+            process_name: "app.exe".to_string(),
+            app_name: "App".to_string(),
+            exe_path: String::new(),
+            class_name: String::new(),
+            title: String::new(),
+            desktop_id: None,
+            desktop_index: Some(0),
+            is_pinned: false,
+            is_minimized: false,
+            is_maximized: false,
+            restore_to_maximized: false,
+            is_elevated: None,
+            cloaked_flags: 0,
+            monitor_index: Some(0),
+            rect: RECT::default(),
+            visible_rect: RECT::default(),
+            normal_rect: RECT::default(),
+        };
+        let windows = vec![make_win(100), make_win(200), make_win(300)];
+
+        // 1. Mouse trigger over unfocused visible window 200 -> picks 200 over foreground 100
+        let over_unfocused = QuickDragTriggerInfo {
+            screen_x: 500,
+            screen_y: 400,
+            cursor_hwnd: 200,
+            cursor_root_hwnd: 0,
+            fg_hwnd: 100,
+            fg_root_hwnd: 0,
+            triggered_by_keyboard: false,
+        };
+        assert_eq!(
+            resolve_quick_drag_target_hwnd(over_unfocused, &windows),
+            Some(200)
+        );
+
+        // 1b. Keyboard trigger prefers foreground 100 over unfocused cursor window 200
+        let kb_trigger = QuickDragTriggerInfo {
+            triggered_by_keyboard: true,
+            ..over_unfocused
+        };
+        assert_eq!(
+            resolve_quick_drag_target_hwnd(kb_trigger, &windows),
+            Some(100)
+        );
+
+        // 2. Cursor over owned child dialog 999 -> resolves to cursor_root_hwnd 300
+        let over_owned_dialog = QuickDragTriggerInfo {
+            screen_x: 500,
+            screen_y: 400,
+            cursor_hwnd: 999,
+            cursor_root_hwnd: 300,
+            fg_hwnd: 100,
+            fg_root_hwnd: 0,
+            triggered_by_keyboard: false,
+        };
+        assert_eq!(
+            resolve_quick_drag_target_hwnd(over_owned_dialog, &windows),
+            Some(300)
+        );
+
+        // 3. Cursor over empty desktop/taskbar (unmanaged 888) -> falls back to foreground 100
+        let over_desktop = QuickDragTriggerInfo {
+            screen_x: 20,
+            screen_y: 1060,
+            cursor_hwnd: 888,
+            cursor_root_hwnd: 0,
+            fg_hwnd: 100,
+            fg_root_hwnd: 0,
+            triggered_by_keyboard: false,
+        };
+        assert_eq!(
+            resolve_quick_drag_target_hwnd(over_desktop, &windows),
+            Some(100)
+        );
+
+        // 4. Foreground is an owned popup 777 -> falls back to fg_root_hwnd 200
+        let fg_owned_popup = QuickDragTriggerInfo {
+            screen_x: 20,
+            screen_y: 1060,
+            cursor_hwnd: 888,
+            cursor_root_hwnd: 0,
+            fg_hwnd: 777,
+            fg_root_hwnd: 200,
+            triggered_by_keyboard: false,
+        };
+        assert_eq!(
+            resolve_quick_drag_target_hwnd(fg_owned_popup, &windows),
+            Some(200)
+        );
+
+        // 5. No switchable window matches -> None (opens WinDeck cleanly without bogus drag)
+        let nothing = QuickDragTriggerInfo {
+            screen_x: 20,
+            screen_y: 20,
+            cursor_hwnd: 888,
+            cursor_root_hwnd: 0,
+            fg_hwnd: 999,
+            fg_root_hwnd: 0,
+            triggered_by_keyboard: false,
+        };
+        assert_eq!(resolve_quick_drag_target_hwnd(nothing, &windows), None);
+    }
+
+    #[test]
+    fn quick_drag_release_decision_supports_both_click_carry_and_press_hold_drag() {
+        let target = DropTarget::CreateNewDesktop;
+
+        // Short click in place -> enters sticky click-carry (even if hovering over a pill at click point)
+        assert_eq!(
+            decide_quick_drag_release(0.0, Duration::from_millis(60), None),
+            QuickDragReleaseDecision::EnterStickyCarry
+        );
+        assert_eq!(
+            decide_quick_drag_release(3.0, Duration::from_millis(75), Some(target)),
+            QuickDragReleaseDecision::EnterStickyCarry
+        );
+
+        // Shaky quick click onto blank space -> stays in sticky click-carry instead of cancelling
+        assert_eq!(
+            decide_quick_drag_release(24.0, Duration::from_millis(120), None),
+            QuickDragReleaseDecision::EnterStickyCarry
+        );
+        assert_eq!(
+            decide_quick_drag_release(80.0, Duration::from_millis(120), None),
+            QuickDragReleaseDecision::EnterStickyCarry
+        );
+
+        // Press-hold-drag onto a valid drop target -> commits drop immediately on release
+        assert_eq!(
+            decide_quick_drag_release(DRAG_THRESHOLD_PX, Duration::from_millis(110), Some(target)),
+            QuickDragReleaseDecision::CommitDrop(target)
+        );
+        assert_eq!(
+            decide_quick_drag_release(260.0, Duration::from_millis(450), Some(target)),
+            QuickDragReleaseDecision::CommitDrop(target)
+        );
+
+        // Deliberate long hold-drag onto empty/invalid space -> cancels cleanly
+        assert_eq!(
+            decide_quick_drag_release(
+                QUICK_DRAG_CANCEL_DISTANCE_PX,
+                Duration::from_millis(QUICK_DRAG_CANCEL_MIN_HOLD_MS),
+                None,
+            ),
+            QuickDragReleaseDecision::CancelDrag
+        );
+    }
+
+    #[test]
+    fn quick_drag_screen_to_overlay_mapping_handles_negative_monitor_and_dpi() {
+        // Left secondary monitor at (-2560, 0) with 125% DPI scaling
+        let left_monitor = RECT {
+            left: -2560,
+            top: 0,
+            right: 0,
+            bottom: 1440,
+        };
+        let mapped = map_screen_to_overlay_logical(-1200, 600, left_monitor, 1.25);
+        assert!((f32::from(mapped.x) - 1088.0).abs() < 0.01);
+        assert!((f32::from(mapped.y) - 480.0).abs() < 0.01);
+
+        // Off-monitor coordinate clamps cleanly into overlay bounds for initial card visibility
+        let primary = RECT {
+            left: 0,
+            top: 0,
+            right: 1920,
+            bottom: 1080,
+        };
+        let off = map_screen_to_overlay_logical(-400, 1200, primary, 1.0);
+        assert!((f32::from(off.x) - (-400.0)).abs() < 0.01);
+        let clamped = clamp_point_to_overlay(off, 1920.0, 1080.0);
+        assert_eq!(f32::from(clamped.x), 0.0);
+        assert_eq!(f32::from(clamped.y), 1080.0);
+    }
+
+    #[test]
+    fn focused_window_drop_follows_actual_desktop_only_for_foreground_to_other_desktop() {
+        let d1 = DesktopId::from_le_bytes(&[1; 16]).unwrap();
+        let d2 = DesktopId::from_le_bytes(&[2; 16]).unwrap();
+
+        // Direct foreground window dragged from current desktop D1 -> D2 -> must follow desktop
+        assert!(should_follow_actual_desktop_after_drop(
+            100,
+            100,
+            0,
+            Some(d1),
+            d2,
+        ));
+
+        // Owned popup was foreground (777) whose root owner is 100 -> dragging 100 follows desktop
+        assert!(should_follow_actual_desktop_after_drop(
+            100,
+            777,
+            100,
+            Some(d1),
+            d2,
+        ));
+
+        // Pinned focused window dragged onto a non-current desktop D2 -> unpins & follows to D2
+        assert!(should_follow_actual_desktop_after_drop(
+            100,
+            100,
+            0,
+            Some(d1),
+            d2,
+        ));
+
+        // Focused window dragged onto the ALREADY-current desktop D1 (e.g. unpinning onto D1) -> no switch
+        assert!(!should_follow_actual_desktop_after_drop(
+            100,
+            100,
+            0,
+            Some(d1),
+            d1,
+        ));
+
+        // Unfocused background window 200 dragged while 100 is focused -> stay on current desktop
+        assert!(!should_follow_actual_desktop_after_drop(
+            200,
+            100,
+            0,
+            Some(d1),
+            d2,
+        ));
+
+        // Zero / unknown HWND never triggers a desktop switch
+        assert!(!should_follow_actual_desktop_after_drop(
+            0,
+            0,
+            0,
+            Some(d1),
+            d2,
+        ));
+    }
+
+    #[test]
+    fn genie_auto_hide_gate_waits_for_background_desktop_switch_signal() {
+        let captured = synthesize_fallback_card_bitmap(120, 80, 0x0A84FF);
+        let full_image = bitmap_to_full_render_image(&captured).expect("render image");
+        let ready = Arc::new(AtomicBool::new(false));
+        let anim = GenieTransferAnim {
+            hwnd: 100,
+            target_desktop_id: Some(DesktopId::from_le_bytes(&[2; 16]).unwrap()),
+            auto_switch_filter: false,
+            play_suck_out: false,
+            suck_out_from_pill: true,
+            phase: GeniePhase::SuckIn {
+                from_rect: RectF {
+                    left: 10.0,
+                    top: 100.0,
+                    right: 130.0,
+                    bottom: 180.0,
+                },
+                mouth: FunnelMouth {
+                    left: 50.0,
+                    right: 90.0,
+                    y: 40.0,
+                },
+                duration: Duration::from_millis(200),
+            },
+            phase_started_at: Instant::now(),
+            full_image,
+            strip_image: None,
+            num_strips: 0,
+            pill_pulse_desktop: None,
+            pill_pulse_space: None,
+            is_virtual_space_transfer: false,
+            keep_source_slot_visible: false,
+            hold_below_new_desktop_zone: false,
+            auto_hide_on_finish: true,
+            auto_hide_wait_ready: Some(ready.clone()),
+        };
+
+        assert!(!anim.is_auto_hide_gate_ready());
+        ready.store(true, Ordering::Release);
+        assert!(anim.is_auto_hide_gate_ready());
     }
 }

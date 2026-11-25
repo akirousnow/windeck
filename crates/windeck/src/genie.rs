@@ -1,5 +1,6 @@
 use std::f32::consts::PI;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui::{Bounds, Pixels, RenderImage, SharedString, point, px, size};
@@ -445,9 +446,18 @@ pub struct GenieTransferAnim {
     /// When `true`, keeps the bottom "create new desktop" preview zone visibly anchored while
     /// Stage 1 (`SuckIn`) swallows the dropped card in single-desktop filter mode.
     pub hold_below_new_desktop_zone: bool,
+    /// When `true`, automatically hides the WinDeck overlay once this transfer animation finishes.
+    pub auto_hide_on_finish: bool,
+    /// Optional background desktop-switch completion gate checked before firing `auto_hide_on_finish`.
+    pub auto_hide_wait_ready: Option<Arc<AtomicBool>>,
 }
 
 impl GenieTransferAnim {
+    pub fn is_auto_hide_gate_ready(&self) -> bool {
+        self.auto_hide_wait_ready
+            .as_ref()
+            .is_none_or(|flag| flag.load(Ordering::Acquire))
+    }
     pub fn phase_progress(&self, now: Instant) -> f32 {
         let dur = match self.phase {
             GeniePhase::SuckIn { duration, .. }

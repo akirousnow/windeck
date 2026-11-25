@@ -25,10 +25,10 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, GetLastInputInfo, HOT_KEY_MODIFIERS, INPUT, INPUT_0, INPUT_KEYBOARD,
     KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, LASTINPUTINFO,
-    MAPVK_VK_TO_VSC, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_WIN, MapVirtualKeyW, RegisterHotKey,
-    SendInput, UnregisterHotKey, VIRTUAL_KEY, VK_CONTROL, VK_DOWN, VK_ESCAPE, VK_LCONTROL,
-    VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU,
-    VK_RSHIFT, VK_RWIN, VK_UP,
+    MAPVK_VK_TO_VSC, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, MOD_SHIFT, MOD_WIN, MapVirtualKeyW,
+    RegisterHotKey, SendInput, UnregisterHotKey, VIRTUAL_KEY, VK_CONTROL, VK_DOWN, VK_ESCAPE,
+    VK_F1, VK_F12, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_OEM_3,
+    VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SPACE, VK_UP,
 };
 use windows::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
@@ -37,22 +37,27 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     ASFW_ANY, AllowSetForegroundWindow, AppendMenuW, CallNextHookEx, CreateIconIndirect,
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu, DestroyWindow,
-    DispatchMessageW, FindWindowExW, GWLP_USERDATA, GetCursorPos, GetForegroundWindow, GetMessageW,
-    GetWindowLongPtrW, HHOOK, HICON, HWND_MESSAGE, ICONINFO, IMAGE_ICON, KBDLLHOOKSTRUCT,
-    KillTimer, LLKHF_INJECTED, LR_DEFAULTCOLOR, LoadImageW, MF_CHECKED, MF_SEPARATOR, MF_STRING,
-    MF_UNCHECKED, MSG, PostMessageW, RegisterClassW, RegisterWindowMessageW, SetForegroundWindow,
-    SetTimer, SetWindowLongPtrW, SetWindowsHookExW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_NONOTIFY,
-    TPM_RETURNCMD, TrackPopupMenu, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL,
-    WINDOW_EX_STYLE, WINDOW_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP,
-    WM_LBUTTONUP, WM_NCCREATE, WM_NCDESTROY, WM_POWERBROADCAST, WM_RBUTTONUP, WM_SYSKEYDOWN,
-    WM_SYSKEYUP, WM_TIMER, WM_WTSSESSION_CHANGE, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
-    WS_POPUP, WTS_CONSOLE_CONNECT, WTS_CONSOLE_DISCONNECT, WTS_REMOTE_CONNECT,
-    WTS_REMOTE_DISCONNECT, WTS_SESSION_LOCK, WTS_SESSION_UNLOCK,
+    DispatchMessageW, FindWindowExW, GA_ROOT, GA_ROOTOWNER, GWLP_USERDATA, GetAncestor,
+    GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowLongPtrW, HHOOK, HICON, HWND_MESSAGE,
+    ICONINFO, IMAGE_ICON, KBDLLHOOKSTRUCT, KillTimer, LLKHF_INJECTED, LR_DEFAULTCOLOR, LoadImageW,
+    MF_CHECKED, MF_SEPARATOR, MF_STRING, MF_UNCHECKED, MSG, MSLLHOOKSTRUCT, PostMessageW,
+    RegisterClassW, RegisterWindowMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
+    SetWindowsHookExW, TPM_BOTTOMALIGN, TPM_LEFTALIGN, TPM_NONOTIFY, TPM_RETURNCMD, TrackPopupMenu,
+    TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL, WINDOW_EX_STYLE,
+    WINDOW_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_HOTKEY, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN,
+    WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_NCCREATE, WM_NCDESTROY, WM_POWERBROADCAST,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_TIMER, WM_WTSSESSION_CHANGE,
+    WM_XBUTTONDOWN, WM_XBUTTONUP, WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
+    WTS_CONSOLE_CONNECT, WTS_CONSOLE_DISCONNECT, WTS_REMOTE_CONNECT, WTS_REMOTE_DISCONNECT,
+    WTS_SESSION_LOCK, WTS_SESSION_UNLOCK, WindowFromPoint,
 };
 use windows_core::{HSTRING, PCWSTR, w};
 use windows_registry::CURRENT_USER;
 
 const HOTKEY_ID: i32 = 1;
+const QUICK_DRAG_HOTKEY_ID: i32 = 2;
+const XBUTTON1_ID: u16 = 1;
+const XBUTTON2_ID: u16 = 2;
 const WM_TRAY_ICON: u32 = WM_APP + 1;
 const WM_REBIND_HOTKEY: u32 = WM_APP + 2;
 const WM_ACTIVATE_EXISTING: u32 = WM_APP + 3;
@@ -68,12 +73,18 @@ const WM_SYSTEM_RESUMED: u32 = WM_APP + 12;
 const WM_SESSION_LOCKED: u32 = WM_APP + 13;
 const WM_SESSION_UNLOCKED: u32 = WM_APP + 14;
 const WM_SYNC_WATCHDOG_TIMER: u32 = WM_APP + 15;
+const WM_SET_QUICK_DRAG: u32 = WM_APP + 16;
+const WM_QUICK_DRAG_TRIGGER: u32 = WM_APP + 17;
+const WM_QUICK_DRAG_RELEASE: u32 = WM_APP + 18;
 
 const WM_KBD_SET_PATCH: u32 = WM_APP + 40;
 const WM_KBD_ARM_HOLD: u32 = WM_APP + 41;
 const WM_KBD_DISARM_HOLD: u32 = WM_APP + 42;
 const WM_KBD_RESET_MODS: u32 = WM_APP + 43;
 const WM_KBD_REFRESH_HOOK: u32 = WM_APP + 44;
+const WM_KBD_SET_QUICK_DRAG: u32 = WM_APP + 45;
+
+const LLMHF_INJECTED_FLAG: u32 = 0x0000_0001;
 
 const TIMER_HOOK_WATCHDOG: usize = 1;
 const TIMER_MOD_RECONCILE: usize = 2;
@@ -434,6 +445,344 @@ impl DesktopSwitchDir {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuickDragMouseButton {
+    Left,
+    Right,
+    Middle,
+    X1,
+    X2,
+}
+
+impl QuickDragMouseButton {
+    pub fn config_token(self) -> &'static str {
+        match self {
+            Self::Left => "Left",
+            Self::Right => "Right",
+            Self::Middle => "Middle",
+            Self::X1 => "X1",
+            Self::X2 => "X2",
+        }
+    }
+
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Left => "左键",
+            Self::Right => "右键",
+            Self::Middle => "中键",
+            Self::X1 => "侧键1",
+            Self::X2 => "侧键2",
+        }
+    }
+
+    pub fn requires_modifier(self) -> bool {
+        matches!(self, Self::Left | Self::Right)
+    }
+
+    fn parse(token: &str) -> Option<Self> {
+        match token.trim().to_ascii_lowercase().as_str() {
+            "left" | "lbutton" | "leftclick" | "mouseleft" | "左键" => Some(Self::Left),
+            "right" | "rbutton" | "rightclick" | "mouseright" | "右键" => Some(Self::Right),
+            "middle" | "mbutton" | "middleclick" | "mousemiddle" | "中键" => Some(Self::Middle),
+            "x1" | "xbutton1" | "back" | "mouse4" | "侧键1" | "后退键" => Some(Self::X1),
+            "x2" | "xbutton2" | "forward" | "mouse5" | "侧键2" | "前进键" => Some(Self::X2),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct QuickDragModifiers {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub win: bool,
+}
+
+impl QuickDragModifiers {
+    pub const fn new(ctrl: bool, alt: bool, shift: bool, win: bool) -> Self {
+        Self {
+            ctrl,
+            alt,
+            shift,
+            win,
+        }
+    }
+
+    pub fn any(self) -> bool {
+        self.ctrl || self.alt || self.shift || self.win
+    }
+
+    pub fn has_non_shift_modifier(self) -> bool {
+        self.ctrl || self.alt || self.win
+    }
+
+    pub fn win32_mod_flags(self) -> u32 {
+        let mut flags = 0u32;
+        if self.ctrl {
+            flags |= MOD_CONTROL.0;
+        }
+        if self.alt {
+            flags |= MOD_ALT.0;
+        }
+        if self.shift {
+            flags |= MOD_SHIFT.0;
+        }
+        if self.win {
+            flags |= MOD_WIN.0;
+        }
+        flags
+    }
+
+    fn push_labels(self, parts: &mut Vec<String>) {
+        if self.ctrl {
+            parts.push("Ctrl".to_string());
+        }
+        if self.alt {
+            parts.push("Alt".to_string());
+        }
+        if self.shift {
+            parts.push("Shift".to_string());
+        }
+        if self.win {
+            parts.push("Win".to_string());
+        }
+    }
+}
+
+/// Reads the live physical state of `Ctrl`, `Alt`, `Shift`, and `Win` directly from Win32.
+pub fn current_physical_modifiers() -> QuickDragModifiers {
+    let bits = capture_async_mod_bits();
+    QuickDragModifiers {
+        ctrl: (bits & PHYS_MOD_CTRL_MASK) != 0,
+        alt: (bits & PHYS_MOD_ALT_MASK) != 0,
+        shift: (bits & PHYS_MOD_SHIFT_MASK) != 0,
+        win: (bits & PHYS_MOD_WIN_MASK) != 0,
+    }
+}
+
+/// Configurable global trigger for WinDeck's Quick Drag ("快捷拖动"):
+/// supports either a modifier+mouse click (e.g. `Ctrl+Alt+Left`, `Alt+Right`, `Middle`, `X1`)
+/// or a global keyboard hotkey (e.g. `Ctrl+Alt+D`, `Alt+G`, `F9`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuickDragShortcut {
+    Mouse {
+        mods: QuickDragModifiers,
+        button: QuickDragMouseButton,
+    },
+    Key {
+        mods: QuickDragModifiers,
+        vk: u32,
+    },
+}
+
+impl Default for QuickDragShortcut {
+    fn default() -> Self {
+        Self::Mouse {
+            mods: QuickDragModifiers::new(true, true, false, false),
+            button: QuickDragMouseButton::Left,
+        }
+    }
+}
+
+impl QuickDragShortcut {
+    fn is_function_key(vk: u32) -> bool {
+        (VK_F1.0 as u32..=VK_F12.0 as u32).contains(&vk)
+    }
+
+    fn parse_key_vk(token: &str) -> Option<u32> {
+        let lower = token.trim().to_ascii_lowercase();
+        match lower.as_str() {
+            "space" | " " => Some(VK_SPACE.0 as u32),
+            "`" | "~" | "grave" | "backquote" => Some(VK_OEM_3.0 as u32),
+            k if k.len() == 1 => {
+                let b = k.as_bytes()[0].to_ascii_uppercase();
+                if b.is_ascii_alphabetic() || b.is_ascii_digit() {
+                    Some(b as u32)
+                } else {
+                    None
+                }
+            }
+            k if k.starts_with('f') && k.len() <= 3 => {
+                let n: u32 = k[1..].parse().ok()?;
+                (1..=12).contains(&n).then_some(VK_F1.0 as u32 + (n - 1))
+            }
+            _ => None,
+        }
+    }
+
+    fn key_vk_label(vk: u32) -> String {
+        if vk == VK_SPACE.0 as u32 {
+            "Space".to_string()
+        } else if vk == VK_OEM_3.0 as u32 {
+            "`".to_string()
+        } else if Self::is_function_key(vk) {
+            format!("F{}", (vk - VK_F1.0 as u32) + 1)
+        } else if let Some(ch) = char::from_u32(vk)
+            && (ch.is_ascii_alphabetic() || ch.is_ascii_digit())
+        {
+            ch.to_ascii_uppercase().to_string()
+        } else {
+            format!("VK_{vk:02X}")
+        }
+    }
+
+    pub fn validate(self) -> Result<()> {
+        match self {
+            Self::Mouse { mods, button } => {
+                if button.requires_modifier() && !mods.any() {
+                    return Err(anyhow!("左键或右键须搭配修饰键（Ctrl / Alt / Shift / Win）"));
+                }
+                Ok(())
+            }
+            Self::Key { mods, vk } => {
+                let valid_vk = Self::is_function_key(vk)
+                    || vk == VK_SPACE.0 as u32
+                    || vk == VK_OEM_3.0 as u32
+                    || (b'A' as u32..=b'Z' as u32).contains(&vk)
+                    || (b'0' as u32..=b'9' as u32).contains(&vk);
+                if !valid_vk {
+                    return Err(anyhow!("不支持的快捷拖动按键"));
+                }
+                if !Self::is_function_key(vk) && !mods.has_non_shift_modifier() {
+                    return Err(anyhow!("键盘快捷键须包含 Ctrl / Alt / Win（或使用 F1–F12）"));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    pub fn from_mouse(mods: QuickDragModifiers, button: QuickDragMouseButton) -> Result<Self> {
+        let sc = Self::Mouse { mods, button };
+        sc.validate()?;
+        Ok(sc)
+    }
+
+    /// Converts a GPUI key name + live modifiers into a `QuickDragShortcut`.
+    /// Returns `Ok(None)` for bare modifier keydowns so the recorder waits for the trigger key/click.
+    pub fn from_key_name(key: &str, mods: QuickDragModifiers) -> Result<Option<Self>> {
+        let lower = key.trim().to_ascii_lowercase();
+        if matches!(
+            lower.as_str(),
+            "" | "control"
+                | "ctrl"
+                | "alt"
+                | "shift"
+                | "platform"
+                | "meta"
+                | "super"
+                | "win"
+                | "windows"
+                | "capslock"
+        ) {
+            return Ok(None);
+        }
+        let Some(vk) = Self::parse_key_vk(&lower) else {
+            return Err(anyhow!("仅支持字母、数字、F1–F12、空格、` 或鼠标按键"));
+        };
+        let sc = Self::Key { mods, vk };
+        sc.validate()?;
+        Ok(Some(sc))
+    }
+
+    pub fn parse(spec: &str) -> Result<Self> {
+        let mut mods = QuickDragModifiers::default();
+        let mut mouse_btn: Option<QuickDragMouseButton> = None;
+        let mut key_vk: Option<u32> = None;
+
+        for raw in spec.split('+') {
+            let token = raw.trim();
+            if token.is_empty() {
+                continue;
+            }
+            match token.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" => mods.ctrl = true,
+                "alt" => mods.alt = true,
+                "shift" => mods.shift = true,
+                "win" | "super" | "meta" | "platform" => mods.win = true,
+                other => {
+                    if let Some(btn) = QuickDragMouseButton::parse(other) {
+                        if mouse_btn.replace(btn).is_some() || key_vk.is_some() {
+                            return Err(anyhow!("快捷拖动快捷键 '{spec}' 只能包含一个触发键"));
+                        }
+                    } else if let Some(vk) = Self::parse_key_vk(other) {
+                        if key_vk.replace(vk).is_some() || mouse_btn.is_some() {
+                            return Err(anyhow!("快捷拖动快捷键 '{spec}' 只能包含一个触发键"));
+                        }
+                    } else {
+                        return Err(anyhow!("无法识别的快捷拖动按键 '{token}'"));
+                    }
+                }
+            }
+        }
+
+        let sc = if let Some(button) = mouse_btn {
+            Self::Mouse { mods, button }
+        } else if let Some(vk) = key_vk {
+            Self::Key { mods, vk }
+        } else {
+            return Err(anyhow!("快捷拖动快捷键 '{spec}' 缺少触发按键"));
+        };
+        sc.validate()?;
+        Ok(sc)
+    }
+
+    pub fn to_config_string(self) -> String {
+        let mut parts = Vec::new();
+        match self {
+            Self::Mouse { mods, button } => {
+                mods.push_labels(&mut parts);
+                parts.push(button.config_token().to_string());
+            }
+            Self::Key { mods, vk } => {
+                mods.push_labels(&mut parts);
+                parts.push(Self::key_vk_label(vk));
+            }
+        }
+        parts.join("+")
+    }
+
+    pub fn display_label(self) -> String {
+        let mut parts = Vec::new();
+        match self {
+            Self::Mouse { mods, button } => {
+                mods.push_labels(&mut parts);
+                parts.push(button.display_name().to_string());
+            }
+            Self::Key { mods, vk } => {
+                mods.push_labels(&mut parts);
+                parts.push(Self::key_vk_label(vk));
+            }
+        }
+        parts.join("+")
+    }
+
+    fn matches_launch_hotkey(self, hotkey: HotkeySpec) -> bool {
+        let Self::Key { mods, vk } = self else {
+            return false;
+        };
+        if vk != hotkey.vk || mods.shift {
+            return false;
+        }
+        match hotkey.primary {
+            PrimaryModifier::Ctrl => mods.ctrl && !mods.alt && !mods.win,
+            PrimaryModifier::Alt => mods.alt && !mods.ctrl && !mods.win,
+            PrimaryModifier::Win => mods.win && !mods.ctrl && !mods.alt,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuickDragTriggerInfo {
+    pub screen_x: i32,
+    pub screen_y: i32,
+    pub cursor_hwnd: isize,
+    pub cursor_root_hwnd: isize,
+    pub fg_hwnd: isize,
+    pub fg_root_hwnd: isize,
+    pub triggered_by_keyboard: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum ShellEvent {
     ToggleOverlay {
@@ -441,6 +790,11 @@ pub enum ShellEvent {
         hold_armed: bool,
     },
     ShowOverlay,
+    QuickDragOpen(QuickDragTriggerInfo),
+    QuickDragButtonReleased {
+        screen_x: i32,
+        screen_y: i32,
+    },
     OpenSettings,
     CheckUpdate,
     OpenUpdateDialog,
@@ -466,6 +820,17 @@ struct WinArrowPatchRequest {
     reply: mpsc::Sender<Result<()>>,
 }
 
+struct QuickDragConfigRequest {
+    enabled: bool,
+    shortcut: QuickDragShortcut,
+    reply: mpsc::Sender<Result<()>>,
+}
+
+struct QuickDragMouseTargetRequest {
+    target: Option<(QuickDragModifiers, QuickDragMouseButton)>,
+    reply: mpsc::Sender<Result<()>>,
+}
+
 struct ArmHoldRequest {
     primary: PrimaryModifier,
     reply: mpsc::Sender<bool>,
@@ -481,6 +846,7 @@ struct ShellHostStartup {
     hotkey_registered: bool,
     hotkey_error: Option<String>,
     win_arrow_patch_error: Option<String>,
+    quick_drag_hook_error: Option<String>,
 }
 
 struct OverlayFocusState {
@@ -511,6 +877,13 @@ impl OverlayFocusState {
         self.host_hwnd.store(host_hwnd.0 as isize, Ordering::Release);
     }
 
+    fn overlay_hwnds(&self) -> (isize, isize) {
+        (
+            self.gpui_hwnd.load(Ordering::Acquire),
+            self.host_hwnd.load(Ordering::Acquire),
+        )
+    }
+
     fn is_overlay_foreground_with(&self, fg_raw: isize) -> bool {
         if !self.is_visible() {
             return false;
@@ -537,22 +910,31 @@ struct SharedHookSync {
     physical_mods: AtomicU8,
     synthetic_ctrl_until_ms: AtomicU64,
     last_hook_event_ms: AtomicU64,
+    last_mouse_hook_event_ms: AtomicU64,
     patch_enabled: AtomicBool,
+    quick_drag_enabled: AtomicBool,
 }
 
 impl SharedHookSync {
-    fn new(overlay: Arc<OverlayFocusState>, patch_enabled: bool) -> Self {
+    fn new(overlay: Arc<OverlayFocusState>, patch_enabled: bool, quick_drag_enabled: bool) -> Self {
         Self {
             overlay,
             physical_mods: AtomicU8::new(0),
             synthetic_ctrl_until_ms: AtomicU64::new(0),
             last_hook_event_ms: AtomicU64::new(0),
+            last_mouse_hook_event_ms: AtomicU64::new(0),
             patch_enabled: AtomicBool::new(patch_enabled),
+            quick_drag_enabled: AtomicBool::new(quick_drag_enabled),
         }
     }
 
     fn in_synthetic_ctrl_window(&self, now_ms: u64) -> bool {
         now_ms <= self.synthetic_ctrl_until_ms.load(Ordering::Acquire)
+    }
+
+    fn any_persistent_hook_enabled(&self) -> bool {
+        self.patch_enabled.load(Ordering::Acquire)
+            || self.quick_drag_enabled.load(Ordering::Acquire)
     }
 }
 
@@ -570,6 +952,9 @@ struct ShellHostState {
     hotkey_label: String,
     taskbar_created_msg: u32,
     hotkey_registered: bool,
+    quick_drag_enabled: bool,
+    quick_drag_shortcut: QuickDragShortcut,
+    quick_drag_hotkey_registered: bool,
     broadcast_hwnd: HWND,
     watchdog_armed: bool,
     hook_sync: Arc<SharedHookSync>,
@@ -646,6 +1031,173 @@ impl ModifierSnapshot {
 
     fn is_pure_win_only(self) -> bool {
         self.win && !self.ctrl && !self.alt && !self.shift
+    }
+
+    fn matches_quick_drag(self, expected: QuickDragModifiers) -> bool {
+        self.ctrl == expected.ctrl
+            && self.alt == expected.alt
+            && self.shift == expected.shift
+            && self.win == expected.win
+    }
+}
+
+fn pack_point_params(pt: POINT) -> (WPARAM, LPARAM) {
+    (WPARAM((pt.x as u32) as usize), LPARAM(pt.y as isize))
+}
+
+fn unpack_point_params(wparam: WPARAM, lparam: LPARAM) -> POINT {
+    POINT {
+        x: (wparam.0 as u32) as i32,
+        y: lparam.0 as i32,
+    }
+}
+
+fn capture_quick_drag_trigger_info(
+    pt: POINT,
+    overlay_hwnds: (isize, isize),
+    triggered_by_keyboard: bool,
+) -> QuickDragTriggerInfo {
+    let (self_gpui, self_host) = overlay_hwnds;
+    let is_self = |raw: isize| raw == 0 || raw == self_gpui || raw == self_host;
+
+    let mut cursor_hwnd = 0isize;
+    let mut cursor_root_hwnd = 0isize;
+    let hit = unsafe { WindowFromPoint(pt) };
+    if !hit.is_invalid() {
+        let root = unsafe { GetAncestor(hit, GA_ROOT) };
+        let root_raw = if !root.is_invalid() {
+            root.0 as isize
+        } else {
+            hit.0 as isize
+        };
+        if !is_self(root_raw) {
+            cursor_hwnd = root_raw;
+        }
+        let root_owner = unsafe { GetAncestor(hit, GA_ROOTOWNER) };
+        let root_owner_raw = if !root_owner.is_invalid() {
+            root_owner.0 as isize
+        } else {
+            0
+        };
+        if !is_self(root_owner_raw) && root_owner_raw != cursor_hwnd {
+            cursor_root_hwnd = root_owner_raw;
+        }
+    }
+
+    let mut fg_hwnd = 0isize;
+    let mut fg_root_hwnd = 0isize;
+    let fg = unsafe { GetForegroundWindow() };
+    if !fg.is_invalid() {
+        let fg_raw = fg.0 as isize;
+        if !is_self(fg_raw) {
+            fg_hwnd = fg_raw;
+            let fg_ro = unsafe { GetAncestor(fg, GA_ROOTOWNER) };
+            let fg_ro_raw = if !fg_ro.is_invalid() {
+                fg_ro.0 as isize
+            } else {
+                0
+            };
+            if !is_self(fg_ro_raw) && fg_ro_raw != fg_raw {
+                fg_root_hwnd = fg_ro_raw;
+            }
+        }
+    }
+
+    QuickDragTriggerInfo {
+        screen_x: pt.x,
+        screen_y: pt.y,
+        cursor_hwnd,
+        cursor_root_hwnd,
+        fg_hwnd,
+        fg_root_hwnd,
+        triggered_by_keyboard,
+    }
+}
+
+fn decode_mouse_button_event(msg: u32, mouse_data: u32) -> Option<(QuickDragMouseButton, bool)> {
+    match msg {
+        WM_LBUTTONDOWN => Some((QuickDragMouseButton::Left, true)),
+        WM_LBUTTONUP => Some((QuickDragMouseButton::Left, false)),
+        WM_RBUTTONDOWN => Some((QuickDragMouseButton::Right, true)),
+        WM_RBUTTONUP => Some((QuickDragMouseButton::Right, false)),
+        WM_MBUTTONDOWN => Some((QuickDragMouseButton::Middle, true)),
+        WM_MBUTTONUP => Some((QuickDragMouseButton::Middle, false)),
+        WM_XBUTTONDOWN => match ((mouse_data >> 16) & 0xFFFF) as u16 {
+            XBUTTON1_ID => Some((QuickDragMouseButton::X1, true)),
+            XBUTTON2_ID => Some((QuickDragMouseButton::X2, true)),
+            _ => None,
+        },
+        WM_XBUTTONUP => match ((mouse_data >> 16) & 0xFFFF) as u16 {
+            XBUTTON1_ID => Some((QuickDragMouseButton::X1, false)),
+            XBUTTON2_ID => Some((QuickDragMouseButton::X2, false)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuickDragMouseDecision {
+    Pass,
+    SwallowAndTrigger,
+    SwallowAndRelease,
+}
+
+#[derive(Debug, Default)]
+struct QuickDragMouseState {
+    target: Option<(QuickDragModifiers, QuickDragMouseButton)>,
+    swallowed_button: Option<QuickDragMouseButton>,
+}
+
+impl QuickDragMouseState {
+    fn is_enabled(&self) -> bool {
+        self.target.is_some()
+    }
+
+    fn set_target(&mut self, target: Option<(QuickDragModifiers, QuickDragMouseButton)>) {
+        self.target = target;
+        if target.is_none() {
+            self.swallowed_button = None;
+        }
+    }
+
+    fn reset_swallowed(&mut self) {
+        self.swallowed_button = None;
+    }
+
+    fn handle_button(
+        &mut self,
+        button: QuickDragMouseButton,
+        is_down: bool,
+        overlay_foreground: bool,
+        mods: ModifierSnapshot,
+    ) -> QuickDragMouseDecision {
+        if !is_down {
+            if self.swallowed_button == Some(button) {
+                self.swallowed_button = None;
+                return QuickDragMouseDecision::SwallowAndRelease;
+            }
+            return QuickDragMouseDecision::Pass;
+        }
+
+        // Recover cleanly if a previous button-up was lost (e.g. UAC / Secure Desktop).
+        if self.swallowed_button == Some(button) {
+            self.swallowed_button = None;
+        }
+
+        let Some((expected_mods, expected_button)) = self.target else {
+            return QuickDragMouseDecision::Pass;
+        };
+        if overlay_foreground || button != expected_button {
+            return QuickDragMouseDecision::Pass;
+        }
+
+        if mods.matches_quick_drag(expected_mods) {
+            self.swallowed_button = Some(button);
+            QuickDragMouseDecision::SwallowAndTrigger
+        } else {
+            QuickDragMouseDecision::Pass
+        }
     }
 }
 
@@ -939,6 +1491,7 @@ struct HoldHookContext {
 #[derive(Default)]
 struct KeyboardHookState {
     hook: Option<HHOOK>,
+    mouse_hook: Option<HHOOK>,
     kbd_hwnd: HWND,
     shell_hwnd: HWND,
     sync: Option<Arc<SharedHookSync>>,
@@ -946,6 +1499,7 @@ struct KeyboardHookState {
     modifiers: PhysicalModifierTracker,
     reconcile_timer_armed: bool,
     win_arrow_patch: WinArrowPatchState,
+    quick_drag: QuickDragMouseState,
 }
 
 thread_local! {
@@ -1054,12 +1608,70 @@ fn reinstall_keyboard_hook(state: &mut KeyboardHookState, reset_modifiers: bool)
     Ok(())
 }
 
+fn sync_mouse_hook(state: &mut KeyboardHookState) -> Result<()> {
+    let needed = state.quick_drag.is_enabled();
+    if needed && state.mouse_hook.is_none() {
+        let hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_ll_proc), None, 0) }
+            .context("SetWindowsHookExW(WH_MOUSE_LL) failed")?;
+        state.mouse_hook = Some(hook);
+        if let Some(ref sync) = state.sync {
+            sync.last_mouse_hook_event_ms
+                .store(monotonic_ms(), Ordering::Relaxed);
+        }
+    } else if !needed {
+        if let Some(hook) = state.mouse_hook.take() {
+            unsafe {
+                let _ = UnhookWindowsHookEx(hook);
+            }
+        }
+        state.quick_drag.reset_swallowed();
+    }
+    Ok(())
+}
+
+fn reinstall_mouse_hook(state: &mut KeyboardHookState) -> Result<()> {
+    if let Some(hook) = state.mouse_hook.take() {
+        unsafe {
+            let _ = UnhookWindowsHookEx(hook);
+        }
+    }
+    state.quick_drag.reset_swallowed();
+    if state.quick_drag.is_enabled() {
+        let hook = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_ll_proc), None, 0) }
+            .map_err(|e| anyhow!("SetWindowsHookExW(WH_MOUSE_LL) failed: {e}"))?;
+        state.mouse_hook = Some(hook);
+        if let Some(ref sync) = state.sync {
+            sync.last_mouse_hook_event_ms
+                .store(monotonic_ms(), Ordering::Relaxed);
+        }
+    }
+    Ok(())
+}
+
+fn notify_watchdog_sync(state: &KeyboardHookState) {
+    if !state.shell_hwnd.is_invalid() {
+        let any_enabled = state
+            .sync
+            .as_ref()
+            .is_some_and(|s| s.any_persistent_hook_enabled());
+        unsafe {
+            let _ = PostMessageW(
+                Some(state.shell_hwnd),
+                WM_SYNC_WATCHDOG_TIMER,
+                WPARAM(any_enabled as usize),
+                LPARAM(0),
+            );
+        }
+    }
+}
+
 fn init_keyboard_hook_context(
     kbd_hwnd: HWND,
     shell_hwnd: HWND,
     sync: Arc<SharedHookSync>,
     win_arrow_patch_enabled: bool,
-) -> Result<()> {
+    quick_drag_mouse_target: Option<(QuickDragModifiers, QuickDragMouseButton)>,
+) -> (Option<String>, Option<String>) {
     KEYBOARD_HOOK.with(|slot| {
         let mut state = slot.borrow_mut();
         state.kbd_hwnd = kbd_hwnd;
@@ -1068,15 +1680,34 @@ fn init_keyboard_hook_context(
         state.hold = None;
         state.modifiers.clear();
         state.win_arrow_patch.set_enabled(win_arrow_patch_enabled);
-        let res = sync_keyboard_hook(&mut state);
-        if res.is_err() {
-            state.win_arrow_patch.set_enabled(false);
-            sync.patch_enabled.store(false, Ordering::Release);
-        } else {
-            sync.patch_enabled
-                .store(win_arrow_patch_enabled, Ordering::Release);
-        }
-        res
+        let kbd_err = match sync_keyboard_hook(&mut state) {
+            Ok(()) => {
+                sync.patch_enabled
+                    .store(win_arrow_patch_enabled, Ordering::Release);
+                None
+            }
+            Err(e) => {
+                state.win_arrow_patch.set_enabled(false);
+                sync.patch_enabled.store(false, Ordering::Release);
+                Some(format!("{e:#}"))
+            }
+        };
+
+        state.quick_drag.set_target(quick_drag_mouse_target);
+        let mouse_err = match sync_mouse_hook(&mut state) {
+            Ok(()) => {
+                sync.quick_drag_enabled
+                    .store(quick_drag_mouse_target.is_some(), Ordering::Release);
+                None
+            }
+            Err(e) => {
+                state.quick_drag.set_target(None);
+                sync.quick_drag_enabled.store(false, Ordering::Release);
+                Some(format!("{e:#}"))
+            }
+        };
+
+        (kbd_err, mouse_err)
     })
 }
 
@@ -1096,16 +1727,32 @@ fn set_win_arrow_patch_hook(enabled: bool) -> Result<()> {
         if let Some(ref sync) = state.sync {
             sync.patch_enabled.store(enabled, Ordering::Release);
         }
-        if !state.shell_hwnd.is_invalid() {
-            unsafe {
-                let _ = PostMessageW(
-                    Some(state.shell_hwnd),
-                    WM_SYNC_WATCHDOG_TIMER,
-                    WPARAM(enabled as usize),
-                    LPARAM(0),
-                );
+        notify_watchdog_sync(&state);
+        Ok(())
+    })
+}
+
+fn set_quick_drag_mouse_target_hook(
+    target: Option<(QuickDragModifiers, QuickDragMouseButton)>,
+) -> Result<()> {
+    KEYBOARD_HOOK.with(|slot| {
+        let mut state = slot.borrow_mut();
+        let prev = state.quick_drag.target;
+        state.quick_drag.set_target(target);
+        if let Err(e) = sync_mouse_hook(&mut state) {
+            state.quick_drag.set_target(prev);
+            let _ = sync_mouse_hook(&mut state);
+            if let Some(ref sync) = state.sync {
+                sync.quick_drag_enabled
+                    .store(prev.is_some(), Ordering::Release);
             }
+            return Err(anyhow!("安装鼠标钩子失败（{e}）"));
         }
+        if let Some(ref sync) = state.sync {
+            sync.quick_drag_enabled
+                .store(target.is_some(), Ordering::Release);
+        }
+        notify_watchdog_sync(&state);
         Ok(())
     })
 }
@@ -1142,6 +1789,7 @@ fn reset_hook_modifiers_local() {
         let mut state = slot.borrow_mut();
         state.modifiers.clear();
         state.win_arrow_patch.reset_swallowed();
+        state.quick_drag.reset_swallowed();
         publish_physical_mods(&state);
         update_reconcile_timer(&mut state);
     });
@@ -1150,26 +1798,43 @@ fn reset_hook_modifiers_local() {
 fn refresh_keyboard_hook_local(force: bool) {
     KEYBOARD_HOOK.with(|slot| {
         let mut state = slot.borrow_mut();
-        let needed = state.hold.is_some() || state.win_arrow_patch.enabled;
-        if !needed {
-            return;
-        }
-        if !force {
-            if state.hold.is_some()
+        let kbd_needed = state.hold.is_some() || state.win_arrow_patch.enabled;
+        if kbd_needed {
+            let should_refresh_kbd = if force {
+                true
+            } else if state.hold.is_some()
                 || state.modifiers.any_held()
                 || state.win_arrow_patch.any_swallowed()
             {
-                return;
-            }
-            if let Some(ref sync) = state.sync {
+                false
+            } else if let Some(ref sync) = state.sync {
                 let last = sync.last_hook_event_ms.load(Ordering::Relaxed);
                 let now = monotonic_ms();
-                if state.hook.is_some() && now.saturating_sub(last) < WATCHDOG_STALE_ACTIVITY_MS {
-                    return;
-                }
+                state.hook.is_none() || now.saturating_sub(last) >= WATCHDOG_STALE_ACTIVITY_MS
+            } else {
+                true
+            };
+            if should_refresh_kbd {
+                let _ = reinstall_keyboard_hook(&mut state, force);
             }
         }
-        let _ = reinstall_keyboard_hook(&mut state, force);
+
+        if state.quick_drag.is_enabled() {
+            let should_refresh_mouse = if force {
+                true
+            } else if state.quick_drag.swallowed_button.is_some() {
+                false
+            } else if let Some(ref sync) = state.sync {
+                let last = sync.last_mouse_hook_event_ms.load(Ordering::Relaxed);
+                let now = monotonic_ms();
+                state.mouse_hook.is_none() || now.saturating_sub(last) >= WATCHDOG_STALE_ACTIVITY_MS
+            } else {
+                true
+            };
+            if should_refresh_mouse {
+                let _ = reinstall_mouse_hook(&mut state);
+            }
+        }
     });
 }
 
@@ -1193,6 +1858,7 @@ fn teardown_keyboard_hook_local() {
         let mut state = slot.borrow_mut();
         state.hold = None;
         state.win_arrow_patch.set_enabled(false);
+        state.quick_drag.set_target(None);
         state.modifiers.clear();
         if state.reconcile_timer_armed && !state.kbd_hwnd.is_invalid() {
             unsafe {
@@ -1205,9 +1871,15 @@ fn teardown_keyboard_hook_local() {
                 let _ = UnhookWindowsHookEx(hook);
             }
         }
+        if let Some(hook) = state.mouse_hook.take() {
+            unsafe {
+                let _ = UnhookWindowsHookEx(hook);
+            }
+        }
         if let Some(ref sync) = state.sync {
             sync.physical_mods.store(0, Ordering::Release);
             sync.patch_enabled.store(false, Ordering::Release);
+            sync.quick_drag_enabled.store(false, Ordering::Release);
         }
         state.sync = None;
         state.kbd_hwnd = HWND::default();
@@ -1227,6 +1899,15 @@ unsafe extern "system" fn kbd_wnd_proc(
             if !req_ptr.is_null() {
                 let req = unsafe { Box::from_raw(req_ptr) };
                 let res = set_win_arrow_patch_hook(req.enabled);
+                let _ = req.reply.send(res);
+            }
+            return LRESULT(0);
+        }
+        WM_KBD_SET_QUICK_DRAG => {
+            let req_ptr = lparam.0 as *mut QuickDragMouseTargetRequest;
+            if !req_ptr.is_null() {
+                let req = unsafe { Box::from_raw(req_ptr) };
+                let res = set_quick_drag_mouse_target_hook(req.target);
                 let _ = req.reply.send(res);
             }
             return LRESULT(0);
@@ -1287,6 +1968,7 @@ struct KbdHookWorker {
 struct KbdHookStartup {
     kbd_hwnd_raw: isize,
     patch_error: Option<String>,
+    quick_drag_error: Option<String>,
 }
 
 impl KbdHookWorker {
@@ -1294,7 +1976,8 @@ impl KbdHookWorker {
         shell_hwnd: HWND,
         sync: Arc<SharedHookSync>,
         win_arrow_patch_enabled: bool,
-    ) -> Result<(Self, Option<String>)> {
+        quick_drag_mouse_target: Option<(QuickDragModifiers, QuickDragMouseButton)>,
+    ) -> Result<(Self, Option<String>, Option<String>)> {
         let (ready_tx, ready_rx) = mpsc::channel::<Result<KbdHookStartup>>();
         let shell_hwnd_raw = shell_hwnd.0 as isize;
 
@@ -1334,16 +2017,20 @@ impl KbdHookWorker {
                     .context("CreateWindowExW for WinDeckKbdHook")?;
 
                     let shell_hwnd = HWND(shell_hwnd_raw as *mut c_void);
-                    let patch_error =
-                        init_keyboard_hook_context(kbd_hwnd, shell_hwnd, sync, win_arrow_patch_enabled)
-                            .err()
-                            .map(|e| format!("{e:#}"));
+                    let (patch_error, quick_drag_error) = init_keyboard_hook_context(
+                        kbd_hwnd,
+                        shell_hwnd,
+                        sync,
+                        win_arrow_patch_enabled,
+                        quick_drag_mouse_target,
+                    );
 
                     Ok((
                         kbd_hwnd,
                         KbdHookStartup {
                             kbd_hwnd_raw: kbd_hwnd.0 as isize,
                             patch_error,
+                            quick_drag_error,
                         },
                     ))
                 })();
@@ -1372,14 +2059,14 @@ impl KbdHookWorker {
         let startup = ready_rx
             .recv()
             .context("wait for windeck-kbd-hook startup")??;
-        let patch_error = startup.patch_error;
 
         Ok((
             Self {
                 kbd_hwnd_raw: startup.kbd_hwnd_raw,
                 thread: Some(thread),
             },
-            patch_error,
+            startup.patch_error,
+            startup.quick_drag_error,
         ))
     }
 
@@ -1406,6 +2093,32 @@ impl KbdHookWorker {
                 .reply
                 .send(Err(anyhow!("PostMessageW(WM_KBD_SET_PATCH) failed: {e}")));
         }
+    }
+
+    fn set_quick_drag_mouse_target(
+        &self,
+        target: Option<(QuickDragModifiers, QuickDragMouseButton)>,
+    ) -> Result<()> {
+        let Some(hwnd) = self.kbd_hwnd() else {
+            return Err(anyhow!("输入钩子线程未运行"));
+        };
+        let (tx, rx) = mpsc::channel();
+        let req_ptr = Box::into_raw(Box::new(QuickDragMouseTargetRequest { target, reply: tx }));
+        if let Err(e) = unsafe {
+            PostMessageW(
+                Some(hwnd),
+                WM_KBD_SET_QUICK_DRAG,
+                WPARAM(0),
+                LPARAM(req_ptr as isize),
+            )
+        } {
+            unsafe {
+                drop(Box::from_raw(req_ptr));
+            }
+            return Err(anyhow!("PostMessageW(WM_KBD_SET_QUICK_DRAG) failed: {e}"));
+        }
+        rx.recv_timeout(Duration::from_millis(800))
+            .map_err(|_| anyhow!("鼠标钩子更新超时"))?
     }
 
     fn arm_hold(&self, primary: PrimaryModifier) -> bool {
@@ -1669,6 +2382,95 @@ unsafe extern "system" fn keyboard_ll_proc(
     match action {
         Action::Swallow => LRESULT(1),
         Action::Pass => unsafe { CallNextHookEx(None, n_code, wparam, lparam) },
+    }
+}
+
+unsafe extern "system" fn mouse_ll_proc(n_code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    if n_code < 0 {
+        return unsafe { CallNextHookEx(None, n_code, wparam, lparam) };
+    }
+
+    // Ultra-fast hot path: ignore WM_MOUSEMOVE / wheel before touching thread-local storage
+    // or atomics so high-polling-rate mice never see latency.
+    let msg = wparam.0 as u32;
+    if !matches!(
+        msg,
+        WM_LBUTTONDOWN
+            | WM_LBUTTONUP
+            | WM_RBUTTONDOWN
+            | WM_RBUTTONUP
+            | WM_MBUTTONDOWN
+            | WM_MBUTTONUP
+            | WM_XBUTTONDOWN
+            | WM_XBUTTONUP
+    ) {
+        return unsafe { CallNextHookEx(None, n_code, wparam, lparam) };
+    }
+
+    let ms = unsafe { &*(lparam.0 as *const MSLLHOOKSTRUCT) };
+    if (ms.flags & LLMHF_INJECTED_FLAG) != 0 {
+        return unsafe { CallNextHookEx(None, n_code, wparam, lparam) };
+    }
+    let Some((button, is_down)) = decode_mouse_button_event(msg, ms.mouseData) else {
+        return unsafe { CallNextHookEx(None, n_code, wparam, lparam) };
+    };
+
+    let pt = ms.pt;
+    let swallow = KEYBOARD_HOOK.with(|slot| {
+        let Ok(mut state) = slot.try_borrow_mut() else {
+            return false;
+        };
+
+        let now_ms = monotonic_ms();
+        let (overlay_foreground, ignore_lctrl_async) = match state.sync.as_ref() {
+            Some(sync) => {
+                sync.last_mouse_hook_event_ms
+                    .store(now_ms, Ordering::Relaxed);
+                (
+                    sync.overlay.is_overlay_foreground(),
+                    sync.in_synthetic_ctrl_window(now_ms),
+                )
+            }
+            None => (false, false),
+        };
+
+        let mods = if is_down && state.quick_drag.is_enabled() && !overlay_foreground {
+            let mut bits = capture_async_mod_bits();
+            if ignore_lctrl_async {
+                bits &= !PHYS_MOD_LCTRL;
+            }
+            ModifierSnapshot::from_bits(bits)
+        } else {
+            ModifierSnapshot::from_bits(0)
+        };
+
+        let shell_hwnd = state.shell_hwnd;
+        match state
+            .quick_drag
+            .handle_button(button, is_down, overlay_foreground, mods)
+        {
+            QuickDragMouseDecision::Pass => false,
+            QuickDragMouseDecision::SwallowAndTrigger => {
+                let (wp, lp) = pack_point_params(pt);
+                unsafe {
+                    let _ = PostMessageW(Some(shell_hwnd), WM_QUICK_DRAG_TRIGGER, wp, lp);
+                }
+                true
+            }
+            QuickDragMouseDecision::SwallowAndRelease => {
+                let (wp, lp) = pack_point_params(pt);
+                unsafe {
+                    let _ = PostMessageW(Some(shell_hwnd), WM_QUICK_DRAG_RELEASE, wp, lp);
+                }
+                true
+            }
+        }
+    });
+
+    if swallow {
+        LRESULT(1)
+    } else {
+        unsafe { CallNextHookEx(None, n_code, wparam, lparam) }
     }
 }
 
@@ -2112,6 +2914,40 @@ unsafe extern "system" fn shell_wnd_proc(
                 }
                 return LRESULT(0);
             }
+            WM_SET_QUICK_DRAG => {
+                let req_ptr = lparam.0 as *mut QuickDragConfigRequest;
+                if !req_ptr.is_null() {
+                    let req = unsafe { Box::from_raw(req_ptr) };
+                    let res = apply_quick_drag_config_on_shell(
+                        hwnd,
+                        state,
+                        req.enabled,
+                        req.shortcut,
+                    );
+                    let _ = req.reply.send(res);
+                }
+                return LRESULT(0);
+            }
+            WM_QUICK_DRAG_TRIGGER => {
+                let _ = unsafe { AllowSetForegroundWindow(ASFW_ANY) };
+                state.kbd_worker.disarm_hold();
+                let pt = unpack_point_params(wparam, lparam);
+                let info = capture_quick_drag_trigger_info(
+                    pt,
+                    state.hook_sync.overlay.overlay_hwnds(),
+                    false,
+                );
+                (state.on_event)(ShellEvent::QuickDragOpen(info));
+                return LRESULT(0);
+            }
+            WM_QUICK_DRAG_RELEASE => {
+                let pt = unpack_point_params(wparam, lparam);
+                (state.on_event)(ShellEvent::QuickDragButtonReleased {
+                    screen_x: pt.x,
+                    screen_y: pt.y,
+                });
+                return LRESULT(0);
+            }
             WM_SYNC_WATCHDOG_TIMER => {
                 sync_watchdog_timer(hwnd, state, wparam.0 != 0);
                 return LRESULT(0);
@@ -2131,7 +2967,7 @@ unsafe extern "system" fn shell_wnd_proc(
                 return LRESULT(0);
             }
             WM_TIMER if wparam.0 == TIMER_HOOK_WATCHDOG => {
-                if state.hook_sync.patch_enabled.load(Ordering::Acquire)
+                if state.hook_sync.any_persistent_hook_enabled()
                     && state.hook_sync.physical_mods.load(Ordering::Acquire) == 0
                     && user_idle_ms().is_some_and(|idle| idle >= WATCHDOG_MIN_IDLE_MS)
                 {
@@ -2153,6 +2989,22 @@ unsafe extern "system" fn shell_wnd_proc(
                     hotkey_triggered: true,
                     hold_armed,
                 });
+                return LRESULT(0);
+            }
+            WM_HOTKEY if wparam.0 as i32 == QUICK_DRAG_HOTKEY_ID => {
+                if state.hook_sync.overlay.is_overlay_foreground() {
+                    return LRESULT(0);
+                }
+                let _ = unsafe { AllowSetForegroundWindow(ASFW_ANY) };
+                state.kbd_worker.disarm_hold();
+                let mut pt = POINT::default();
+                let _ = unsafe { GetCursorPos(&mut pt) };
+                let info = capture_quick_drag_trigger_info(
+                    pt,
+                    state.hook_sync.overlay.overlay_hwnds(),
+                    true,
+                );
+                (state.on_event)(ShellEvent::QuickDragOpen(info));
                 return LRESULT(0);
             }
             WM_HOLD_NAV => {
@@ -2296,6 +3148,10 @@ unsafe extern "system" fn shell_wnd_proc(
                     let _ = unsafe { UnregisterHotKey(Some(hwnd), HOTKEY_ID) };
                     state.hotkey_registered = false;
                 }
+                if state.quick_drag_hotkey_registered {
+                    let _ = unsafe { UnregisterHotKey(Some(hwnd), QUICK_DRAG_HOTKEY_ID) };
+                    state.quick_drag_hotkey_registered = false;
+                }
                 remove_tray_icon(hwnd);
                 let _ = unsafe { DestroyWindow(hwnd) };
                 return LRESULT(0);
@@ -2303,6 +3159,10 @@ unsafe extern "system" fn shell_wnd_proc(
             WM_DESTROY => {
                 sync_watchdog_timer(hwnd, state, false);
                 state.kbd_worker.shutdown();
+                if state.quick_drag_hotkey_registered {
+                    let _ = unsafe { UnregisterHotKey(Some(hwnd), QUICK_DRAG_HOTKEY_ID) };
+                    state.quick_drag_hotkey_registered = false;
+                }
                 if !state.broadcast_hwnd.is_invalid() {
                     let _ = unsafe { DestroyWindow(state.broadcast_hwnd) };
                     state.broadcast_hwnd = HWND::default();
@@ -2331,6 +3191,115 @@ unsafe extern "system" fn shell_wnd_proc(
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
+fn apply_quick_drag_config_on_shell(
+    hwnd: HWND,
+    state: &mut ShellHostState,
+    enabled: bool,
+    shortcut: QuickDragShortcut,
+) -> Result<()> {
+    shortcut.validate()?;
+    if enabled && shortcut.matches_launch_hotkey(state.hotkey) {
+        return Err(anyhow!(
+            "快捷拖动热键 {} 与呼出快捷键冲突",
+            shortcut.display_label()
+        ));
+    }
+
+    let prev_enabled = state.quick_drag_enabled;
+    let prev_shortcut = state.quick_drag_shortcut;
+    let prev_hotkey_registered = state.quick_drag_hotkey_registered;
+
+    let want_mouse = if enabled {
+        match shortcut {
+            QuickDragShortcut::Mouse { mods, button } => Some((mods, button)),
+            QuickDragShortcut::Key { .. } => None,
+        }
+    } else {
+        None
+    };
+    let want_key = if enabled {
+        match shortcut {
+            QuickDragShortcut::Key { mods, vk } => Some((mods, vk)),
+            QuickDragShortcut::Mouse { .. } => None,
+        }
+    } else {
+        None
+    };
+
+    // 1. Update global keyboard hotkey if needed (rolling back cleanly on occupancy conflict).
+    let prev_key = if prev_enabled && prev_hotkey_registered {
+        match prev_shortcut {
+            QuickDragShortcut::Key { mods, vk } => Some((mods, vk)),
+            QuickDragShortcut::Mouse { .. } => None,
+        }
+    } else {
+        None
+    };
+    if want_key != prev_key {
+        if prev_hotkey_registered {
+            let _ = unsafe { UnregisterHotKey(Some(hwnd), QUICK_DRAG_HOTKEY_ID) };
+            state.quick_drag_hotkey_registered = false;
+        }
+        if let Some((mods, vk)) = want_key {
+            if let Err(e) = unsafe {
+                RegisterHotKey(
+                    Some(hwnd),
+                    QUICK_DRAG_HOTKEY_ID,
+                    HOT_KEY_MODIFIERS(MOD_NOREPEAT.0 | mods.win32_mod_flags()),
+                    vk,
+                )
+            } {
+                if let Some((old_mods, old_vk)) = prev_key
+                    && unsafe {
+                        RegisterHotKey(
+                            Some(hwnd),
+                            QUICK_DRAG_HOTKEY_ID,
+                            HOT_KEY_MODIFIERS(MOD_NOREPEAT.0 | old_mods.win32_mod_flags()),
+                            old_vk,
+                        )
+                    }
+                    .is_ok()
+                {
+                    state.quick_drag_hotkey_registered = true;
+                }
+                return Err(anyhow!(
+                    "快捷拖动热键 {} 已被系统或其他程序占用（{e}）",
+                    shortcut.display_label()
+                ));
+            }
+            state.quick_drag_hotkey_registered = true;
+        }
+    }
+
+    // 2. Update WH_MOUSE_LL hook on the dedicated input-hook worker thread.
+    if let Err(e) = state.kbd_worker.set_quick_drag_mouse_target(want_mouse) {
+        if want_key != prev_key {
+            if state.quick_drag_hotkey_registered {
+                let _ = unsafe { UnregisterHotKey(Some(hwnd), QUICK_DRAG_HOTKEY_ID) };
+                state.quick_drag_hotkey_registered = false;
+            }
+            if let Some((old_mods, old_vk)) = prev_key
+                && unsafe {
+                    RegisterHotKey(
+                        Some(hwnd),
+                        QUICK_DRAG_HOTKEY_ID,
+                        HOT_KEY_MODIFIERS(MOD_NOREPEAT.0 | old_mods.win32_mod_flags()),
+                        old_vk,
+                    )
+                }
+                .is_ok()
+            {
+                state.quick_drag_hotkey_registered = true;
+            }
+        }
+        return Err(e);
+    }
+
+    state.quick_drag_enabled = enabled;
+    state.quick_drag_shortcut = shortcut;
+    Ok(())
+}
+
 /// Manages global hotkey + Windows system tray icon on a dedicated zero-CPU message thread,
 /// paired with a separate high-priority `windeck-kbd-hook` thread for low-level keyboard interception.
 pub struct ShellHost {
@@ -2338,6 +3307,7 @@ pub struct ShellHost {
     hotkey_registered: bool,
     hotkey_error: Option<String>,
     win_arrow_patch_error: Option<String>,
+    quick_drag_hook_error: Option<String>,
     overlay: Arc<OverlayFocusState>,
     thread: Option<thread::JoinHandle<()>>,
 }
@@ -2347,6 +3317,8 @@ impl ShellHost {
         hotkey: HotkeySpec,
         hotkey_label: String,
         win_arrow_switch_desktop: bool,
+        quick_drag_window: bool,
+        quick_drag_shortcut: QuickDragShortcut,
         on_event: F,
     ) -> Result<Self>
     where
@@ -2354,7 +3326,19 @@ impl ShellHost {
     {
         let (ready_tx, ready_rx) = mpsc::channel::<Result<ShellHostStartup>>();
         let overlay = Arc::new(OverlayFocusState::new());
-        let hook_sync = Arc::new(SharedHookSync::new(overlay.clone(), win_arrow_switch_desktop));
+        let initial_mouse_target = if quick_drag_window {
+            match quick_drag_shortcut {
+                QuickDragShortcut::Mouse { mods, button } => Some((mods, button)),
+                QuickDragShortcut::Key { .. } => None,
+            }
+        } else {
+            None
+        };
+        let hook_sync = Arc::new(SharedHookSync::new(
+            overlay.clone(),
+            win_arrow_switch_desktop,
+            initial_mouse_target.is_some(),
+        ));
 
         let thread = thread::Builder::new()
             .name("windeck-shell-host".to_string())
@@ -2398,12 +3382,13 @@ impl ShellHost {
                         }
                     };
 
-                    let (kbd_worker, patch_err) = match KbdHookWorker::start(
+                    let (kbd_worker, patch_err, mut quick_drag_err) = match KbdHookWorker::start(
                         hwnd,
                         hook_sync.clone(),
                         win_arrow_switch_desktop,
+                        initial_mouse_target,
                     ) {
-                        Ok(pair) => pair,
+                        Ok(triple) => triple,
                         Err(e) => {
                             let _ = unsafe { DestroyWindow(hwnd) };
                             let _ = unsafe { DestroyIcon(tray_icon) };
@@ -2423,6 +3408,9 @@ impl ShellHost {
                         hotkey_label,
                         taskbar_created_msg,
                         hotkey_registered: false,
+                        quick_drag_enabled: quick_drag_window && quick_drag_err.is_none(),
+                        quick_drag_shortcut,
+                        quick_drag_hotkey_registered: false,
                         broadcast_hwnd,
                         watchdog_armed: false,
                         hook_sync: hook_sync.clone(),
@@ -2448,7 +3436,39 @@ impl ShellHost {
                         Err(e) => (false, Some(format!("RegisterHotKey failed: {e}"))),
                     };
 
-                    if win_arrow_switch_desktop && patch_err.is_none() {
+                    if quick_drag_window
+                        && let QuickDragShortcut::Key { mods, vk } = quick_drag_shortcut
+                    {
+                        if quick_drag_shortcut.matches_launch_hotkey(hotkey) {
+                            quick_drag_err = Some(format!(
+                                "快捷拖动热键 {} 与呼出快捷键冲突",
+                                quick_drag_shortcut.display_label()
+                            ));
+                            unsafe { (*state_ptr).quick_drag_enabled = false };
+                        } else {
+                            match unsafe {
+                                RegisterHotKey(
+                                    Some(hwnd),
+                                    QUICK_DRAG_HOTKEY_ID,
+                                    HOT_KEY_MODIFIERS(MOD_NOREPEAT.0 | mods.win32_mod_flags()),
+                                    vk,
+                                )
+                            } {
+                                Ok(()) => {
+                                    unsafe { (*state_ptr).quick_drag_hotkey_registered = true };
+                                }
+                                Err(e) => {
+                                    quick_drag_err = Some(format!(
+                                        "快捷拖动热键 {} 已被系统或其他程序占用（{e}）",
+                                        quick_drag_shortcut.display_label()
+                                    ));
+                                    unsafe { (*state_ptr).quick_drag_enabled = false };
+                                }
+                            }
+                        }
+                    }
+
+                    if hook_sync.any_persistent_hook_enabled() {
                         unsafe {
                             sync_watchdog_timer(hwnd, &mut *state_ptr, true);
                         }
@@ -2461,6 +3481,7 @@ impl ShellHost {
                             hotkey_registered: reg_ok,
                             hotkey_error: reg_err,
                             win_arrow_patch_error: patch_err,
+                            quick_drag_hook_error: quick_drag_err,
                         },
                     ))
                 })();
@@ -2494,6 +3515,7 @@ impl ShellHost {
             hotkey_registered: startup.hotkey_registered,
             hotkey_error: startup.hotkey_error,
             win_arrow_patch_error: startup.win_arrow_patch_error,
+            quick_drag_hook_error: startup.quick_drag_hook_error,
             overlay,
             thread: Some(thread),
         })
@@ -2509,6 +3531,10 @@ impl ShellHost {
 
     pub fn win_arrow_patch_error(&self) -> Option<&str> {
         self.win_arrow_patch_error.as_deref()
+    }
+
+    pub fn quick_drag_hook_error(&self) -> Option<&str> {
+        self.quick_drag_hook_error.as_deref()
     }
 
     /// Registers WinDeck's two overlay HWNDs so the keyboard patch only treats the overlay
@@ -2562,6 +3588,41 @@ impl ShellHost {
         }
         rx.recv_timeout(Duration::from_millis(800))
             .map_err(|_| anyhow!("系统补丁更新超时"))?
+    }
+
+    /// Atomically updates the global Quick Drag ("快捷拖动") enable flag and trigger shortcut
+    /// (installing/uninstalling `WH_MOUSE_LL` for mouse triggers or `RegisterHotKey` for keyboard triggers).
+    pub fn set_quick_drag_config(
+        &self,
+        enabled: bool,
+        shortcut: QuickDragShortcut,
+    ) -> Result<()> {
+        if self.hwnd_raw == 0 {
+            return Err(anyhow!("ShellHost is not running"));
+        }
+        let hwnd = HWND(self.hwnd_raw as *mut c_void);
+        let (tx, rx) = mpsc::channel();
+        let req_ptr = Box::into_raw(Box::new(QuickDragConfigRequest {
+            enabled,
+            shortcut,
+            reply: tx,
+        }));
+        let posted = unsafe {
+            PostMessageW(
+                Some(hwnd),
+                WM_SET_QUICK_DRAG,
+                WPARAM(0),
+                LPARAM(req_ptr as isize),
+            )
+        };
+        if let Err(e) = posted {
+            unsafe {
+                drop(Box::from_raw(req_ptr));
+            }
+            return Err(anyhow!("PostMessageW(WM_SET_QUICK_DRAG) failed: {e}"));
+        }
+        rx.recv_timeout(Duration::from_millis(800))
+            .map_err(|_| anyhow!("快捷拖动配置更新超时"))?
     }
 
     /// Shows a non-intrusive Windows tray notification balloon (e.g. when an update is found while hidden).
@@ -2938,20 +3999,235 @@ mod tests {
     }
 
     #[test]
+    fn quick_drag_shortcut_parses_validates_and_formats_mouse_and_keyboard_combos() {
+        let def = QuickDragShortcut::default();
+        assert_eq!(def.to_config_string(), "Ctrl+Alt+Left");
+        assert_eq!(def.display_label(), "Ctrl+Alt+左键");
+        assert_eq!(QuickDragShortcut::parse("ctrl + alt + left").unwrap(), def);
+
+        let alt_right = QuickDragShortcut::parse("Alt+Right").unwrap();
+        assert_eq!(alt_right.to_config_string(), "Alt+Right");
+        assert_eq!(alt_right.display_label(), "Alt+右键");
+
+        let bare_middle = QuickDragShortcut::parse("Middle").unwrap();
+        assert_eq!(bare_middle.to_config_string(), "Middle");
+        assert_eq!(bare_middle.display_label(), "中键");
+
+        let x1 = QuickDragShortcut::parse("Ctrl+X1").unwrap();
+        assert_eq!(x1.to_config_string(), "Ctrl+X1");
+        assert_eq!(x1.display_label(), "Ctrl+侧键1");
+
+        let key_combo = QuickDragShortcut::parse("Ctrl+Shift+D").unwrap();
+        assert_eq!(key_combo.to_config_string(), "Ctrl+Shift+D");
+        assert_eq!(key_combo.display_label(), "Ctrl+Shift+D");
+
+        let fn_key = QuickDragShortcut::parse("F9").unwrap();
+        assert_eq!(fn_key.to_config_string(), "F9");
+        assert_eq!(fn_key.display_label(), "F9");
+
+        // Bare Left/Right or bare letter must be rejected to avoid hijacking normal input
+        assert!(QuickDragShortcut::parse("Left").is_err());
+        assert!(QuickDragShortcut::parse("Right").is_err());
+        assert!(QuickDragShortcut::parse("D").is_err());
+        assert!(QuickDragShortcut::parse("Shift+D").is_err());
+
+        // Bare modifier key names return Ok(None) during live recording
+        assert_eq!(
+            QuickDragShortcut::from_key_name("control", QuickDragModifiers::new(true, false, false, false))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            QuickDragShortcut::from_key_name("d", QuickDragModifiers::new(true, true, false, false))
+                .unwrap(),
+            Some(QuickDragShortcut::parse("Ctrl+Alt+D").unwrap())
+        );
+
+        // Launch hotkey collision detection
+        let launch = HotkeySpec::parse("Alt+Q").unwrap();
+        assert!(
+            QuickDragShortcut::parse("Alt+Q")
+                .unwrap()
+                .matches_launch_hotkey(launch)
+        );
+        assert!(
+            !QuickDragShortcut::parse("Ctrl+Alt+Q")
+                .unwrap()
+                .matches_launch_hotkey(launch)
+        );
+        assert!(!def.matches_launch_hotkey(launch));
+    }
+
+    #[test]
+    fn quick_drag_mouse_state_handles_custom_buttons_modifiers_release_and_guards() {
+        let ctrl_alt = ModifierSnapshot {
+            win: false,
+            ctrl: true,
+            alt: true,
+            shift: false,
+        };
+        let ctrl_only = ModifierSnapshot {
+            win: false,
+            ctrl: true,
+            alt: false,
+            shift: false,
+        };
+        let alt_only = ModifierSnapshot {
+            win: false,
+            ctrl: false,
+            alt: true,
+            shift: false,
+        };
+        let ctrl_alt_shift = ModifierSnapshot {
+            win: false,
+            ctrl: true,
+            alt: true,
+            shift: true,
+        };
+        let ctrl_alt_win = ModifierSnapshot {
+            win: true,
+            ctrl: true,
+            alt: true,
+            shift: false,
+        };
+        let none = ModifierSnapshot {
+            win: false,
+            ctrl: false,
+            alt: false,
+            shift: false,
+        };
+
+        let mut state = QuickDragMouseState::default();
+        // Disabled -> passes everything
+        assert_eq!(
+            state.handle_button(QuickDragMouseButton::Left, true, false, ctrl_alt),
+            QuickDragMouseDecision::Pass
+        );
+
+        state.set_target(Some((
+            QuickDragModifiers::new(true, true, false, false),
+            QuickDragMouseButton::Left,
+        )));
+        // Non-matching modifiers or wrong button must pass through untouched
+        assert_eq!(
+            state.handle_button(QuickDragMouseButton::Left, true, false, ctrl_only),
+            QuickDragMouseDecision::Pass
+        );
+        assert_eq!(
+            state.handle_button(QuickDragMouseButton::Left, true, false, ctrl_alt_shift),
+            QuickDragMouseDecision::Pass
+        );
+        assert_eq!(
+            state.handle_button(QuickDragMouseButton::Left, true, false, ctrl_alt_win),
+            QuickDragMouseDecision::Pass
+        );
+        assert_eq!(
+            state.handle_button(QuickDragMouseButton::Right, true, false, ctrl_alt),
+            QuickDragMouseDecision::Pass
+        );
+        // Overlay foreground -> normal clicks pass through
+        assert_eq!(
+            state.handle_button(QuickDragMouseButton::Left, true, true, ctrl_alt),
+            QuickDragMouseDecision::Pass
+        );
+
+        // Background Ctrl+Alt+LeftDown triggers & swallows, and matching LeftUp MUST still
+        // swallow + emit release even after the overlay has become foreground and modifiers released!
+        assert_eq!(
+            state.handle_button(QuickDragMouseButton::Left, true, false, ctrl_alt),
+            QuickDragMouseDecision::SwallowAndTrigger
+        );
+        assert_eq!(
+            state.handle_button(QuickDragMouseButton::Right, false, true, none),
+            QuickDragMouseDecision::Pass
+        );
+        assert_eq!(
+            state.handle_button(QuickDragMouseButton::Left, false, true, none),
+            QuickDragMouseDecision::SwallowAndRelease
+        );
+
+        // Custom Alt+Right trigger swallows RightDown + RightUp cleanly
+        state.set_target(Some((
+            QuickDragModifiers::new(false, true, false, false),
+            QuickDragMouseButton::Right,
+        )));
+        assert_eq!(
+            state.handle_button(QuickDragMouseButton::Right, true, false, alt_only),
+            QuickDragMouseDecision::SwallowAndTrigger
+        );
+        assert_eq!(
+            state.handle_button(QuickDragMouseButton::Right, false, true, none),
+            QuickDragMouseDecision::SwallowAndRelease
+        );
+
+        // Bare Middle button trigger works with zero modifiers
+        state.set_target(Some((
+            QuickDragModifiers::default(),
+            QuickDragMouseButton::Middle,
+        )));
+        assert_eq!(
+            state.handle_button(QuickDragMouseButton::Middle, true, false, none),
+            QuickDragMouseDecision::SwallowAndTrigger
+        );
+        assert_eq!(
+            state.handle_button(QuickDragMouseButton::Middle, false, true, none),
+            QuickDragMouseDecision::SwallowAndRelease
+        );
+
+        // XBUTTON1 / XBUTTON2 decoding
+        assert_eq!(
+            decode_mouse_button_event(WM_XBUTTONDOWN, (XBUTTON1_ID as u32) << 16),
+            Some((QuickDragMouseButton::X1, true))
+        );
+        assert_eq!(
+            decode_mouse_button_event(WM_XBUTTONUP, (XBUTTON2_ID as u32) << 16),
+            Some((QuickDragMouseButton::X2, false))
+        );
+    }
+
+    #[test]
+    fn point_param_packing_round_trips_negative_multi_monitor_coords() {
+        for pt in [
+            POINT { x: 0, y: 0 },
+            POINT { x: 1920, y: 1080 },
+            POINT { x: -2560, y: -1440 },
+            POINT { x: -1, y: 540 },
+            POINT { x: 3840, y: -2160 },
+        ] {
+            let (wp, lp) = pack_point_params(pt);
+            let out = unpack_point_params(wp, lp);
+            assert_eq!(out.x, pt.x);
+            assert_eq!(out.y, pt.y);
+        }
+    }
+
+    #[test]
     fn unified_keyboard_hook_installs_refreshes_and_unhooks_cleanly_on_win32() {
         let handle = thread::spawn(|| {
             let overlay = Arc::new(OverlayFocusState::new());
-            let sync = Arc::new(SharedHookSync::new(overlay, false));
-            // Starting disabled keeps zero WH_KEYBOARD_LL hooks installed
-            init_keyboard_hook_context(HWND::default(), HWND::default(), sync.clone(), false)
-                .unwrap();
+            let sync = Arc::new(SharedHookSync::new(overlay, false, false));
+            // Starting disabled keeps zero WH_KEYBOARD_LL / WH_MOUSE_LL hooks installed
+            let (kbd_err, mouse_err) = init_keyboard_hook_context(
+                HWND::default(),
+                HWND::default(),
+                sync.clone(),
+                false,
+                None,
+            );
+            assert!(kbd_err.is_none());
+            assert!(mouse_err.is_none());
             KEYBOARD_HOOK.with(|slot| {
                 let s = slot.borrow();
                 assert!(
                     s.hook.is_none(),
                     "hook should stay uninstalled while idle/disabled"
                 );
+                assert!(
+                    s.mouse_hook.is_none(),
+                    "mouse hook should stay uninstalled while disabled"
+                );
                 assert!(!s.win_arrow_patch.enabled);
+                assert!(!s.quick_drag.is_enabled());
             });
 
             // Enabling patch installs exactly one real Win32 WH_KEYBOARD_LL hook
@@ -2964,6 +4240,22 @@ mod tests {
                     .expect("WH_KEYBOARD_LL hook should be installed when enabled")
             });
 
+            // Enabling quick-drag mouse trigger installs real Win32 WH_MOUSE_LL independently
+            let mouse_target = Some((
+                QuickDragModifiers::new(true, true, false, false),
+                QuickDragMouseButton::Left,
+            ));
+            set_quick_drag_mouse_target_hook(mouse_target).unwrap();
+            assert!(sync.quick_drag_enabled.load(Ordering::Acquire));
+            KEYBOARD_HOOK.with(|slot| {
+                let s = slot.borrow();
+                assert!(s.quick_drag.is_enabled());
+                assert!(
+                    s.mouse_hook.is_some(),
+                    "WH_MOUSE_LL hook should be installed when quick-drag is enabled"
+                );
+            });
+
             // Disarming hold mode while patch is enabled must keep the single hook alive
             disarm_hold_hook_local();
             KEYBOARD_HOOK.with(|slot| {
@@ -2971,29 +4263,43 @@ mod tests {
                 assert_eq!(s.hook, Some(hook_when_enabled));
             });
 
-            // Force refresh replaces the hook cleanly and resets any stale modifier state
+            // Force refresh replaces both hooks cleanly and resets any stale modifier/button state
             KEYBOARD_HOOK.with(|slot| {
-                slot.borrow_mut()
-                    .modifiers
+                let mut s = slot.borrow_mut();
+                s.modifiers
                     .on_non_injected_key(VK_LWIN.0 as u32, true, false);
+                s.quick_drag.swallowed_button = Some(QuickDragMouseButton::Left);
             });
             refresh_keyboard_hook_local(true);
             KEYBOARD_HOOK.with(|slot| {
                 let s = slot.borrow();
                 assert!(s.hook.is_some(), "hook should stay installed after refresh");
+                assert!(
+                    s.mouse_hook.is_some(),
+                    "mouse hook should stay installed after refresh"
+                );
+                assert!(s.quick_drag.swallowed_button.is_none());
                 assert!(s.win_arrow_patch.enabled);
+                assert!(s.quick_drag.is_enabled());
             });
 
-            // Disabling patch immediately unhooks WH_KEYBOARD_LL (back to zero idle hooks)
+            // Disabling both hooks immediately unhooks WH_KEYBOARD_LL and WH_MOUSE_LL
             set_win_arrow_patch_hook(false).unwrap();
+            set_quick_drag_mouse_target_hook(None).unwrap();
             assert!(!sync.patch_enabled.load(Ordering::Acquire));
+            assert!(!sync.quick_drag_enabled.load(Ordering::Acquire));
             KEYBOARD_HOOK.with(|slot| {
                 let s = slot.borrow();
                 assert!(
                     s.hook.is_none(),
                     "hook should be uninstalled once disabled"
                 );
+                assert!(
+                    s.mouse_hook.is_none(),
+                    "mouse hook should be uninstalled once disabled"
+                );
                 assert!(!s.win_arrow_patch.enabled);
+                assert!(!s.quick_drag.is_enabled());
             });
 
             teardown_keyboard_hook_local();
@@ -3004,11 +4310,17 @@ mod tests {
     #[test]
     fn dedicated_kbd_hook_worker_toggles_refreshes_and_shuts_down_cleanly() {
         let overlay = Arc::new(OverlayFocusState::new());
-        let sync = Arc::new(SharedHookSync::new(overlay, false));
-        let (mut worker, startup_err) =
-            KbdHookWorker::start(HWND::default(), sync.clone(), false).unwrap();
+        let sync = Arc::new(SharedHookSync::new(overlay, false, true));
+        let default_mouse = Some((
+            QuickDragModifiers::new(true, true, false, false),
+            QuickDragMouseButton::Left,
+        ));
+        let (mut worker, startup_err, quick_drag_err) =
+            KbdHookWorker::start(HWND::default(), sync.clone(), false, default_mouse).unwrap();
         assert!(startup_err.is_none());
+        assert!(quick_drag_err.is_none());
         assert!(!sync.patch_enabled.load(Ordering::Acquire));
+        assert!(sync.quick_drag_enabled.load(Ordering::Acquire));
 
         let (tx, rx) = mpsc::channel();
         worker.forward_patch_request(Box::into_raw(Box::new(WinArrowPatchRequest {
@@ -3019,6 +4331,11 @@ mod tests {
             .expect("enable reply")
             .expect("enable hook succeeded");
         assert!(sync.patch_enabled.load(Ordering::Acquire));
+
+        worker
+            .set_quick_drag_mouse_target(None)
+            .expect("disable quick drag succeeded");
+        assert!(!sync.quick_drag_enabled.load(Ordering::Acquire));
 
         worker.refresh_hook(true);
         worker.reset_modifiers();

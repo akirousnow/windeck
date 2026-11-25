@@ -6,7 +6,7 @@ use gpui::{
     prelude::*, px, rgb, rgba,
 };
 use win_platform::{
-    BackdropStyle, HotkeySpec, OverlayMonitorPolicy, PrimaryModifier,
+    BackdropStyle, HotkeySpec, OverlayMonitorPolicy, PrimaryModifier, QuickDragShortcut,
     configure_borderless_immersive, is_autostart_enabled, set_autostart_enabled,
     show_and_focus_layered_overlay,
 };
@@ -19,7 +19,7 @@ use crate::switcher_view::SwitcherView;
 use crate::update_dialog::UpdateStatus;
 
 const SHEET_W: f32 = 500.0;
-const SHEET_CONTENT_EST_H: f32 = 1015.0;
+const SHEET_CONTENT_EST_H: f32 = 1105.0;
 
 /// Minimalist 3-slider icon matching the hairline weight of the top Spaces bar.
 fn sliders_icon() -> Div {
@@ -270,6 +270,7 @@ impl SwitcherView {
         self.recording_force_quit_key = false;
         self.recording_columns_inc_key = false;
         self.recording_columns_dec_key = false;
+        self.recording_quick_drag_shortcut = false;
     }
 
     pub fn open_settings(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -286,6 +287,7 @@ impl SwitcherView {
         self.clear_shortcut_recordings();
         self.settings_error = None;
         self.win_arrow_patch_error = None;
+        self.quick_drag_hook_error = None;
         self.settings_scroll_y = 0.0;
         self.autostart_enabled = is_autostart_enabled();
         window.focus(&self.focus_handle);
@@ -301,6 +303,7 @@ impl SwitcherView {
         self.clear_shortcut_recordings();
         self.settings_error = None;
         self.win_arrow_patch_error = None;
+        self.quick_drag_hook_error = None;
         // Immediately restore live DWM thumbnails for the Mission Control grid
         self.thumbs.borrow_mut().sync_targets(&self.flat_hwnds);
         self.clamp_scroll();
@@ -429,6 +432,72 @@ impl SwitcherView {
         cx.notify();
     }
 
+    pub(crate) fn apply_quick_drag_change(&mut self, enabled: bool, cx: &mut Context<Self>) {
+        let shortcut = self.config.parsed_quick_drag_shortcut();
+        let hook_res = if let Some(ref host) = *self.shell_host {
+            host.set_quick_drag_config(enabled, shortcut)
+        } else {
+            Ok(())
+        };
+
+        match hook_res {
+            Ok(()) => {
+                self.config.quick_drag_window = enabled;
+                self.quick_drag_hook_error = None;
+                self.persist_config();
+                append_log(&format!(
+                    "QUICK_DRAG UPDATED -> enabled={enabled} shortcut={}",
+                    shortcut.to_config_string()
+                ));
+            }
+            Err(e) => {
+                self.quick_drag_hook_error = Some(SharedString::from(format!("{e}")));
+                append_log(&format!(
+                    "QUICK_DRAG UPDATE FAILED -> enabled={enabled}: {e:#}"
+                ));
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn apply_quick_drag_shortcut_change(
+        &mut self,
+        shortcut: QuickDragShortcut,
+        cx: &mut Context<Self>,
+    ) {
+        if let Err(e) = shortcut.validate() {
+            self.quick_drag_hook_error = Some(SharedString::from(format!("{e}")));
+            cx.notify();
+            return;
+        }
+        let enabled = self.config.quick_drag_window;
+        let apply_res = if let Some(ref host) = *self.shell_host {
+            host.set_quick_drag_config(enabled, shortcut)
+        } else {
+            Ok(())
+        };
+
+        match apply_res {
+            Ok(()) => {
+                let config_str = shortcut.to_config_string();
+                self.config.quick_drag_shortcut = config_str.clone();
+                self.clear_shortcut_recordings();
+                self.quick_drag_hook_error = None;
+                self.persist_config();
+                append_log(&format!("QUICK_DRAG_SHORTCUT UPDATED -> {config_str}"));
+            }
+            Err(e) => {
+                self.recording_quick_drag_shortcut = false;
+                self.quick_drag_hook_error = Some(SharedString::from(format!("{e}")));
+                append_log(&format!(
+                    "QUICK_DRAG_SHORTCUT UPDATE FAILED -> {}: {e:#}",
+                    shortcut.to_config_string()
+                ));
+            }
+        }
+        cx.notify();
+    }
+
     pub(crate) fn apply_visual_and_save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.thumb_host.configure(
             self.config.immersive,
@@ -485,8 +554,19 @@ impl SwitcherView {
             } else {
                 self.win_arrow_patch_error = None;
             }
+            if let Err(e) = host.set_quick_drag_config(
+                defaults.quick_drag_window,
+                defaults.parsed_quick_drag_shortcut(),
+            ) {
+                defaults.quick_drag_window = self.config.quick_drag_window;
+                defaults.quick_drag_shortcut = self.config.quick_drag_shortcut.clone();
+                self.quick_drag_hook_error = Some(SharedString::from(format!("{e}")));
+            } else {
+                self.quick_drag_hook_error = None;
+            }
         } else {
             self.win_arrow_patch_error = None;
+            self.quick_drag_hook_error = None;
         }
         self.config = defaults;
         self.clear_shortcut_recordings();
@@ -534,9 +614,11 @@ impl SwitcherView {
         let recording_fq = self.recording_force_quit_key;
         let recording_col_inc = self.recording_columns_inc_key;
         let recording_col_dec = self.recording_columns_dec_key;
+        let recording_quick_drag = self.recording_quick_drag_shortcut;
         let fq_label = self.config.parsed_force_quit_key().canonical_label();
         let col_inc_label = self.config.parsed_columns_inc_key().canonical_label();
         let col_dec_label = self.config.parsed_columns_dec_key().canonical_label();
+        let quick_drag_label = self.config.parsed_quick_drag_shortcut().display_label();
         let move_mod = self.config.move_desktop_modifier;
         let autostart = self.autostart_enabled;
         let label_pos = self.config.label_position;
@@ -554,6 +636,8 @@ impl SwitcherView {
         let hide_on_blur = self.config.hide_on_blur;
         let auto_update = self.config.auto_update;
         let win_arrow_switch_desktop = self.config.win_arrow_switch_desktop;
+        let quick_drag_window = self.config.quick_drag_window;
+        let quick_drag_auto_hide = self.config.quick_drag_auto_hide;
         let cur_ver_tag = format!("v{}", self.effective_version);
 
         let (update_hint_text, update_hint_color, update_btn_label, update_has_new, update_checking) =
@@ -860,6 +944,76 @@ impl SwitcherView {
                         .child("↑↓ · 1-9"),
                 )
             });
+
+        // Quick-drag shortcut recorder pill + master toggle: [ Ctrl+Alt+左键 ]  [ switch ]
+        let quick_drag_control = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .id("qd-shortcut-record")
+                    .h(px(27.0))
+                    .min_w(px(if recording_quick_drag { 104.0 } else { 88.0 }))
+                    .px(px(11.0))
+                    .rounded_full()
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .bg(if recording_quick_drag {
+                        rgba(0x0A84FFCC)
+                    } else if quick_drag_window {
+                        rgba(0xFFFFFF1C)
+                    } else {
+                        rgba(0xFFFFFF0F)
+                    })
+                    .border_1()
+                    .border_color(if recording_quick_drag {
+                        rgba(0xFFFFFF55)
+                    } else {
+                        rgba(0xFFFFFF1E)
+                    })
+                    .hover(|s| {
+                        s.bg(if recording_quick_drag {
+                            rgba(0x0A84FFE6)
+                        } else {
+                            rgba(0xFFFFFF2C)
+                        })
+                    })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.stop_propagation();
+                        let next = !this.recording_quick_drag_shortcut;
+                        this.clear_shortcut_recordings();
+                        this.recording_quick_drag_shortcut = next;
+                        this.quick_drag_hook_error = None;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(if recording_quick_drag || quick_drag_window {
+                                rgba(0xFFFFFFFA)
+                            } else {
+                                rgba(0xFFFFFF78)
+                            })
+                            .child(if recording_quick_drag {
+                                "按键/点击...".to_string()
+                            } else {
+                                quick_drag_label
+                            }),
+                    ),
+            )
+            .child(minimal_switch(
+                "sw-quick-drag",
+                quick_drag_window,
+                cx.listener(move |this, _, _, cx| {
+                    cx.stop_propagation();
+                    this.apply_quick_drag_change(!quick_drag_window, cx);
+                }),
+            ));
 
         // Columns increase / decrease shortcut recorders: [ + Ctrl++ ] [ − Ctrl+- ]
         let columns_keys_control = div()
@@ -1557,6 +1711,31 @@ impl SwitcherView {
                                     .child(setting_row("强制退出", force_quit_control))
                                     .child(row_divider())
                                     .child(setting_row("移动桌面", move_desktop_control))
+                                    .child(row_divider())
+                                    .child(setting_row("快捷拖动", quick_drag_control))
+                                    .when_some(self.quick_drag_hook_error.clone(), |el, err| {
+                                        el.child(
+                                            div()
+                                                .pb(px(8.0))
+                                                .text_xs()
+                                                .text_color(rgb(0xFF8A80))
+                                                .child(err),
+                                        )
+                                    })
+                                    .child(row_divider())
+                                    .child(setting_row(
+                                        "拖动后关闭",
+                                        minimal_switch(
+                                            "sw-quick-drag-auto-hide",
+                                            quick_drag_auto_hide,
+                                            cx.listener(move |this, _, window, cx| {
+                                                cx.stop_propagation();
+                                                this.config.quick_drag_auto_hide =
+                                                    !quick_drag_auto_hide;
+                                                this.apply_visual_and_save(window, cx);
+                                            }),
+                                        ),
+                                    ))
                                     .child(row_divider())
                                     .child(setting_row("增减列数", columns_keys_control))
                                     .child(row_divider())

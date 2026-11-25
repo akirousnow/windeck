@@ -13,6 +13,7 @@ use windows::Win32::Graphics::Gdi::{
     MonitorFromPoint,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleA, GetModuleHandleW, GetProcAddress};
+use windows::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
 use windows::Win32::UI::Controls::MARGINS;
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
@@ -20,15 +21,16 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     KEYEVENTF_KEYUP, SendInput, VK_MENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GW_HWNDNEXT, GWL_EXSTYLE, GWL_STYLE,
-    GetClientRect, GetCursorPos, GetForegroundWindow, GetWindow, GetWindowLongPtrW, GetWindowRect,
-    HWND_NOTOPMOST, HWND_TOPMOST, IsIconic, IsWindowVisible, RegisterClassW, SET_WINDOW_POS_FLAGS,
-    SW_HIDE, SW_SHOWNOACTIVATE, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    WNDCLASSW, WS_BORDER, WS_CAPTION, WS_DLGFRAME, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME,
-    WS_EX_NOACTIVATE, WS_EX_NOREDIRECTIONBITMAP, WS_EX_STATICEDGE, WS_EX_TOOLWINDOW,
-    WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP,
-    WS_SYSMENU, WS_THICKFRAME,
+    BringWindowToTop, CreateWindowExW, DefWindowProcW, DestroyWindow, GW_HWNDNEXT, GWL_EXSTYLE,
+    GWL_STYLE, GetClientRect, GetCursorPos, GetForegroundWindow, GetWindow, GetWindowLongPtrW,
+    GetWindowRect, GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST, IsHungAppWindow,
+    IsIconic, IsWindowVisible, RegisterClassW, SET_WINDOW_POS_FLAGS, SW_HIDE, SW_SHOWNOACTIVATE,
+    SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, WNDCLASSW, WS_BORDER,
+    WS_CAPTION, WS_DLGFRAME, WS_EX_CLIENTEDGE, WS_EX_DLGMODALFRAME, WS_EX_NOACTIVATE,
+    WS_EX_NOREDIRECTIONBITMAP, WS_EX_STATICEDGE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST,
+    WS_EX_TRANSPARENT, WS_EX_WINDOWEDGE, WS_MAXIMIZEBOX, WS_MINIMIZEBOX, WS_POPUP, WS_SYSMENU,
+    WS_THICKFRAME,
 };
 use windows_core::{BOOL, PCSTR, w};
 
@@ -355,38 +357,66 @@ fn compute_overlay_rect(
     Ok((x, y, win_w, win_h, scale))
 }
 
+/// Returns the live cursor position in physical screen coordinates.
+pub fn current_cursor_screen_pos() -> Option<(i32, i32)> {
+    let mut pt = POINT::default();
+    unsafe { GetCursorPos(&mut pt) }.ok().map(|()| (pt.x, pt.y))
+}
+
 fn focus_hwnd(hwnd: HWND) {
     unsafe {
-        if !SetForegroundWindow(hwnd).as_bool() {
-            // Never inject a synthetic VK_MENU KEYUP while the user is physically holding Alt,
-            // as doing so would break hold-Alt + arrow + release-to-jump tracking.
-            if (GetAsyncKeyState(VK_MENU.0 as i32) as u16 & 0x8000) == 0 {
-                let inputs = [
-                    INPUT {
-                        r#type: INPUT_KEYBOARD,
-                        Anonymous: INPUT_0 {
-                            ki: KEYBDINPUT {
-                                wVk: VK_MENU,
-                                dwFlags: KEYBD_EVENT_FLAGS(0),
-                                ..Default::default()
-                            },
-                        },
-                    },
-                    INPUT {
-                        r#type: INPUT_KEYBOARD,
-                        Anonymous: INPUT_0 {
-                            ki: KEYBDINPUT {
-                                wVk: VK_MENU,
-                                dwFlags: KEYEVENTF_KEYUP,
-                                ..Default::default()
-                            },
-                        },
-                    },
-                ];
-                SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
-            }
-            let _ = SetForegroundWindow(hwnd);
+        if SetForegroundWindow(hwnd).as_bool() && GetForegroundWindow() == hwnd {
+            return;
         }
+
+        // First fallback: briefly attach to the active non-hung foreground thread's input queue.
+        // This works reliably even when triggered from WH_MOUSE_LL while Alt is physically held
+        // (where injecting a synthetic VK_MENU tap is forbidden).
+        let fg = GetForegroundWindow();
+        if !fg.is_invalid() && fg != hwnd && !IsHungAppWindow(fg).as_bool() {
+            let cur_tid = GetCurrentThreadId();
+            let fg_tid = GetWindowThreadProcessId(fg, None);
+            if fg_tid != 0 && fg_tid != cur_tid {
+                let attached = AttachThreadInput(cur_tid, fg_tid, true).as_bool();
+                let _ = BringWindowToTop(hwnd);
+                let _ = SetForegroundWindow(hwnd);
+                if attached {
+                    let _ = AttachThreadInput(cur_tid, fg_tid, false);
+                }
+                if GetForegroundWindow() == hwnd {
+                    return;
+                }
+            }
+        }
+
+        // Never inject a synthetic VK_MENU KEYUP while the user is physically holding Alt,
+        // as doing so would break hold-Alt + arrow + release-to-jump tracking.
+        if (GetAsyncKeyState(VK_MENU.0 as i32) as u16 & 0x8000) == 0 {
+            let inputs = [
+                INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: VK_MENU,
+                            dwFlags: KEYBD_EVENT_FLAGS(0),
+                            ..Default::default()
+                        },
+                    },
+                },
+                INPUT {
+                    r#type: INPUT_KEYBOARD,
+                    Anonymous: INPUT_0 {
+                        ki: KEYBDINPUT {
+                            wVk: VK_MENU,
+                            dwFlags: KEYEVENTF_KEYUP,
+                            ..Default::default()
+                        },
+                    },
+                },
+            ];
+            SendInput(&inputs, std::mem::size_of::<INPUT>() as i32);
+        }
+        let _ = SetForegroundWindow(hwnd);
     }
 }
 
@@ -557,6 +587,13 @@ pub fn pin_layered_z_order(gpui_hwnd: HWND, thumb_host_hwnd: HWND, rect: RECT) {
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
     }
+}
+
+/// Re-pins the two-layer topmost overlay stack and reclaims Win32 foreground focus for `gpui_hwnd`
+/// (e.g. after Explorer bumps foreground during a background virtual-desktop switch).
+pub fn refocus_layered_overlay(gpui_hwnd: HWND, thumb_host_hwnd: HWND, rect: RECT) {
+    pin_layered_z_order(gpui_hwnd, thumb_host_hwnd, rect);
+    focus_hwnd(gpui_hwnd);
 }
 
 /// Positions and reveals both layers in strict lockstep Z-order:

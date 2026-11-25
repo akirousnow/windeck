@@ -162,13 +162,16 @@ fn main() -> Result<()> {
     let post_ota_restart = wait_pid.is_some();
     let (winsta, desk) = current_session_desktop_names();
     append_log(&format!(
-        "STARTUP ver=v{} hotkey='{}' immersive={} label='{}' auto_update={} win_arrow_desktop={} desktop='{}\\{}' hidden={} bench={} wait_pid={:?}",
+        "STARTUP ver=v{} hotkey='{}' immersive={} label='{}' auto_update={} win_arrow_desktop={} quick_drag={}({}) quick_drag_auto_hide={} desktop='{}\\{}' hidden={} bench={} wait_pid={:?}",
         effective_version,
         config.hotkey,
         config.immersive,
         config.label_position.as_config_str(),
         config.auto_update,
         config.win_arrow_switch_desktop,
+        config.quick_drag_window,
+        config.parsed_quick_drag_shortcut().to_config_string(),
+        config.quick_drag_auto_hide,
         winsta,
         desk,
         start_hidden,
@@ -180,6 +183,7 @@ fn main() -> Result<()> {
     let (event_tx, event_rx) = async_channel::unbounded::<ShellEvent>();
 
     let hotkey_spec = config.parsed_hotkey();
+    let quick_drag_shortcut = config.parsed_quick_drag_shortcut();
     let shell_host = if bench_mode {
         None
     } else {
@@ -188,6 +192,8 @@ fn main() -> Result<()> {
             hotkey_spec,
             hotkey_spec.canonical_label(),
             config.win_arrow_switch_desktop,
+            config.quick_drag_window,
+            quick_drag_shortcut,
             move |ev| {
                 let _ = tx.send_blocking(ev);
             },
@@ -203,6 +209,10 @@ fn main() -> Result<()> {
     if let Some(err) = shell_host.as_ref().and_then(|h| h.win_arrow_patch_error()) {
         append_log(&format!("WIN_ARROW_PATCH startup hook failed: {err}"));
         config.win_arrow_switch_desktop = false;
+    }
+    if let Some(err) = shell_host.as_ref().and_then(|h| h.quick_drag_hook_error()) {
+        append_log(&format!("QUICK_DRAG startup mouse hook failed: {err}"));
+        config.quick_drag_window = false;
     }
 
     let hotkey_warning = shell_host.as_ref().and_then(|h| {
@@ -360,6 +370,22 @@ fn main() -> Result<()> {
                                         });
                                     });
                                 }
+                                ShellEvent::QuickDragOpen(trigger) => {
+                                    let _ = window_handle.update(cx, |_, window, cx| {
+                                        view_for_events.update(cx, |v, cx| {
+                                            v.open_with_quick_drag(trigger, window, cx);
+                                        });
+                                    });
+                                }
+                                ShellEvent::QuickDragButtonReleased { screen_x, screen_y } => {
+                                    let _ = window_handle.update(cx, |_, window, cx| {
+                                        view_for_events.update(cx, |v, cx| {
+                                            v.handle_quick_drag_button_released(
+                                                screen_x, screen_y, window, cx,
+                                            );
+                                        });
+                                    });
+                                }
                                 ShellEvent::OpenSettings => {
                                     let _ = window_handle.update(cx, |_, window, cx| {
                                         view_for_events.update(cx, |v, cx| {
@@ -442,6 +468,15 @@ fn main() -> Result<()> {
                                             ));
                                             if new_cfg.win_arrow_switch_desktop {
                                                 new_cfg.win_arrow_switch_desktop = false;
+                                            }
+                                        }
+                                        if let Err(e) = host.set_quick_drag_config(
+                                            new_cfg.quick_drag_window,
+                                            new_cfg.parsed_quick_drag_shortcut(),
+                                        ) {
+                                            append_log(&format!("RELOAD QUICK_DRAG ERROR: {e:#}"));
+                                            if new_cfg.quick_drag_window {
+                                                new_cfg.quick_drag_window = false;
                                             }
                                         }
                                     }

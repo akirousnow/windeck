@@ -3,7 +3,9 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use win_platform::{BackdropStyle, HotkeySpec, OverlayMonitorPolicy, PrimaryModifier};
+use win_platform::{
+    BackdropStyle, HotkeySpec, OverlayMonitorPolicy, PrimaryModifier, QuickDragShortcut,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnsConfig {
@@ -409,6 +411,9 @@ pub struct AppConfig {
     pub hide_on_blur: bool,
     pub auto_update: bool,
     pub win_arrow_switch_desktop: bool,
+    pub quick_drag_window: bool,
+    pub quick_drag_shortcut: String,
+    pub quick_drag_auto_hide: bool,
 }
 
 impl Default for AppConfig {
@@ -438,6 +443,9 @@ impl Default for AppConfig {
             hide_on_blur: true,
             auto_update: true,
             win_arrow_switch_desktop: false,
+            quick_drag_window: true,
+            quick_drag_shortcut: QuickDragShortcut::default().to_config_string(),
+            quick_drag_auto_hide: false,
         }
     }
 }
@@ -515,6 +523,15 @@ auto_update = true
 
 # 系统补丁：将系统 Win + 左/右方向键 映射为切换虚拟桌面（覆盖系统分屏，使用原生动画；管理员窗口不生效）
 win_arrow_switch_desktop = false
+
+# 快捷拖动：全局直接呼出面板并拎起当前窗口，快速拖到其他桌面（管理员窗口不生效）
+quick_drag_window = true
+
+# 快捷拖动触发快捷键（支持鼠标组合如 "Ctrl+Alt+Left"、"Alt+Right"、"Middle"、"Ctrl+X1"，或键盘热键如 "Ctrl+Alt+D"）
+quick_drag_shortcut = "Ctrl+Alt+Left"
+
+# 快捷拖动放置到目标桌面后是否自动关闭启动器面板
+quick_drag_auto_hide = false
 "#;
 
 pub fn config_dir() -> PathBuf {
@@ -694,6 +711,21 @@ impl AppConfig {
                         cfg.win_arrow_switch_desktop = b;
                     }
                 }
+                "quick_drag_window" => {
+                    if let Ok(b) = val.parse::<bool>() {
+                        cfg.quick_drag_window = b;
+                    }
+                }
+                "quick_drag_shortcut" if !val.is_empty() => {
+                    if let Ok(sc) = QuickDragShortcut::parse(val) {
+                        cfg.quick_drag_shortcut = sc.to_config_string();
+                    }
+                }
+                "quick_drag_auto_hide" => {
+                    if let Ok(b) = val.parse::<bool>() {
+                        cfg.quick_drag_auto_hide = b;
+                    }
+                }
                 _ => {}
             }
         }
@@ -722,6 +754,10 @@ impl AppConfig {
     pub fn parsed_columns_dec_key(&self) -> LocalShortcut {
         LocalShortcut::parse(&self.columns_dec_key)
             .unwrap_or_else(|| LocalShortcut::parse("Ctrl+-").expect("default columns_dec_key valid"))
+    }
+
+    pub fn parsed_quick_drag_shortcut(&self) -> QuickDragShortcut {
+        QuickDragShortcut::parse(&self.quick_drag_shortcut).unwrap_or_default()
     }
 
     pub fn effective_columns_bounds(&self) -> (usize, usize) {
@@ -819,6 +855,15 @@ auto_update = {auto_update}
 
 # 系统补丁：将系统 Win + 左/右方向键 映射为切换虚拟桌面（覆盖系统分屏，使用原生动画；管理员窗口不生效）
 win_arrow_switch_desktop = {win_arrow_switch_desktop}
+
+# 快捷拖动：全局直接呼出面板并拎起当前窗口，快速拖到其他桌面（管理员窗口不生效）
+quick_drag_window = {quick_drag_window}
+
+# 快捷拖动触发快捷键（支持鼠标组合如 "Ctrl+Alt+Left"、"Alt+Right"、"Middle"、"Ctrl+X1"，或键盘热键如 "Ctrl+Alt+D"）
+quick_drag_shortcut = "{quick_drag_shortcut}"
+
+# 快捷拖动放置到目标桌面后是否自动关闭启动器面板
+quick_drag_auto_hide = {quick_drag_auto_hide}
 "#,
             hotkey = self.parsed_hotkey().canonical_label(),
             force_quit_key = self.parsed_force_quit_key().canonical_label(),
@@ -844,6 +889,9 @@ win_arrow_switch_desktop = {win_arrow_switch_desktop}
             hide_on_blur = self.hide_on_blur,
             auto_update = self.auto_update,
             win_arrow_switch_desktop = self.win_arrow_switch_desktop,
+            quick_drag_window = self.quick_drag_window,
+            quick_drag_shortcut = self.parsed_quick_drag_shortcut().to_config_string(),
+            quick_drag_auto_hide = self.quick_drag_auto_hide,
         )
     }
 
@@ -893,6 +941,9 @@ mod tests {
             hide_on_blur = false
             auto_update = false
             win_arrow_switch_desktop = true
+            quick_drag_window = false
+            quick_drag_shortcut = "Alt+Right"
+            quick_drag_auto_hide = true
         "#;
         let cfg = AppConfig::parse(raw);
         assert_eq!(cfg.hotkey, "Ctrl+E");
@@ -943,6 +994,9 @@ mod tests {
         assert!(default_cfg.selection_transition_enabled());
         assert!(default_cfg.switch_transition_enabled());
         assert!(!default_cfg.win_arrow_switch_desktop);
+        assert!(default_cfg.quick_drag_window);
+        assert_eq!(default_cfg.quick_drag_shortcut, "Ctrl+Alt+Left");
+        assert!(!default_cfg.quick_drag_auto_hide);
 
         let legacy_cfg = AppConfig::parse("transition_effect = \"smooth\"\n");
         assert_eq!(legacy_cfg.transition_effect, TransitionEffect::Spring);
@@ -963,6 +1017,12 @@ mod tests {
             round_tripped.win_arrow_switch_desktop,
             cfg.win_arrow_switch_desktop
         );
+        assert!(!cfg.quick_drag_window);
+        assert_eq!(round_tripped.quick_drag_window, cfg.quick_drag_window);
+        assert_eq!(cfg.quick_drag_shortcut, "Alt+Right");
+        assert_eq!(round_tripped.quick_drag_shortcut, cfg.quick_drag_shortcut);
+        assert!(cfg.quick_drag_auto_hide);
+        assert_eq!(round_tripped.quick_drag_auto_hide, cfg.quick_drag_auto_hide);
     }
 
     #[test]
